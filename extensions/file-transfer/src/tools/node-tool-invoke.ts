@@ -48,6 +48,17 @@ export async function invokeNodeToolPayload(input: {
 }> {
   const gatewayOpts = readGatewayCallOptions(input.params);
   const nodes: NodeListNode[] = await listNodes(gatewayOpts);
+  // With no paired nodes, resolveNodeIdFromList can only throw a bare
+  // `unknown node: <guess>` (the known-node list is empty), so models burn turns
+  // guessing local/host/gateway/auto. Surface the precondition up front instead.
+  if (nodes.length === 0) {
+    throw new Error(
+      `Cannot run ${input.command}: no paired nodes are available (the nodes status tool returns an empty list). ` +
+        'These tools act only on paired remote nodes, so there is no valid "node" value — ' +
+        '"local", "host", "gateway", and "auto" are not nodes. ' +
+        "To read or list a local workspace directory, use the local file/exec tools instead.",
+    );
+  }
   const nodeId = resolveNodeIdFromList(nodes, input.node, false);
   const nodeMeta = nodes.find((n) => n.nodeId === nodeId);
   const nodeDisplayName = nodeMeta?.displayName ?? input.node;

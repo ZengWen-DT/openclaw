@@ -12,6 +12,13 @@ type FileTransferToolDescriptor = Pick<
 // the same turn can still reference them.
 export const FILE_TRANSFER_SUBDIR = "file-transfer";
 
+// Steer models away from guessing pseudo-targets for the required `node` param;
+// it must be a real paired node from the nodes status tool, never local/host/etc.
+const NODE_PARAM_DESCRIPTION =
+  "Id, name, or IP of an existing paired node, exactly as listed by the nodes status tool. " +
+  'This is a remote node only — "local", "host", "gateway", and "auto" are not valid values. ' +
+  "For the local workspace, use the local file/exec tools instead of this tool.";
+
 export const FILE_FETCH_DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
 export const FILE_FETCH_HARD_MAX_BYTES = 16 * 1024 * 1024;
 export const DIR_LIST_DEFAULT_MAX_ENTRIES = 200;
@@ -21,9 +28,7 @@ export const DIR_FETCH_HARD_MAX_BYTES = 16 * 1024 * 1024;
 export const FILE_WRITE_HARD_MAX_BYTES = 16 * 1024 * 1024;
 
 export const FileFetchToolSchema = Type.Object({
-  node: Type.String({
-    description: "Node id, name, or IP. Resolves the same way as the nodes tool.",
-  }),
+  node: Type.String({ description: NODE_PARAM_DESCRIPTION }),
   path: Type.String({
     description: "Absolute path to the file on the node. Canonicalized server-side.",
   }),
@@ -44,9 +49,7 @@ export const FILE_FETCH_TOOL_DESCRIPTOR: FileTransferToolDescriptor = {
 };
 
 export const DirListToolSchema = Type.Object({
-  node: Type.String({
-    description: "Node id, name, or IP. Resolves the same way as the nodes tool.",
-  }),
+  node: Type.String({ description: NODE_PARAM_DESCRIPTION }),
   path: Type.String({
     description: "Absolute path to the directory on the node. Canonicalized server-side.",
   }),
@@ -73,9 +76,7 @@ export const DIR_LIST_TOOL_DESCRIPTOR: FileTransferToolDescriptor = {
 };
 
 export const DirFetchToolSchema = Type.Object({
-  node: Type.String({
-    description: "Node id, name, or IP. Resolves the same way as the nodes tool.",
-  }),
+  node: Type.String({ description: NODE_PARAM_DESCRIPTION }),
   path: Type.String({
     description: "Absolute path to the directory on the node to fetch. Canonicalized server-side.",
   }),
@@ -102,7 +103,7 @@ export const DIR_FETCH_TOOL_DESCRIPTOR: FileTransferToolDescriptor = {
 };
 
 export const FileWriteToolSchema = Type.Object({
-  node: Type.String({ description: "Node id or display name to write the file on." }),
+  node: Type.String({ description: NODE_PARAM_DESCRIPTION }),
   path: Type.String({
     description: "Absolute path on the node to write. Canonicalized server-side.",
   }),
