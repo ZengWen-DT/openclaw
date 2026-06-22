@@ -430,26 +430,27 @@ function buildDiagnosticLogRecord(logObj: TsLogRecord) {
   const { trace, trustedTraceContext } = resolveLogTraceContext(bindings, numericArgs);
   const structuredArg = numericArgs[0];
   const structuredBindings = isPlainLogRecordObject(structuredArg) ? structuredArg : undefined;
-  if (structuredBindings) {
-    numericArgs.shift();
-  }
 
-  let message = "";
-  if (numericArgs.length > 0 && typeof numericArgs[numericArgs.length - 1] === "string") {
-    message = sanitizeDiagnosticLogText(
-      String(numericArgs.pop()),
-      MAX_DIAGNOSTIC_LOG_MESSAGE_CHARS,
-    );
-  } else if (
-    numericArgs.length === 1 &&
-    (typeof numericArgs[0] === "number" || typeof numericArgs[0] === "boolean")
-  ) {
-    message = String(numericArgs[0]);
-    numericArgs.length = 0;
+  // The body is the human-readable text, which can appear before or after the
+  // structured context across OpenClaw call sites: log.x("message", { context })
+  // dominates, while pino-style log.x({ context }, "message") is also used.
+  // Collect the scalar (string/number/boolean) parts from any position so the
+  // body is no longer pinned to the "log" sentinel for the message-first shape.
+  // Only a leading plain object stays structured bindings, so the exported
+  // attribute surface is unchanged from before (the diagnostics-otel exporter
+  // emits attributes even when log bodies are content-capture gated).
+  const messageParts: string[] = [];
+  for (const arg of numericArgs) {
+    if (typeof arg === "string") {
+      messageParts.push(arg);
+    } else if ((typeof arg === "number" && Number.isFinite(arg)) || typeof arg === "boolean") {
+      messageParts.push(String(arg));
+    }
   }
-  if (!message) {
-    message = "log";
-  }
+  const joinedMessage = messageParts.join(" ");
+  const message = joinedMessage
+    ? sanitizeDiagnosticLogText(joinedMessage, MAX_DIAGNOSTIC_LOG_MESSAGE_CHARS)
+    : "log";
 
   const attributes: DiagnosticLogAttributes = Object.create(null) as DiagnosticLogAttributes;
   const attributeState = { count: 0 };
