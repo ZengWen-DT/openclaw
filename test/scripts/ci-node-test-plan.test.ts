@@ -664,6 +664,7 @@ describe("scripts/lib/ci-node-test-plan.mjs", () => {
           "test/vitest/vitest.media-understanding.config.ts",
           "test/vitest/vitest.tui.config.ts",
           "test/vitest/vitest.ui.config.ts",
+          "test/vitest/vitest.ui-isolated.config.ts",
           "test/vitest/vitest.wizard.config.ts",
         ],
         requiresDist: false,
@@ -841,7 +842,7 @@ describe("scripts/lib/ci-node-test-plan.mjs", () => {
     expect(cliShard).toEqual({
       checkName: "checks-node-agentic-cli",
       shardName: "agentic-cli",
-      configs: ["test/vitest/vitest.cli.config.ts"],
+      configs: ["test/vitest/vitest.cli.config.ts", "test/vitest/vitest.cli-process.config.ts"],
       requiresDist: false,
       runner: DEFAULT_NODE_TEST_RUNNER,
     });

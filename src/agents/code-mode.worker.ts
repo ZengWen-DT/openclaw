@@ -1,87 +1,25 @@
 /**
  * QuickJS worker for Code Mode guest execution and suspended VM snapshots.
  */
-import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { parentPort, workerData } from "node:worker_threads";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import type { Result } from "@openclaw/normalization-core/result";
 import { EvalFlags, JSException, QuickJS, type JSValueHandle } from "quickjs-wasi";
+import { toCodeModeJsonSafe as toJsonSafe } from "./code-mode-json.js";
 import type { CodeModeApiVirtualFile } from "./code-mode-namespaces.js";
+import { CODE_MODE_SWARM_CONTROLLER_SOURCE } from "./code-mode-swarm-controller-source.js";
+import type {
+  CodeModeConfig,
+  CodeModeNamespaceDescriptor,
+  CodeModeWorkerInput,
+  CodeModeWorkerResult,
+  PendingBridgeRequest,
+  SettledBridgeRequest,
+} from "./code-mode-worker-types.js";
 const require = createRequire(import.meta.url);
 const QUICKJS_WASM_PATH = require.resolve("quickjs-wasi/quickjs.wasm");
 let quickJsWasmModulePromise: Promise<WebAssembly.Module> | undefined;
-
-type CodeModeBridgeMethod = "search" | "describe" | "call" | "callValue" | "yield" | "namespace";
-
-type CodeModeConfig = {
-  timeoutMs: number;
-  memoryLimitBytes: number;
-  maxPendingToolCalls: number;
-  maxSnapshotBytes: number;
-};
-
-type PendingBridgeRequest = {
-  id: string;
-  method: CodeModeBridgeMethod;
-  args: unknown[];
-};
-
-type SettledBridgeRequest = { id: string } & Result<unknown, string>;
-
-type SerializedCodeModeNamespaceValue =
-  | { kind: "array"; items: SerializedCodeModeNamespaceValue[] }
-  | { kind: "function"; path: string[] }
-  | { kind: "object"; entries: Array<[string, SerializedCodeModeNamespaceValue]> }
-  | { kind: "value"; value: unknown };
-
-type CodeModeNamespaceDescriptor = {
-  id: string;
-  globalName: string;
-  description?: string;
-  scope: SerializedCodeModeNamespaceValue;
-};
-
-type CodeModeWorkerInput =
-  | {
-      kind: "exec";
-      source: string;
-      config: CodeModeConfig;
-      catalog: unknown[];
-      apiFiles?: CodeModeApiVirtualFile[];
-      namespaces: CodeModeNamespaceDescriptor[];
-    }
-  | {
-      kind: "resume";
-      snapshotBytes: Uint8Array;
-      config: CodeModeConfig;
-      settledRequests: SettledBridgeRequest[];
-    };
-
-type CodeModeWorkerResult =
-  | {
-      status: "completed";
-      value: unknown;
-      output: unknown[];
-    }
-  | {
-      status: "waiting";
-      snapshotBytes: Uint8Array;
-      pendingRequests: PendingBridgeRequest[];
-      output: unknown[];
-    }
-  | {
-      status: "failed";
-      error: string;
-      code:
-        | "invalid_input"
-        | "runtime_unavailable"
-        | "timeout"
-        | "snapshot_limit_exceeded"
-        | "internal_error";
-      output: unknown[];
-    };
 
 class CodeModeWorkerFailure extends Error {
   readonly code: Extract<CodeModeWorkerResult, { status: "failed" }>["code"];
@@ -158,35 +96,6 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-function toJsonSafe(value: unknown): unknown {
-  if (value === undefined) {
-    return null;
-  }
-  try {
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? null : (JSON.parse(serialized) as unknown);
-  } catch {
-    if (value instanceof Error) {
-      return { name: value.name, message: value.message };
-    }
-    if (value === null) {
-      return null;
-    }
-    switch (typeof value) {
-      case "string":
-      case "number":
-      case "boolean":
-        return value;
-      case "bigint":
-      case "symbol":
-      case "function":
-        return String(value);
-      default:
-        return Object.prototype.toString.call(value);
-    }
-  }
-}
-
 const CONTROLLER_SOURCE = String.raw`
 (() => {
   const output = [];
@@ -194,6 +103,9 @@ const CONTROLLER_SOURCE = String.raw`
   const catalog = Array.isArray(globalThis.__openclawCatalog) ? globalThis.__openclawCatalog : [];
   const apiFiles = Array.isArray(globalThis.__openclawApiFiles) ? globalThis.__openclawApiFiles : [];
   const namespaceDescriptors = Array.isArray(globalThis.__openclawNamespaces) ? globalThis.__openclawNamespaces : [];
+  const hostRequest = globalThis.__openclawHostRequest;
+  delete globalThis.__openclawHostRequest;
+  const bridgeSequences = new Map();
 
   function safe(value) {
     if (value === undefined) return null;
@@ -217,11 +129,17 @@ const CONTROLLER_SOURCE = String.raw`
   }
 
   function request(method, args) {
-    const id = String(globalThis.__openclawHostRequest(String(method), JSON.stringify(safe(args ?? []))));
+    const methodName = String(method);
+    const sequence = (bridgeSequences.get(methodName) ?? 0) + 1;
+    bridgeSequences.set(methodName, sequence);
+    const bridgeId = "bridge:" + methodName + ":" + String(sequence);
+    const id = String(hostRequest(methodName, JSON.stringify(safe(args ?? [])), bridgeId));
     return new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
     });
   }
+
+  ${CODE_MODE_SWARM_CONTROLLER_SOURCE}
 
   function namespaceFunction(namespaceId, path) {
     const callablePath = Object.freeze((Array.isArray(path) ? path : []).map((entry) => String(entry)));
@@ -270,6 +188,30 @@ const CONTROLLER_SOURCE = String.raw`
     return true;
   }
 
+  function nodeHandle(descriptor) {
+    const handle = Object.create(null);
+    Object.defineProperties(handle, {
+      id: { value: descriptor.id, enumerable: true },
+      name: { value: descriptor.name, enumerable: true },
+      invoke: {
+        value: (command, params) => request("nodes", ["invoke", descriptor.id, command, params]),
+        enumerable: true,
+      },
+    });
+    if (typeof descriptor.listDirCommand === "string") {
+      Object.defineProperty(handle, "listDir", {
+        value: (path) => request("nodes", ["invoke", descriptor.id, descriptor.listDirCommand, { path }]),
+        enumerable: true,
+      });
+    }
+    return Object.freeze(handle);
+  }
+
+  const nodes = Object.freeze({
+    list: () => request("nodes", ["list"]),
+    get: async (idOrName) => nodeHandle(await request("nodes", ["get", idOrName])),
+  });
+
   const baseTools = Object.create(null);
   Object.defineProperties(baseTools, {
     search: { value: (query, options) => request("search", [query, options]), enumerable: true },
@@ -277,6 +219,21 @@ const CONTROLLER_SOURCE = String.raw`
     call: { value: (id, input) => request("call", [id, input]), enumerable: true },
     callValue: { value: (id, input) => request("callValue", [id, input]), enumerable: true },
   });
+  const skills = Object.freeze({
+    list: () => request("skillsList", []),
+    read: (name) => request("skillsRead", [name]),
+  });
+
+  if (globalThis.__openclawSwarmEnabled === true) {
+    Object.defineProperties(globalThis, {
+      agents: {
+        value: Object.freeze({ run: runAgent }),
+        enumerable: true,
+      },
+      phase: { value: (title) => swarmNote("phase", title), enumerable: true },
+      log: { value: (message) => swarmNote("log", message), enumerable: true },
+    });
+  }
 
   function normalizeApiPath(value) {
     const text = String(value ?? "").trim().replace(/^\/+/, "");
@@ -335,7 +292,7 @@ const CONTROLLER_SOURCE = String.raw`
       continue;
     }
     Object.defineProperty(baseTools, name, {
-      value: (input) => request("call", [id, input]),
+      value: (input) => request("callValue", [id, input]),
       enumerable: true,
     });
   }
@@ -362,7 +319,9 @@ const CONTROLLER_SOURCE = String.raw`
   Object.defineProperties(globalThis, {
     ALL_TOOLS: { value: Object.freeze(catalog.slice()), enumerable: true },
     API: { value: api, enumerable: true },
+    nodes: { value: nodes, enumerable: true },
     namespaces: { value: Object.freeze(namespaceGlobals), enumerable: true },
+    skills: { value: skills, enumerable: true },
     tools: { value: Object.freeze(baseTools), enumerable: true },
     text: { value: (value) => output.push({ type: "text", text: asText(value) }), enumerable: true },
     json: { value: (value) => output.push({ type: "json", value: safe(value) }), enumerable: true },
@@ -381,8 +340,13 @@ function createHostRequestHandler(params: {
   vm: QuickJS;
   pendingRequests: PendingBridgeRequest[];
   config: CodeModeConfig;
-}): (this: JSValueHandle, method: JSValueHandle, argsJson: JSValueHandle) => JSValueHandle {
-  return (methodHandle, argsHandle) => {
+}): (
+  this: JSValueHandle,
+  method: JSValueHandle,
+  argsJson: JSValueHandle,
+  bridgeId?: JSValueHandle,
+) => JSValueHandle {
+  return (methodHandle, argsHandle, bridgeIdHandle) => {
     if (params.pendingRequests.length >= params.config.maxPendingToolCalls) {
       throw new Error("too many pending code mode tool calls");
     }
@@ -392,8 +356,14 @@ function createHostRequestHandler(params: {
       method !== "describe" &&
       method !== "call" &&
       method !== "callValue" &&
+      method !== "nodes" &&
       method !== "yield" &&
-      method !== "namespace"
+      method !== "namespace" &&
+      method !== "agentSpawn" &&
+      method !== "agentWait" &&
+      method !== "skillsList" &&
+      method !== "skillsRead" &&
+      method !== "swarmNote"
     ) {
       throw new Error("unsupported code mode bridge method");
     }
@@ -403,7 +373,15 @@ function createHostRequestHandler(params: {
     } catch {
       args = [];
     }
-    const id = `bridge:${params.pendingRequests.length + 1}:${randomUUID()}`;
+    // Snapshotted method counters keep launch identity independent of unrelated bridge traffic.
+    // Snapshots are process-local, so every resumable guest comes from the ID-aware source above.
+    const id = bridgeIdHandle?.toString();
+    if (!id?.startsWith(`bridge:${method}:`) || !/^bridge:[A-Za-z]+:[1-9]\d*$/u.test(id)) {
+      throw new Error("invalid code mode bridge id");
+    }
+    if (params.pendingRequests.some((request) => request.id === id)) {
+      throw new Error("duplicate code mode bridge id");
+    }
     // The guest receives only an opaque id. Host-side tool execution and policy
     // happen after the worker returns a waiting snapshot.
     params.pendingRequests.push({
@@ -419,6 +397,7 @@ async function createVm(params: {
   catalog: unknown[];
   apiFiles: CodeModeApiVirtualFile[];
   namespaces: CodeModeNamespaceDescriptor[];
+  swarmEnabled: boolean;
   config: CodeModeConfig;
   pendingRequests: PendingBridgeRequest[];
 }): Promise<VmRun> {
@@ -442,6 +421,9 @@ async function createVm(params: {
   );
   vm.hostToHandle(params.apiFiles).consume((handle) =>
     vm.global.setProp("__openclawApiFiles", handle),
+  );
+  vm.hostToHandle(params.swarmEnabled).consume((handle) =>
+    vm.global.setProp("__openclawSwarmEnabled", handle),
   );
   vm.newFunction(
     "__openclawHostRequest",
@@ -547,6 +529,16 @@ async function readCompletedResult(vm: QuickJS, resultHandle: JSValueHandle): Pr
       // format it like the synchronous path so async rejections keep their cause
       // and location instead of collapsing to the bare message.
       const dumped = vm.dump(error);
+      // Node module globals are deliberately absent from the WASI guest. Keep
+      // aliases fail-closed at that runtime boundary rather than guessing source
+      // provenance or installing a host-backed loader.
+      if (
+        dumped instanceof Error &&
+        dumped.name === "ReferenceError" &&
+        /^(?:require|module|process) is not defined$/u.test(dumped.message)
+      ) {
+        throw new CodeModeWorkerFailure("invalid_input", "code mode module access is disabled.");
+      }
       const text =
         dumped instanceof Error
           ? formatQuickJsError(dumped.name, dumped.message, dumped.stack)
@@ -560,6 +552,7 @@ async function readCompletedResult(vm: QuickJS, resultHandle: JSValueHandle): Pr
 function waitingResult(params: {
   vm: QuickJS;
   pendingRequests: PendingBridgeRequest[];
+  settlementMode: Extract<CodeModeWorkerResult, { status: "waiting" }>["settlementMode"];
   output: unknown[];
   config: CodeModeConfig;
 }): CodeModeWorkerResult {
@@ -571,6 +564,7 @@ function waitingResult(params: {
     status: "waiting",
     snapshotBytes,
     pendingRequests: params.pendingRequests,
+    settlementMode: params.settlementMode,
     output: params.output,
   };
 }
@@ -589,18 +583,23 @@ async function runVmExecution(params: {
     output = takeOutput(params.vm);
     const resultHandle = params.vm.global.getProp("__openclawResult");
     try {
-      if (params.pendingRequests.length > 0) {
-        // Pending host work suspends the VM instead of blocking in-worker; the
-        // host resumes with settled bridge results via runResume.
+      const promisePending = resultHandle.isPromise && resultHandle.promiseState === 0;
+      if (promisePending && params.pendingRequests.length === 0) {
+        throw new Error("code mode promise is pending without host work");
+      }
+      const requiredPendingRequestIds = params.pendingRequests.map((request) => request.id);
+      if (promisePending || requiredPendingRequestIds.length > 0) {
+        // Native await does not expose Promise ownership. Every dispatched
+        // call remains required, including detached calls and race branches.
         return waitingResult({
           vm: params.vm,
           pendingRequests: params.pendingRequests,
+          settlementMode: promisePending
+            ? { kind: "awaiting" }
+            : { kind: "draining", requiredRequestIds: requiredPendingRequestIds },
           output,
           config: params.config,
         });
-      }
-      if (resultHandle.isPromise && resultHandle.promiseState === 0) {
-        throw new Error("code mode promise is pending without host work");
       }
       return {
         status: "completed",
@@ -628,6 +627,7 @@ async function runExec(input: Extract<CodeModeWorkerInput, { kind: "exec" }>) {
     catalog: input.catalog,
     apiFiles: input.apiFiles ?? [],
     namespaces: input.namespaces,
+    swarmEnabled: input.swarmEnabled === true,
     config: input.config,
     pendingRequests,
   });
@@ -647,7 +647,9 @@ async function runExec(input: Extract<CodeModeWorkerInput, { kind: "exec" }>) {
 }
 
 async function runResume(input: Extract<CodeModeWorkerInput, { kind: "resume" }>) {
-  const pendingRequests: PendingBridgeRequest[] = [];
+  // Restored promises keep their original bridge ids; do not redispatch calls
+  // that are still running when a faster sibling resumes this snapshot.
+  const pendingRequests: PendingBridgeRequest[] = [...(input.pendingRequests ?? [])];
   const { vm, didTimeout } = await restoreVm({
     snapshotBytes: input.snapshotBytes,
     config: input.config,
@@ -702,6 +704,7 @@ async function main(): Promise<CodeModeWorkerResult> {
         namespaces: Array.isArray(input.namespaces)
           ? (input.namespaces as CodeModeNamespaceDescriptor[])
           : [],
+        swarmEnabled: input.swarmEnabled === true,
       });
     }
     if (input.kind === "resume" && input.snapshotBytes instanceof Uint8Array) {
@@ -711,6 +714,9 @@ async function main(): Promise<CodeModeWorkerResult> {
         config: input.config as CodeModeConfig,
         settledRequests: Array.isArray(input.settledRequests)
           ? (input.settledRequests as SettledBridgeRequest[])
+          : [],
+        pendingRequests: Array.isArray(input.pendingRequests)
+          ? (input.pendingRequests as PendingBridgeRequest[])
           : [],
       });
     }
