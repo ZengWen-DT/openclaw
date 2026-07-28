@@ -34,8 +34,9 @@ function loadRoute(search: string): CustodianRouteData {
 function createContext(): ApplicationContext {
   const snapshot: ApplicationGatewaySnapshot = {
     client: null,
-    connected: false,
-    reconnecting: false,
+    phase: "stopped",
+    offlineStable: false,
+    canvasPluginSurfaceUrl: null,
     hello: null,
     assistantAgentId: "main",
     sessionKey: "main",
@@ -69,7 +70,7 @@ describe("custodian route", () => {
     expect(loadRoute("?intent=new-agent")).toEqual({ onboarding: false, intent: "new-agent" });
   });
 
-  it("renders Exit setup only in onboarding mode", async () => {
+  it("renders mode-specific framing", async () => {
     const provider = createApplicationContextProvider(createContext());
     document.body.append(provider);
 
@@ -78,13 +79,19 @@ describe("custodian route", () => {
       "openclaw-custodian-page",
     );
     await normalPage?.updateComplete;
-    expect(normalPage?.querySelector(".custodian__header > .btn")).toBeNull();
+    expect(normalPage?.querySelector(".custodian__header .btn")).toBeNull();
+    expect(normalPage?.querySelector(".custodian__header p")?.textContent?.trim()).toBe(
+      "System setup and care.",
+    );
 
     render(renderCustodianRoute({ onboarding: true, intent: null }), provider);
     const onboardingPage = provider.querySelector<
       HTMLElement & { updateComplete: Promise<boolean> }
     >("openclaw-custodian-page");
     await onboardingPage?.updateComplete;
-    expect(onboardingPage?.querySelector(".custodian__header > .btn")).not.toBeNull();
+    expect(onboardingPage?.querySelector(".custodian__header .btn")).not.toBeNull();
+    expect(onboardingPage?.querySelector(".custodian__header p")?.textContent?.trim()).toBe(
+      "Your system setup guide",
+    );
   });
 });
