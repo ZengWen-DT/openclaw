@@ -230,11 +230,7 @@ describe("exa web search provider", () => {
     const provider = createExaWebSearchProvider();
     const tool = provider.createTool({
       config: {
-        plugins: {
-          entries: {
-            exa: { config: { webSearch: { apiKey: "exa-secret" } } },
-          },
-        },
+        plugins: { entries: { exa: { config: { webSearch: { apiKey: "exa-secret" } } } } },
       },
       searchConfig: {},
     });
@@ -270,11 +266,7 @@ describe("exa web search provider", () => {
     const provider = createExaWebSearchProvider();
     const tool = provider.createTool({
       config: {
-        plugins: {
-          entries: {
-            exa: { config: { webSearch: { apiKey: "exa-secret" } } },
-          },
-        },
+        plugins: { entries: { exa: { config: { webSearch: { apiKey: "exa-secret" } } } } },
       },
       searchConfig: {},
     });
@@ -300,11 +292,7 @@ describe("exa web search provider", () => {
     const provider = createExaWebSearchProvider();
     const tool = provider.createTool({
       config: {
-        plugins: {
-          entries: {
-            exa: { config: { webSearch: { apiKey: "exa-secret" } } },
-          },
-        },
+        plugins: { entries: { exa: { config: { webSearch: { apiKey: "exa-secret" } } } } },
       },
       searchConfig: {},
     });
