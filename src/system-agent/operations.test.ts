@@ -3,8 +3,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { resetPluginStateStoreForTests } from "../plugin-state/plugin-state-store.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
+import { listSystemAgentAuditEntriesForTests } from "./audit.test-support.js";
 import {
   describeSystemAgentPersistentOperation,
   executeSystemAgentOperation,
@@ -38,6 +40,10 @@ function expectAuditRecord(
   expectRecordFields(requireRecord(auditRecord.details, "audit details"), detailFields);
 }
 
+function readLastAuditEntry(): unknown {
+  return listSystemAgentAuditEntriesForTests().at(-1)?.value;
+}
+
 function requireFirstMockCall(mock: unknown, label: string): unknown[] {
   const call = (mock as { mock?: { calls?: unknown[][] } }).mock?.calls?.[0];
   if (!call) {
@@ -57,6 +63,7 @@ const mockConfig = vi.hoisted(() => {
     path: "/tmp/openclaw.json",
     exists: true,
     config: initial as TestConfig,
+    sourceConfigBeforeMigrations: undefined as TestConfig | undefined,
     hash: "mock-hash-0" as string | undefined,
   };
   const cloneConfig = () => structuredClone(state.config);
@@ -67,6 +74,7 @@ const mockConfig = vi.hoisted(() => {
       exists: state.exists,
       raw: state.exists ? `${JSON.stringify(config)}\n` : null,
       parsed: state.exists ? config : undefined,
+      sourceConfigBeforeMigrations: structuredClone(state.sourceConfigBeforeMigrations ?? config),
       sourceConfig: config,
       resolved: config,
       valid: state.exists,
@@ -83,12 +91,14 @@ const mockConfig = vi.hoisted(() => {
       state.path = "/tmp/openclaw.json";
       state.exists = true;
       state.config = {};
+      state.sourceConfigBeforeMigrations = undefined;
       state.hash = "mock-hash-0";
     },
     missing(pathLocal: string) {
       state.path = pathLocal;
       state.exists = false;
       state.config = {};
+      state.sourceConfigBeforeMigrations = undefined;
       state.hash = undefined;
     },
     currentConfig() {
@@ -96,6 +106,11 @@ const mockConfig = vi.hoisted(() => {
     },
     setConfig(config: TestConfig) {
       state.config = structuredClone(config);
+      state.sourceConfigBeforeMigrations = undefined;
+    },
+    setResolvedConfig(config: TestConfig, sourceConfigBeforeMigrations: TestConfig) {
+      state.config = structuredClone(config);
+      state.sourceConfigBeforeMigrations = structuredClone(sourceConfigBeforeMigrations);
     },
     readConfigFileSnapshot: vi.fn(async () => snapshot()),
     mutateConfigFile: vi.fn(
@@ -181,6 +196,7 @@ describe("parseSystemAgentOperation", () => {
   });
 
   afterEach(() => {
+    resetPluginStateStoreForTests();
     stateDirSnapshot?.restore();
     vi.unstubAllEnvs();
   });
@@ -486,7 +502,7 @@ describe("parseSystemAgentOperation", () => {
     const tempDir = opTempDirs.make("openclaw-agent-model-rejected-");
     setTestEnvValue("OPENCLAW_STATE_DIR", tempDir);
     const { runtime, lines } = createSystemAgentTestRuntime();
-    const runAgentsAdd = vi.fn(async () => {});
+    const createAgent = vi.fn();
     expect(
       isPersistentSystemAgentOperation({
         kind: "create-agent",
@@ -505,11 +521,11 @@ describe("parseSystemAgentOperation", () => {
           model: "openai/gpt-5.5",
         },
         runtime,
-        { approved: true, deps: { runAgentsAdd } },
+        { approved: true, deps: { createAgent } },
       ),
     ).rejects.toThrow("Retry without `model`; the new agent inherits");
 
-    expect(runAgentsAdd).not.toHaveBeenCalled();
+    expect(createAgent).not.toHaveBeenCalled();
     expect(lines.join("\n")).not.toContain("[openclaw] running: agents.create");
     await expect(fs.access(path.join(tempDir, "audit", "system-agent.jsonl"))).rejects.toThrow();
   });
@@ -518,7 +534,7 @@ describe("parseSystemAgentOperation", () => {
     const tempDir = opTempDirs.make("openclaw-agent-id-reserved-");
     setTestEnvValue("OPENCLAW_STATE_DIR", tempDir);
     const { runtime, lines } = createSystemAgentTestRuntime();
-    const runAgentsAdd = vi.fn(async () => {});
+    const createAgent = vi.fn();
     const operation = {
       kind: "create-agent" as const,
       agentId: "OpenClaw",
@@ -529,18 +545,18 @@ describe("parseSystemAgentOperation", () => {
     await expect(
       executeSystemAgentOperation(operation, runtime, {
         approved: true,
-        deps: { runAgentsAdd },
+        deps: { createAgent },
       }),
     ).rejects.toThrow('Agent id "openclaw" is reserved');
 
-    expect(runAgentsAdd).not.toHaveBeenCalled();
+    expect(createAgent).not.toHaveBeenCalled();
     expect(lines.join("\n")).not.toContain("[openclaw] running: agents.create");
     await expect(fs.access(path.join(tempDir, "audit", "system-agent.jsonl"))).rejects.toThrow();
   });
 
   it("keeps the retired agent identity reserved", async () => {
     const { runtime } = createSystemAgentTestRuntime();
-    const runAgentsAdd = vi.fn(async () => {});
+    const createAgent = vi.fn();
     const operation = {
       kind: "create-agent" as const,
       agentId: "crestodian", // reserved retired id
@@ -551,10 +567,10 @@ describe("parseSystemAgentOperation", () => {
     await expect(
       executeSystemAgentOperation(operation, runtime, {
         approved: true,
-        deps: { runAgentsAdd },
+        deps: { createAgent },
       }),
     ).rejects.toThrow('Agent id "crestodian" is reserved'); // reserved retired id
-    expect(runAgentsAdd).not.toHaveBeenCalled();
+    expect(createAgent).not.toHaveBeenCalled();
   });
 
   it("requires approval before restarting gateway", async () => {
@@ -624,8 +640,7 @@ describe("parseSystemAgentOperation", () => {
       cliOptions: {},
     });
     expect(lines.join("\n")).toContain("[openclaw] done: config.set");
-    const auditPath = path.join(tempDir, "audit", "system-agent.jsonl");
-    const audit = JSON.parse((await fs.readFile(auditPath, "utf8")).trim());
+    const audit = readLastAuditEntry();
     expectAuditRecord(
       audit,
       { operation: "config.set", summary: "Set config gateway.port" },
@@ -637,7 +652,7 @@ describe("parseSystemAgentOperation", () => {
     );
   });
 
-  it("reports an audit failure without claiming the committed operation failed", async () => {
+  it("records SQLite audit state despite a retired audit-directory symlink", async () => {
     const tempDir = opTempDirs.make("openclaw-audit-warning-");
     setTestEnvValue("OPENCLAW_STATE_DIR", tempDir);
     const redirectedAuditDir = path.join(tempDir, "redirected-audit");
@@ -654,9 +669,7 @@ describe("parseSystemAgentOperation", () => {
 
     expect(result.applied).toBe(true);
     expect(runConfigSet).toHaveBeenCalledOnce();
-    expect(lines.join("\n")).toContain(
-      "Set config gateway.port, but OpenClaw could not record its audit entry:",
-    );
+    expect(readLastAuditEntry()).toMatchObject({ operation: "config.set" });
     expect(lines.join("\n")).toContain("[openclaw] done: config.set");
   });
 
@@ -691,8 +704,7 @@ describe("parseSystemAgentOperation", () => {
       },
     });
     expect(lines.join("\n")).toContain("[openclaw] done: config.setRef");
-    const auditPath = path.join(tempDir, "audit", "system-agent.jsonl");
-    const audit = JSON.parse((await fs.readFile(auditPath, "utf8")).trim());
+    const audit = readLastAuditEntry();
     expectAuditRecord(
       audit,
       {
@@ -876,6 +888,45 @@ describe("parseSystemAgentOperation", () => {
     expect(runConfigSet).toHaveBeenCalledOnce();
   });
 
+  it("resolves numeric legacy list indices from the authored array order", async () => {
+    const tempDir = opTempDirs.make("openclaw-numeric-agent-route-");
+    setTestEnvValue("OPENCLAW_STATE_DIR", tempDir);
+    mockConfig.setResolvedConfig(
+      {
+        agents: {
+          entries: {
+            "2": {},
+            "10": { default: true },
+          },
+        },
+      },
+      {
+        agents: {
+          list: [{ id: "10", default: true }, { id: "2" }],
+        },
+      },
+    );
+    const { runtime } = createSystemAgentTestRuntime();
+    const runConfigSet = vi.fn(async () => {});
+
+    await expect(
+      executeSystemAgentOperation(
+        { kind: "config-set", path: "agents.list[0].model", value: '"openai/gpt-5.5"' },
+        runtime,
+        { approved: true, deps: { runConfigSet } },
+      ),
+    ).rejects.toThrow("openclaw onboard");
+    expect(runConfigSet).not.toHaveBeenCalled();
+
+    const result = await executeSystemAgentOperation(
+      { kind: "config-set", path: "agents.list[1].model", value: '"openai/gpt-5.5"' },
+      runtime,
+      { approved: true, deps: { runConfigSet } },
+    );
+    expect(result.applied).toBe(true);
+    expect(runConfigSet).toHaveBeenCalledOnce();
+  });
+
   it("runs plugin list and search as read-only operations", async () => {
     const { runtime, lines } = createSystemAgentTestRuntime();
     const runPluginsList = vi.fn(async (pluginRuntime: RuntimeEnv) => {
@@ -938,8 +989,7 @@ describe("parseSystemAgentOperation", () => {
     expect(installCall[0]).toBe("clawhub:openclaw-demo");
     expectRuntimeArg(installCall[1]);
     expect(lines.join("\n")).toContain("[openclaw] done: plugin.install");
-    const auditPath = path.join(tempDir, "audit", "system-agent.jsonl");
-    const audit = JSON.parse((await fs.readFile(auditPath, "utf8")).trim());
+    const audit = readLastAuditEntry();
     expectAuditRecord(
       audit,
       {

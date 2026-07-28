@@ -170,23 +170,9 @@ describe("runDoctorStateSqliteCompact", () => {
     expect(report.integrityCheck).toBe("ok");
   });
 
-  it("clears authoritative quarantine and verification history after compaction", async () => {
+  it("clears authoritative quarantine after compaction", async () => {
     const env = createStateEnv();
     const sqlitePath = seedStateDatabase({ env, withBloat: true });
-    const sqlite = requireNodeSqlite();
-    const history = new sqlite.DatabaseSync(sqlitePath);
-    try {
-      history
-        .prepare(
-          `
-            INSERT INTO database_verifications (path, kind, verified_at, result, error)
-            VALUES (?, 'state', 1, 'error', 'corrupt index')
-          `,
-        )
-        .run(sqlitePath);
-    } finally {
-      history.close();
-    }
     expect(
       recordOpenClawDatabaseQuarantine({
         env,
@@ -199,10 +185,7 @@ describe("runDoctorStateSqliteCompact", () => {
     await runDoctorStateSqliteCompact({ env });
 
     expect(readOpenClawDatabaseQuarantine(sqlitePath, { env })).toBeUndefined();
-    const repaired = openOpenClawStateDatabase({ env });
-    expect(
-      repaired.db.prepare("SELECT 1 FROM database_verifications WHERE path = ?").get(sqlitePath),
-    ).toBeUndefined();
+    expect(openOpenClawStateDatabase({ env }).db.isOpen).toBe(true);
   });
 
   it.skipIf(process.platform === "win32")("reapplies owner-only SQLite permissions", async () => {
@@ -302,6 +285,14 @@ describe("runDoctorStateSqliteCompact", () => {
   it("treats a busy truncating checkpoint as failure", async () => {
     const env = createStateEnv();
     const sqlitePath = seedStateDatabase({ env });
+    expect(
+      recordOpenClawDatabaseQuarantine({
+        env,
+        kind: "state",
+        path: sqlitePath,
+        reason: "busy checkpoint",
+      }),
+    ).toBe(true);
     const sqlite = requireNodeSqlite();
     const reader = new sqlite.DatabaseSync(sqlitePath);
     const writer = new sqlite.DatabaseSync(sqlitePath);
@@ -314,6 +305,7 @@ describe("runDoctorStateSqliteCompact", () => {
         /checkpoint remained busy/,
       );
       expect(readPragma(writer, "auto_vacuum")).toBe(0);
+      expect(readOpenClawDatabaseQuarantine(sqlitePath, { env })?.reason).toBe("busy checkpoint");
     } finally {
       reader.exec("ROLLBACK;");
       reader.close();

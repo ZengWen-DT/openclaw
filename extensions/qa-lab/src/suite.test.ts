@@ -246,6 +246,37 @@ describe("qa suite", () => {
     expect(stop).toHaveBeenCalledTimes(1);
   });
 
+  it("cancels a successful lab readiness body before releasing its guard", async () => {
+    const events: string[] = [];
+    const stop = vi.fn(async () => {});
+    fetchWithSsrFGuardMock.mockResolvedValue({
+      response: new Response(
+        new ReadableStream<Uint8Array>({
+          cancel() {
+            events.push("cancel");
+          },
+        }),
+        { status: 200 },
+      ),
+      release: async () => {
+        events.push("release");
+      },
+    });
+
+    await expect(
+      qaSuiteProgressTesting.waitForQaLabReadyOrStopOwned({
+        lab: {
+          listenUrl: "http://127.0.0.1:43123",
+          stop,
+        },
+        ownsLab: false,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(events).toEqual(["cancel", "release"]);
+    expect(stop).not.toHaveBeenCalled();
+  });
+
   it("bounds a hung lab readiness request by the remaining startup deadline", async () => {
     vi.useFakeTimers();
     const stop = vi.fn(async () => {});
@@ -783,7 +814,7 @@ describe("qa suite", () => {
       OPENCLAW_BUILD_PRIVATE_QA: "1",
       OPENCLAW_QA_FORCE_RUNTIME: "codex",
       OPENCLAW_CODEX_APP_SERVER_ARGS:
-        "app-server -c openai_base_url=http://127.0.0.1:44080/v1 --listen stdio://",
+        "app-server -c openai_base_url=http://127.0.0.1:44080/v1 -c sandbox_workspace_write.exclude_tmpdir_env_var=true -c sandbox_workspace_write.exclude_slash_tmp=true --listen stdio://",
       OPENAI_API_KEY: "qa-mock-openai-key",
       CODEX_API_KEY: "qa-mock-openai-key",
     });
@@ -799,6 +830,39 @@ describe("qa suite", () => {
     ).toEqual({
       OPENCLAW_BUILD_PRIVATE_QA: "1",
       OPENCLAW_QA_FORCE_RUNTIME: "openclaw",
+    });
+  });
+
+  it("confines live Codex QA without rewiring the native provider", () => {
+    expect(
+      qaSuiteProgressTesting.buildQaRuntimeEnvPatch({
+        providerMode: "live-frontier",
+        forcedRuntime: "codex",
+      }),
+    ).toEqual({
+      OPENCLAW_BUILD_PRIVATE_QA: "1",
+      OPENCLAW_QA_FORCE_RUNTIME: "codex",
+      OPENCLAW_CODEX_APP_SERVER_ARGS:
+        "app-server -c sandbox_workspace_write.exclude_tmpdir_env_var=true " +
+        "-c sandbox_workspace_write.exclude_slash_tmp=true --listen stdio://",
+    });
+  });
+
+  it("preserves custom live Codex arguments when confining a QA suite", () => {
+    expect(
+      qaSuiteProgressTesting.buildQaRuntimeEnvPatch({
+        providerMode: "live-frontier",
+        forcedRuntime: "codex",
+        nativeAppServerArgs:
+          'app-server -c openai_base_url="https://live.example/v1" --listen stdio://',
+      }),
+    ).toEqual({
+      OPENCLAW_BUILD_PRIVATE_QA: "1",
+      OPENCLAW_QA_FORCE_RUNTIME: "codex",
+      OPENCLAW_CODEX_APP_SERVER_ARGS:
+        'app-server -c openai_base_url="https://live.example/v1" --listen stdio:// ' +
+        "-c sandbox_workspace_write.exclude_tmpdir_env_var=true " +
+        "-c sandbox_workspace_write.exclude_slash_tmp=true",
     });
   });
 

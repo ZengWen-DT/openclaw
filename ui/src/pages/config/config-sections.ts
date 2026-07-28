@@ -6,6 +6,7 @@ export type ConfigPageId =
   | "security"
   | "automation"
   | "mcp"
+  | "memory"
   | "infrastructure"
   | "ai-agents"
   | "advanced";
@@ -43,17 +44,16 @@ export const INFRASTRUCTURE_SECTION_KEYS = [
   "discovery",
   "media",
   "acp",
-  "mcp",
 ] as const;
 
-export const AI_AGENTS_SECTION_KEYS = [
-  "agents",
-  "models",
-  "skills",
-  "tools",
-  "memory",
-  "session",
-] as const;
+export const MCP_SECTION_KEYS = ["mcp"] as const;
+
+// Curated Memory home: engine/backend/add-on rows plus the Dreaming tab render
+// above the memory schema section (memory.ts). Memory left AI & Agents because
+// the engine choice and dreaming's global cron are not agent defaults.
+export const MEMORY_SECTION_KEYS = ["memory"] as const;
+
+export const AI_AGENTS_SECTION_KEYS = ["agents", "models", "skills", "tools", "session"] as const;
 
 export const SCOPED_CONFIG_SECTION_KEYS = new Set<string>([
   ...COMMUNICATION_SECTION_KEYS,
@@ -62,6 +62,8 @@ export const SCOPED_CONFIG_SECTION_KEYS = new Set<string>([
   ...SECURITY_SECTION_KEYS,
   ...AUTOMATION_SECTION_KEYS,
   ...INFRASTRUCTURE_SECTION_KEYS,
+  ...MCP_SECTION_KEYS,
+  ...MEMORY_SECTION_KEYS,
   ...AI_AGENTS_SECTION_KEYS,
 ]);
 
@@ -75,7 +77,8 @@ const CONFIG_SECTION_KEYS_BY_PAGE = {
   notifications: NOTIFICATION_SECTION_KEYS,
   security: SECURITY_SECTION_KEYS,
   automation: AUTOMATION_SECTION_KEYS,
-  mcp: INFRASTRUCTURE_SECTION_KEYS,
+  mcp: MCP_SECTION_KEYS,
+  memory: MEMORY_SECTION_KEYS,
   infrastructure: INFRASTRUCTURE_SECTION_KEYS,
   "ai-agents": AI_AGENTS_SECTION_KEYS,
   advanced: undefined,

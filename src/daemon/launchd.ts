@@ -1,4 +1,5 @@
 /** macOS LaunchAgent installer, runtime inspection, and lifecycle controls. */
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
@@ -33,6 +34,7 @@ import { formatLine, toPosixPath, writeFormattedLines } from "./output.js";
 import { resolveGatewayStateDir, resolveHomeDir } from "./paths.js";
 import { resolveGatewaySupervisorLogPaths } from "./restart-logs.js";
 import { parseKeyValueOutput } from "./runtime-parse.js";
+import { createGatewayLifecycleMutationReporter } from "./service-mutation.js";
 import type { GatewayServiceRuntime } from "./service-runtime.js";
 import type {
   GatewayServiceCommandConfig,
@@ -62,6 +64,7 @@ const OPENCLAW_NODE_RUNTIME_NAMES = new Set(["bun", "bun.exe", "node", "node.exe
 const OPENCLAW_SCRIPT_NAMES = new Set(["openclaw.mjs"]);
 const LAUNCH_AGENT_STOP_PORT_RELEASE_TIMEOUT_MS = LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS * 1_000;
 const LAUNCH_AGENT_STOP_PORT_RELEASE_POLL_MS = 100;
+const LAUNCHCTL_PROTECTED_PID_TIMEOUT_MS = 2_000;
 
 export type StaleOpenClawUpdateLaunchdJob = {
   label: string;
@@ -375,6 +378,26 @@ async function execLaunchctl(
   const file = isWindows ? getWindowsCmdExePath() : "launchctl";
   const fileArgs = isWindows ? ["/d", "/s", "/c", "launchctl", ...args] : args;
   return await execFileUtf8(file, fileArgs, isWindows ? { windowsHide: true } : {});
+}
+
+function readLaunchAgentPidForCleanupSync(serviceTarget: string): number {
+  const probe = spawnSync("launchctl", ["print", serviceTarget], {
+    encoding: "utf8",
+    timeout: LAUNCHCTL_PROTECTED_PID_TIMEOUT_MS,
+  });
+  const result = {
+    stdout: probe.stdout ?? "",
+    stderr: probe.error?.message ?? probe.stderr ?? "",
+    code: probe.error ? 1 : (probe.status ?? 1),
+  };
+  if (result.code !== 0) {
+    throw new Error(`launchctl print failed: ${formatLaunchctlResultDetail(result)}`);
+  }
+  const pid = parseLaunchctlPrint(result.stdout || result.stderr || "").pid;
+  if (pid === undefined) {
+    throw new Error("launchctl print did not report a running pid");
+  }
+  return pid;
 }
 
 export function parseLaunchctlListOpenClawUpdateJobs(
@@ -781,8 +804,7 @@ export async function repairLaunchAgentBootstrap(args: {
   const serviceTarget = `${domain}/${label}`;
   // Rewrite first so legacy inline environment secrets move into the private
   // env file before the plist becomes world-readable for launchd.
-  const warn =
-    args.warn ?? ((message: string) => process.stderr.write(`${formatLine("Warning", message)}\n`));
+  const warn = args.warn ?? ((message: string) => console.warn(formatLine("Warning", message)));
   await rewriteLaunchAgentPlistForRestart({ env, label, plistPath, warn });
   await execLaunchctl(["enable", serviceTarget]);
   const boot = await execLaunchctl(["bootstrap", domain, plistPath]);
@@ -853,7 +875,7 @@ export async function uninstallLaunchAgent({
   }
 }
 
-function isLaunchctlNotLoaded(res: { stdout: string; stderr: string; code: number }): boolean {
+export function isLaunchctlNotLoaded(res: { stdout: string; stderr: string }): boolean {
   const detail = normalizeLowercaseStringOrEmpty(res.stderr || res.stdout);
   return (
     detail.includes("no such process") ||
@@ -995,6 +1017,7 @@ export async function stopLaunchAgent({
   const domain = resolveGuiDomain();
   const label = resolveLaunchAgentLabel({ env: serviceEnv });
   const serviceTarget = `${domain}/${label}`;
+  const reportMutation = createGatewayLifecycleMutationReporter(onMutation);
 
   if (
     isCurrentProcessLaunchdServiceLabel(label, process.env, { allowConfiguredLabelFallback: false })
@@ -1012,7 +1035,7 @@ export async function stopLaunchAgent({
     if (bootout.code !== 0 && !isLaunchctlNotLoaded(bootout)) {
       throw new Error(`launchctl bootout failed: ${formatLaunchctlResultDetail(bootout)}`);
     }
-    onMutation?.({ mode: "bootout" });
+    reportMutation("bootout");
     await assertGatewayPortReleasedAfterStop(serviceEnv);
     stdout.write(`${formatLine("Stopped LaunchAgent", serviceTarget)}\n`);
     return;
@@ -1026,13 +1049,13 @@ export async function stopLaunchAgent({
       serviceTarget,
       stdout,
       warning: `launchctl disable failed; used bootout fallback and left service unloaded: ${formatLaunchctlResultDetail(disableResult)}`,
-      onMutation: () => onMutation?.({ mode: "disable-bootout" }),
+      onMutation: () => reportMutation("disable-bootout"),
     });
     await assertGatewayPortReleasedAfterStop(serviceEnv);
     stdout.write(`${formatLine("Stopped LaunchAgent (degraded)", serviceTarget)}\n`);
     return;
   }
-  onMutation?.({ mode: "disable" });
+  reportMutation("disable");
 
   // `launchctl stop` targets the plain label (not the fully-qualified service target).
   const stop = await execLaunchctl(["stop", label]);
@@ -1041,14 +1064,14 @@ export async function stopLaunchAgent({
       serviceTarget,
       stdout,
       warning: `launchctl stop failed; used bootout fallback and left service unloaded: ${formatLaunchctlResultDetail(stop)}`,
-      onMutation: () => onMutation?.({ mode: "disable-bootout" }),
+      onMutation: () => reportMutation("disable-bootout"),
     });
     await assertGatewayPortReleasedAfterStop(serviceEnv);
     stdout.write(`${formatLine("Stopped LaunchAgent (degraded)", serviceTarget)}\n`);
     return;
   }
 
-  onMutation?.({ mode: "disable-stop" });
+  reportMutation("disable-stop");
 
   const stopState = await waitForLaunchAgentStopped(serviceTarget);
   if (stopState.state !== "stopped" && stopState.state !== "not-loaded") {
@@ -1060,7 +1083,7 @@ export async function stopLaunchAgent({
       serviceTarget,
       stdout,
       warning,
-      onMutation: () => onMutation?.({ mode: "disable-bootout" }),
+      onMutation: () => reportMutation("disable-bootout"),
     });
     await assertGatewayPortReleasedAfterStop(serviceEnv);
     stdout.write(`${formatLine("Stopped LaunchAgent (degraded)", serviceTarget)}\n`);
@@ -1255,29 +1278,17 @@ async function ensureLaunchAgentLoadedAfterFailure(params: {
   }
 }
 
-function createLaunchAgentMutationReporter(
-  onMutation: GatewayServiceControlArgs["onMutation"],
-): (mode: string) => void {
-  return (mode) => {
-    try {
-      onMutation?.({ mode });
-    } catch {
-      // Audit observers are diagnostic; never interrupt service control.
-    }
-  };
-}
-
 export async function startLaunchAgent({
   stdout,
   env,
   onMutation,
-}: GatewayServiceControlArgs): Promise<GatewayServiceRestartResult> {
+}: GatewayServiceControlArgs): Promise<void> {
   const serviceEnv = env ?? (process.env as GatewayServiceEnv);
   const domain = resolveGuiDomain();
   const label = resolveLaunchAgentLabel({ env: serviceEnv });
   const plistPath = resolveLaunchAgentPlistPath(serviceEnv);
   const serviceTarget = `${domain}/${label}`;
-  const reportMutation = createLaunchAgentMutationReporter(onMutation);
+  const reportMutation = createGatewayLifecycleMutationReporter(onMutation);
 
   // Enable is an independent mutation; audit it even if the later launch fails.
   const enable = await execLaunchctl(["enable", serviceTarget]);
@@ -1303,7 +1314,6 @@ export async function startLaunchAgent({
   }
 
   writeLaunchAgentActionLine(stdout, "Started LaunchAgent", serviceTarget);
-  return { outcome: "completed" };
 }
 
 export async function restartLaunchAgent({
@@ -1317,7 +1327,7 @@ export async function restartLaunchAgent({
   const label = resolveLaunchAgentLabel({ env: serviceEnv });
   const plistPath = resolveLaunchAgentPlistPath(serviceEnv);
   const serviceTarget = `${domain}/${label}`;
-  const reportMutation = createLaunchAgentMutationReporter(onMutation);
+  const reportMutation = createGatewayLifecycleMutationReporter(onMutation);
 
   // Restart requests issued from inside the managed gateway process tree need a
   // detached handoff. A direct `kickstart -k` would terminate the caller before
@@ -1345,15 +1355,30 @@ export async function restartLaunchAgent({
 
   const cleanupPort = await resolveLaunchAgentGatewayPort(serviceEnv);
   if (cleanupPort !== null) {
-    cleanStaleGatewayProcessesSync(cleanupPort);
+    cleanStaleGatewayProcessesSync(cleanupPort, {
+      // Resolve after lsof captures its listener snapshot. A KeepAlive respawn
+      // during enumeration must be protected before candidate filtering/signals.
+      resolveProtectedPid: () => readLaunchAgentPidForCleanupSync(serviceTarget),
+    });
     const diagnostics = await inspectPortUsage(cleanupPort).catch(() => null);
     if (diagnostics?.status === "busy") {
-      throw new Error(
-        [
-          `gateway port ${cleanupPort} is still busy before LaunchAgent restart`,
-          ...formatPortDiagnostics(diagnostics),
-        ].join("\n"),
-      );
+      const runtime = await readLaunchAgentRuntime(serviceEnv);
+      const managedPid = runtime.pid;
+      // Only the current supervised PID may keep the port busy before a
+      // disruptive restart. Re-read after cleanup to close over a concurrent
+      // launchd respawn rather than trusting the protected pre-cleanup PID.
+      const ownedByLaunchAgent =
+        managedPid !== undefined &&
+        diagnostics.listeners.length > 0 &&
+        diagnostics.listeners.every((listener) => listener.pid === managedPid);
+      if (!ownedByLaunchAgent) {
+        throw new Error(
+          [
+            `gateway port ${cleanupPort} is busy but is not verifiably owned by LaunchAgent ${label}`,
+            ...formatPortDiagnostics(diagnostics),
+          ].join("\n"),
+        );
+      }
     }
   }
   const plistReloadNeeded = await rewriteLaunchAgentPlistForRestart({
