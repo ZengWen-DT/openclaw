@@ -48,6 +48,7 @@ describe("GPT-Live call creation", () => {
         fetchImpl,
       }),
     ).resolves.toEqual({
+      kind: "gpt-live",
       status: 201,
       answerSdp: "v=answer\r\n",
       callId: "rtc_1",
@@ -99,6 +100,51 @@ describe("GPT-Live call creation", () => {
     }
   });
 
+  it.each(["gpt-realtime-2.1", "gpt-realtime-2.1-mini", "gpt-realtime-2"])(
+    "uses raw SDP with the model query and no quicksilver alpha header for %s OAuth",
+    async (model) => {
+      vi.stubEnv("OPENCLAW_VERSION", "2026.7.2-test");
+      let capturedHeaders: HeadersInit | undefined;
+      const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = init?.headers;
+        return new Response("v=ga-answer\r\n", { status: 201 });
+      });
+
+      await expect(
+        createOpenAIQuicksilverCall({
+          auth: { type: "oauth", token: "oauth-token", accountId: "acct-1" },
+          requestIds: createRequestIds("ga-oauth"),
+          sdp: "v=ga-offer\r\n",
+          session: buildOpenAIQuicksilverSession({ model }),
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+        }),
+      ).resolves.toEqual({
+        kind: "ga-realtime",
+        status: 201,
+        answerSdp: "v=ga-answer\r\n",
+      });
+      expect(fetchImpl).toHaveBeenCalledWith(
+        `https://api.openai.com/v1/realtime/calls?model=${model}`,
+        expect.objectContaining({
+          method: "POST",
+          body: "v=ga-offer\r\n",
+          headers: {
+            Authorization: "Bearer oauth-token",
+            "User-Agent": "openclaw/2026.7.2-test",
+            "chatgpt-account-id": "acct-1",
+            originator: "openclaw",
+            "session-id": "ga-oauth-session",
+            "thread-id": "ga-oauth-thread",
+            version: "2026.7.2-test",
+            "x-session-id": "ga-oauth-realtime",
+            "Content-Type": "application/sdp",
+          },
+        }),
+      );
+      expect(capturedHeaders).not.toHaveProperty("OpenAI-Alpha");
+    },
+  );
+
   it.each([
     {
       name: "overloaded rejection",
@@ -137,7 +183,18 @@ describe("GPT-Live call creation", () => {
     });
   });
 
-  it("bounds and cancels a streaming error response", async () => {
+  it.each([
+    {
+      name: "GPT-Live",
+      model: "gpt-live-1-codex",
+      expectedMessage: "GPT-Live call creation failed (429): provider diagnostic:",
+    },
+    {
+      name: "GA realtime",
+      model: "gpt-realtime-2.1",
+      expectedMessage: "OpenAI Realtime call creation failed (429): provider diagnostic:",
+    },
+  ])("bounds and cancels an oversized streaming $name error response", async (testCase) => {
     const detailPrefix = "provider diagnostic: ";
     let resolveResponseClosed: (() => void) | undefined;
     const responseClosed = new Promise<void>((resolve) => {
@@ -160,7 +217,7 @@ describe("GPT-Live call creation", () => {
     const controller = new AbortController();
     const abortTimer = setTimeout(() => controller.abort(), 2_000);
     const fetchImpl = ((_url: string | URL | Request, init?: RequestInit) =>
-      fetch(`http://127.0.0.1:${address.port}/v1/live`, {
+      fetch(`http://127.0.0.1:${address.port}/realtime-call`, {
         ...init,
         signal: controller.signal,
       })) as typeof fetch;
@@ -168,16 +225,16 @@ describe("GPT-Live call creation", () => {
     try {
       const promise = createOpenAIQuicksilverCall({
         auth: { type: "api-key", token: "platform-key" },
-        requestIds: createRequestIds("streaming-error"),
+        requestIds: createRequestIds(`streaming-error-${testCase.name}`),
         sdp: "v=offer\r\n",
-        session: buildOpenAIQuicksilverSession({ model: "gpt-live-1-codex" }),
+        session: buildOpenAIQuicksilverSession({ model: testCase.model }),
         signal: controller.signal,
         fetchImpl,
       });
       await expect(promise).rejects.toMatchObject({
         name: "OpenAIQuicksilverCallError",
         status: 429,
-        message: expect.stringContaining(detailPrefix),
+        message: expect.stringContaining(testCase.expectedMessage),
       });
       await responseClosed;
       expect(controller.signal.aborted).toBe(false);
