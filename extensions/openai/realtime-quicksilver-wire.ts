@@ -1,6 +1,9 @@
 // GPT-Live frameless session, call-creation, and sideband event wire contracts.
 import { randomBytes } from "node:crypto";
-import { resolveProviderRequestHeaders } from "openclaw/plugin-sdk/provider-http";
+import {
+  readResponseTextLimited,
+  resolveProviderRequestHeaders,
+} from "openclaw/plugin-sdk/provider-http";
 import { z } from "zod";
 
 const OPENAI_QUICKSILVER_APPEND_MAX_BYTES = 500;
@@ -8,6 +11,8 @@ const OPENAI_QUICKSILVER_CONTEXT_MAX_ENTRIES = 16;
 const OPENAI_QUICKSILVER_CONTEXT_MAX_ITEM_CHARS = 800;
 const OPENAI_QUICKSILVER_CONTEXT_MAX_UTF8_BYTES = 8_000;
 const OPENAI_QUICKSILVER_CALL_URL = "https://api.openai.com/v1/live";
+const OPENAI_QUICKSILVER_ERROR_BODY_MAX_BYTES = 16 * 1024;
+const OPENAI_QUICKSILVER_ERROR_DETAIL_MAX_CHARS = 500;
 const OPENAI_GPT_LIVE_WAITLIST_URL = "https://openai.com/form/gpt-live-1-in-the-api/";
 
 const OPENAI_QUICKSILVER_VOICES = [
@@ -336,7 +341,15 @@ export async function createOpenAIQuicksilverCall(params: {
     signal: params.signal,
   });
   if (!response.ok) {
-    const detail = (await response.text().catch(() => "")).trim().slice(0, 500);
+    // Provider failures are untrusted streams. Bound and cancel the unread body
+    // before retaining the short diagnostic included in the user-facing error.
+    const detail = (
+      await readResponseTextLimited(response, OPENAI_QUICKSILVER_ERROR_BODY_MAX_BYTES).catch(
+        () => "",
+      )
+    )
+      .trim()
+      .slice(0, OPENAI_QUICKSILVER_ERROR_DETAIL_MAX_CHARS);
     throw new OpenAIQuicksilverCallError(
       describeOpenAIQuicksilverCallError(response.status, detail),
       response.status,

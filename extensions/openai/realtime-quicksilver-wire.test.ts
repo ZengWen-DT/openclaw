@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildOpenAIQuicksilverSession,
@@ -134,6 +135,59 @@ describe("GPT-Live call creation", () => {
       status,
       message,
     });
+  });
+
+  it("bounds and cancels a streaming error response", async () => {
+    const detailPrefix = "provider diagnostic: ";
+    let resolveResponseClosed: (() => void) | undefined;
+    const responseClosed = new Promise<void>((resolve) => {
+      resolveResponseClosed = resolve;
+    });
+    const server = createServer((_request, response) => {
+      response.once("close", () => resolveResponseClosed?.());
+      response.writeHead(429, { "Content-Type": "text/plain" });
+      response.write(detailPrefix + "x".repeat(32 * 1024));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("test HTTP server did not bind a TCP port");
+    }
+
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), 2_000);
+    const fetchImpl = ((_url: string | URL | Request, init?: RequestInit) =>
+      fetch(`http://127.0.0.1:${address.port}/v1/live`, {
+        ...init,
+        signal: controller.signal,
+      })) as typeof fetch;
+
+    try {
+      const promise = createOpenAIQuicksilverCall({
+        auth: { type: "api-key", token: "platform-key" },
+        requestIds: createRequestIds("streaming-error"),
+        sdp: "v=offer\r\n",
+        session: buildOpenAIQuicksilverSession({ model: "gpt-live-1-codex" }),
+        signal: controller.signal,
+        fetchImpl,
+      });
+      await expect(promise).rejects.toMatchObject({
+        name: "OpenAIQuicksilverCallError",
+        status: 429,
+        message: expect.stringContaining(detailPrefix),
+      });
+      await responseClosed;
+      expect(controller.signal.aborted).toBe(false);
+    } finally {
+      clearTimeout(abortTimer);
+      controller.abort();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
   });
 
   it.each([
