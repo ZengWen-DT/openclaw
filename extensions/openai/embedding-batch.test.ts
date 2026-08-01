@@ -105,6 +105,12 @@ describe("OpenAI embedding batch output", () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    // Provider error-body reads own independent 10s chunk timers; only poll
+    // delays belong to the embedding batch's 1s operation deadline.
+    const pollTimeoutCalls = () =>
+      setTimeoutSpy.mock.calls.filter(([, timeout]) =>
+        scenario.expectedWaits.includes(Number(timeout)),
+      );
     let statusCalls = 0;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = fetchInputUrl(input);
@@ -158,18 +164,17 @@ describe("OpenAI embedding batch output", () => {
         }
       },
     });
-    const rejection = expect(result).rejects.toThrow("openai batch batch-0 timed out after 1000ms");
+    const rejection = expect(result).rejects.toMatchObject({
+      message: "openai batch batch-0 timed out after 1000ms",
+      ...(scenario.retryFirstStatus ? { cause: { status: 503 } } : {}),
+    });
 
     for (const [index, waitMs] of scenario.expectedWaits.entries()) {
-      for (
-        let attempt = 0;
-        attempt < 100 && setTimeoutSpy.mock.calls.length < index + 1;
-        attempt++
-      ) {
+      for (let attempt = 0; attempt < 100 && pollTimeoutCalls().length < index + 1; attempt++) {
         await Promise.resolve();
       }
-      expect(setTimeoutSpy).toHaveBeenCalledTimes(index + 1);
-      expect(setTimeoutSpy.mock.calls[index]?.[1]).toBe(waitMs);
+      expect(pollTimeoutCalls()).toHaveLength(index + 1);
+      expect(pollTimeoutCalls()[index]?.[1]).toBe(waitMs);
       await vi.advanceTimersByTimeAsync(waitMs);
     }
     await rejection;
