@@ -963,7 +963,7 @@ describe("spawnAcpDirect", () => {
         if (agentDispatchAttempts === 1) {
           throw new Error("gateway timeout after 60000ms");
         }
-        return { runId: "accepted-acp-run" };
+        return { runId: "accepted-acp-run", status: "in_flight" };
       }
       if (args.method === "sessions.patch") {
         return { ok: true };
@@ -994,6 +994,28 @@ describe("spawnAcpDirect", () => {
     const accepted = expectAcceptedSpawn(result);
     expect(accepted.runId).toBe("accepted-acp-run");
     expect(accepted.childSessionKey).toMatch(/^agent:codex:acp:/);
+  });
+
+  it("does not register an ACP child when reconciliation finds a terminal run", async () => {
+    let agentDispatchAttempts = 0;
+    hoisted.callGatewayMock.mockImplementation(async (argsUnknown: unknown) => {
+      const args = argsUnknown as { method?: string };
+      if (args.method === "agent" && ++agentDispatchAttempts === 1) {
+        throw new Error("gateway timeout after 60000ms");
+      }
+      return args.method === "agent"
+        ? { runId: "stopped-acp-run", status: "timeout" }
+        : { ok: true };
+    });
+
+    const result = await spawnAcpDirect(
+      { task: "ambiguous ACP child", agentId: "codex", mode: "run" },
+      { agentSessionKey: "agent:main:main" },
+    );
+
+    expect(agentDispatchAttempts).toBe(2);
+    expect(expectFailedSpawn(result).error).toContain("no active subagent run (status: timeout)");
+    expect(hoisted.registerSubagentRunMock).not.toHaveBeenCalled();
   });
 
   it("forwards ACP lineage with unsupported external native actions and the exact parent token", async () => {

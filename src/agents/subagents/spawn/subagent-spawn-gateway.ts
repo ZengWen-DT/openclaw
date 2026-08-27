@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import type { AgentRuntimeIdentity } from "../../../gateway/agent-runtime-identity-token.js";
 import { withInProcessAgentRuntimeIdentity } from "../../../gateway/in-process-agent-runtime-identity.js";
 import { isGatewayRpcUnavailableError } from "../../../gateway/transport-error.js";
@@ -20,6 +22,8 @@ import {
 
 const DEFAULT_SUBAGENT_AGENT_GATEWAY_TIMEOUT_MS = 60_000;
 const MAX_SUBAGENT_AGENT_GATEWAY_TIMEOUT_MS = 300_000;
+const SUBAGENT_AGENT_RECONCILE_INTERVAL_MS = 800;
+const SUBAGENT_AGENT_RECONCILE_TIMEOUT_MS = 6_400;
 
 type SubagentGatewayResponse = Awaited<ReturnType<typeof callGateway>>;
 type SubagentGatewayDispatchMode = "in_process" | "out_of_process";
@@ -155,29 +159,53 @@ async function callSubagentGatewayWithDispatchMode(
           ),
         )
       : deps.callGateway(typeof timeoutMs === "number" ? { ...request, timeoutMs } : request);
-  // A transport-ambiguous agent dispatch (gateway timeout/closed) does NOT prove the
-  // run never landed: the gateway can accept (and start) an agent run before the ack
-  // is received, and a same-idempotency-key replay returns that already-accepted run
-  // instead of starting a duplicate. Reconcile only agent dispatch calls (native and
-  // ACP share this seam); cleanup and other non-agent methods retry nothing.
+  // Only agent launches have an idempotency key backed by authoritative Gateway state.
+  // Other methods must not repeat after a transport-ambiguous failure.
   const response =
     request.method === "agent"
-      ? await reconcileSubagentAgentDispatch(() => dispatchAgentRequest(request.timeoutMs))
+      ? await reconcileSubagentAgentDispatch(dispatchAgentRequest, request.timeoutMs)
       : await dispatchAgentRequest(request.timeoutMs);
   return { response, dispatchMode: "out_of_process" };
 }
 
-async function reconcileSubagentAgentDispatch<T>(dispatch: () => Promise<T>): Promise<T> {
+async function reconcileSubagentAgentDispatch(
+  dispatch: (timeoutMs?: number | null) => Promise<SubagentGatewayResponse>,
+  timeoutMs?: number | null,
+): Promise<SubagentGatewayResponse> {
   try {
-    return await dispatch();
+    return await dispatch(timeoutMs);
   } catch (error) {
     if (!isGatewayRpcUnavailableError(error)) {
       throw error;
     }
-    // The first dispatch may have accepted the run gateway-side before the ack was
-    // lost. A same-key replay returns that already-accepted run instead of starting a
-    // duplicate, so surface the recovered run rather than misreporting "no target".
-    return await dispatch();
+    const deadline = Date.now() + SUBAGENT_AGENT_RECONCILE_TIMEOUT_MS;
+    while (true) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw error;
+      }
+      // Only an explicit provisional replay gets another attempt. Transport failures
+      // and Gateway rejections remain terminal, so an unreachable Gateway pays at
+      // most one short reconciliation call instead of a second launch timeout.
+      const response = await dispatch(Math.min(SUBAGENT_AGENT_RECONCILE_INTERVAL_MS, remainingMs));
+      const replay = asOptionalRecord(response);
+      if (
+        replay?.admissionPending !== true &&
+        (replay?.status === "accepted" || replay?.status === "in_flight") &&
+        readGatewayRunId(response)
+      ) {
+        return response;
+      }
+      if (replay?.admissionPending !== true) {
+        throw new Error(
+          `Gateway found no active subagent run (status: ${String(replay?.status)}). Retry the spawn.`,
+          { cause: error },
+        );
+      }
+      await delay(
+        Math.min(SUBAGENT_AGENT_RECONCILE_INTERVAL_MS, Math.max(0, deadline - Date.now())),
+      );
+    }
   }
 }
 
