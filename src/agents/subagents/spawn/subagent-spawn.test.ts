@@ -1120,6 +1120,36 @@ describe("spawnSubagentDirect seam flow", () => {
     expect(hoisted.registerSubagentRunMock).toHaveBeenCalledTimes(1);
   });
 
+  it("reconciles a transport-ambiguous dispatch so an accepted run is surfaced instead of misreported as an error", async () => {
+    let dispatchAttempts = 0;
+    // A plain Error whose message matches isGatewayRpcUnavailableError (the gateway
+    // timeout transport shape) models "the gateway may have accepted before the ack
+    // was lost" - distinct from a genuine dispatch rejection.
+    hoisted.callGatewayMock.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent") {
+        dispatchAttempts += 1;
+        if (dispatchAttempts === 1) {
+          throw new Error("gateway timeout after 60000ms");
+        }
+        return { runId: "accepted-ambig-run" };
+      }
+      return request.method?.startsWith("sessions.") ? { ok: true } : {};
+    });
+    const context = { agentSessionKey: "agent:main:main" };
+
+    const result = await spawnSubagentDirect({ task: "ambiguous child" }, context);
+
+    // The reconcile replay reuses the same idempotency key; the gateway surfaces it
+    // back as accepted, so the caller must not conclude nothing is running.
+    expect(dispatchAttempts).toBe(2);
+    expect(result).toMatchObject({
+      status: "accepted",
+      runId: "accepted-ambig-run",
+      childSessionKey: expect.any(String),
+    });
+    expect(hoisted.registerSubagentRunMock).toHaveBeenCalledTimes(1);
+  });
+
   it("shares pending child capacity between native and visible spawn paths", async () => {
     const { maybeSpawnVisibleSession } = await import("../../tools/sessions-spawn-visible.js");
     hoisted.configOverride = createConfigOverride({

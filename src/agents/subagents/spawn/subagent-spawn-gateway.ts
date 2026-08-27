@@ -1,5 +1,6 @@
 import type { AgentRuntimeIdentity } from "../../../gateway/agent-runtime-identity-token.js";
 import { withInProcessAgentRuntimeIdentity } from "../../../gateway/in-process-agent-runtime-identity.js";
+import { isGatewayRpcUnavailableError } from "../../../gateway/transport-error.js";
 import type { WorkerTurnExecutionIdentity } from "../../../gateway/worker-environments/placement-turn-claim-events.js";
 import { getActiveAgentRunDelegatedAuthority } from "../../../infra/agent-run-registry.js";
 import { getGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
@@ -137,13 +138,13 @@ async function callSubagentGatewayWithDispatchMode(
       : await dispatch();
     return { response, dispatchMode: "in_process" };
   }
-  const response =
+  const dispatchAgentRequest = (timeoutMs?: number | null) =>
     sessionSpawnContext && gatewayCaller?.operationalRunInstance
-      ? await runWithGatewaySessionSpawnContext(sessionSpawnContext, () =>
+      ? runWithGatewaySessionSpawnContext(sessionSpawnContext, () =>
           runWithGatewaySessionSpawnParentExecutionIdentity(parentExecutionIdentityToken, () =>
             callGatewayTool(
               request.method,
-              typeof request.timeoutMs === "number" ? { timeoutMs: request.timeoutMs } : {},
+              typeof timeoutMs === "number" ? { timeoutMs } : {},
               request.params,
               {
                 expectFinal: request.expectFinal,
@@ -153,8 +154,31 @@ async function callSubagentGatewayWithDispatchMode(
             ),
           ),
         )
-      : await deps.callGateway(request);
+      : deps.callGateway(typeof timeoutMs === "number" ? { ...request, timeoutMs } : request);
+  // A transport-ambiguous agent dispatch (gateway timeout/closed) does NOT prove the
+  // run never landed: the gateway can accept (and start) an agent run before the ack
+  // is received, and a same-idempotency-key replay returns that already-accepted run
+  // instead of starting a duplicate. Reconcile only agent dispatch calls (native and
+  // ACP share this seam); cleanup and other non-agent methods retry nothing.
+  const response =
+    request.method === "agent"
+      ? await reconcileSubagentAgentDispatch(() => dispatchAgentRequest(request.timeoutMs))
+      : await dispatchAgentRequest(request.timeoutMs);
   return { response, dispatchMode: "out_of_process" };
+}
+
+async function reconcileSubagentAgentDispatch<T>(dispatch: () => Promise<T>): Promise<T> {
+  try {
+    return await dispatch();
+  } catch (error) {
+    if (!isGatewayRpcUnavailableError(error)) {
+      throw error;
+    }
+    // The first dispatch may have accepted the run gateway-side before the ack was
+    // lost. A same-key replay returns that already-accepted run instead of starting a
+    // duplicate, so surface the recovered run rather than misreporting "no target".
+    return await dispatch();
+  }
 }
 
 export async function callSubagentGateway(
