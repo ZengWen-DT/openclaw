@@ -83,3 +83,27 @@ export function maybeAutoDisableCronJobAfterRunFailure(params: {
     consecutiveErrors,
   });
 }
+
+/**
+ * Routes a terminal one-shot disable (permanent error, exhausted retries, or
+ * exhausted disabled-heartbeat retries) through the canonical auto-disable owner
+ * so a durable autoDisabled reason and post-persist owner notification are
+ * emitted, instead of silently clearing the schedule. Mirrors
+ * maybeAutoDisableCronJobAfterRunFailure for the one-shot terminal paths.
+ *
+ * @returns true when the canonical owner recorded the transition and queued its
+ *   recovery notification; false when it declined (e.g. system-owned job, or the
+ *   job was already disabled).
+ */
+export function autoDisableOneShotCronJobTerminalError(params: {
+  state: CronServiceState;
+  job: CronJob;
+  atMs: number;
+  consecutiveErrors: number;
+  deferredNotifications?: DeferredCronNotifications;
+}): boolean {
+  return autoDisableCronJob({
+    ...params,
+    reason: "consecutive-failures",
+  });
+}

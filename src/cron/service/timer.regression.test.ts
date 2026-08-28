@@ -260,6 +260,63 @@ describe("cron service timer regressions", () => {
     expect(runIsolatedAgentJob).toHaveBeenCalledTimes(4);
   });
 
+  it("#131490: exhausted one-shot records autoDisable reason and notifies its owner", async () => {
+    const store = timerRegressionFixtures.makeStorePath();
+    const scheduledAt = Date.parse("2026-08-28T09:00:00.000Z");
+
+    const cronJob = createIsolatedRegressionJob({
+      id: "oneshot-exhausted-notify",
+      name: "exhausted reminder",
+      scheduledAt,
+      schedule: { kind: "at", at: new Date(scheduledAt).toISOString() },
+      payload: { kind: "agentTurn", message: "report lane results" },
+      state: { nextRunAtMs: scheduledAt },
+    });
+    await saveCronStore(store.storePath, { version: 1, jobs: [cronJob] });
+
+    let now = scheduledAt;
+    const enqueueSystemEvent = vi.fn();
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent,
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: vi.fn().mockResolvedValue({
+        status: "error",
+        error: "429 rate limit exceeded",
+      }),
+    });
+
+    for (let i = 0; i < 4; i += 1) {
+      await onTimer(state);
+      const job = requireJob(state, "oneshot-exhausted-notify");
+      if (i < 3) {
+        expect(job.enabled).toBe(true);
+        now = requireTimestamp(job.state.nextRunAtMs, "exhausted-notify retry next run") + 1;
+      } else {
+        expect(job.enabled).toBe(false);
+      }
+    }
+
+    const disabled = requireJob(state, "oneshot-exhausted-notify");
+    expect(disabled.state.autoDisabled).toMatchObject({
+      reason: "consecutive-failures",
+      consecutiveErrors: 4,
+    });
+    expect(disabled.state.nextRunAtMs).toBeUndefined();
+    // The canonical auto-disable owner queued an owner-recovery notification
+    // instead of silently parking the exhausted one-shot.
+    expect(enqueueSystemEvent).toHaveBeenCalled(
+      expect.stringContaining("was auto-disabled after 4 consecutive run failures"),
+      expect.objectContaining({
+        agentId: "main",
+        contextKey: "cron:oneshot-exhausted-notify:auto-disabled",
+      }),
+    );
+  });
+
   it("preserves every cadence after a transient recurring retry succeeds", () => {
     const scheduledAt = Date.parse("2026-05-29T02:28:00.000Z");
     const everyTwelveHoursMs = 12 * 60 * 60 * 1_000;

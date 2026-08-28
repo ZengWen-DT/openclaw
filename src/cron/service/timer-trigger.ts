@@ -25,7 +25,7 @@ import type { CronTriggerEvalOutcome } from "./timer-execution-timeout.js";
 import { HEARTBEAT_SKIP_DISABLED } from "./timer-execution-timeout.js";
 
 /** Default max retries for cron jobs on transient errors (#24355). */
-const DEFAULT_MAX_TRANSIENT_RETRIES = 3;
+export const DEFAULT_MAX_TRANSIENT_RETRIES = 3;
 
 type TransientCronRetryDecision = {
   retryable: boolean;

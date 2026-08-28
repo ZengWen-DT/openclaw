@@ -7,7 +7,10 @@ import { resolveCronRunErrorReason } from "../run-error-reason.js";
 import { cronSchedulingInputsEqual } from "../schedule-identity.js";
 import { computeNextRunAtMs } from "../schedule.js";
 import type { CronJob, CronRunStatus } from "../types.js";
-import { maybeAutoDisableCronJobAfterRunFailure } from "./auto-disable.js";
+import {
+  autoDisableOneShotCronJobTerminalError,
+  maybeAutoDisableCronJobAfterRunFailure,
+} from "./auto-disable.js";
 import {
   finalizeCronFailureNotifications,
   maybeEmitFailureAlert,
@@ -32,6 +35,7 @@ import { emitCronOutcomeEventForJob, recordCronOutcomeForJob } from "./timer-out
 import {
   applyTriggerEvaluationState,
   applyTriggerRunResult,
+  DEFAULT_MAX_TRANSIENT_RETRIES,
   resolveCronNextRunWithLowerBound,
   resolveDeliveryState,
   resolveDisabledHeartbeatOneShotRetryDecision,
@@ -253,14 +257,27 @@ export function applyJobResult(
             );
           }
         } else {
-          job.enabled = false;
-          job.state.nextRunAtMs = undefined;
+          autoDisableNotificationOwnsFailure =
+            autoDisableOneShotCronJobTerminalError({
+              state,
+              job,
+              atMs: result.endedAt,
+              consecutiveErrors: retryDecision.consecutiveSkipped,
+              deferredNotifications: opts?.deferredNotifications,
+            }) || autoDisableNotificationOwnsFailure;
+          if (job.enabled) {
+            // Canonical owner declined (e.g. system-owned job): keep the safety
+            // disable so an errant one-shot cannot remain scheduled.
+            job.enabled = false;
+            job.state.nextRunAtMs = undefined;
+          }
           state.deps.log.warn(
             {
               jobId: job.id,
               jobName: job.name,
               consecutiveSkipped: retryDecision.consecutiveSkipped,
               reason: retryDecision.reason,
+              autoDisabled: job.state.autoDisabled?.reason,
             },
             "cron: disabling one-shot job after disabled heartbeat retries",
           );
@@ -305,8 +322,30 @@ export function applyJobResult(
           // Note: deleteAfterRun:true only triggers on ok (see shouldDelete above),
           // so exhausted-retry jobs are disabled but intentionally kept in the store
           // to preserve the error state for inspection.
-          job.enabled = false;
-          job.state.nextRunAtMs = undefined;
+          //
+          // Route the disable through the canonical auto-disable owner only when the
+          // one-shot accumulated a genuine streak of failures (retry budget exceeded),
+          // so a durable autoDisabled reason and owner-recovery notification are
+          // emitted for repeated failures instead of silently parking the job. A
+          // single first-run permanent error still finalizes quietly (existing
+          // contract: main- and isolated-session one-shot errors are suppressed).
+          if (retryDecision.consecutiveErrors > DEFAULT_MAX_TRANSIENT_RETRIES) {
+            autoDisableNotificationOwnsFailure =
+              autoDisableOneShotCronJobTerminalError({
+                state,
+                job,
+                atMs: result.endedAt,
+                consecutiveErrors: retryDecision.consecutiveErrors,
+                deferredNotifications: opts?.deferredNotifications,
+              }) || autoDisableNotificationOwnsFailure;
+          }
+          if (job.enabled) {
+            // Canonical owner declined (e.g. system-owned job) or the disable was a
+            // first-run permanent error: keep the safety disable so an errant
+            // one-shot cannot remain scheduled or tight-loop.
+            job.enabled = false;
+            job.state.nextRunAtMs = undefined;
+          }
           state.deps.log.warn(
             {
               jobId: job.id,
@@ -315,6 +354,7 @@ export function applyJobResult(
               error: result.error,
               reason: retryDecision.reason,
               retryCategory: retryDecision.retryCategory,
+              autoDisabled: job.state.autoDisabled?.reason,
             },
             "cron: disabling one-shot job after error",
           );
