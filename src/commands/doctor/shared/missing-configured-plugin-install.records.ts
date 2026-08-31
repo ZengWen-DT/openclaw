@@ -202,3 +202,47 @@ function recordClawHubPackageName(value: string | undefined): string | undefined
   }
   return parseClawHubPluginSpec(trimmed)?.name ?? trimmed;
 }
+
+/**
+ * A `source: "path"` install record is stale when its payload directory no
+ * longer exists on disk AND the same plugin id is independently discovered as
+ * a healthy configured load-path plugin (`plugins.load.paths`, origin
+ * "config") living at a distinct location. The stale record is a leftover that
+ * no longer describes the loaded artifact, so Doctor should prune it instead
+ * of proposing a reinstall.
+ */
+export function isStalePathInstallRecordShadowedByConfigLoad(params: {
+  pluginId: string;
+  record: PluginInstallRecord | undefined;
+  /** The healthy configured load-path plugin manifest, when discovered. */
+  configOriginPlugin: { id: string; origin: string; rootDir: string | undefined } | undefined;
+  env: NodeJS.ProcessEnv;
+}): boolean {
+  const { record, pluginId, configOriginPlugin, env } = params;
+  if (record?.source !== "path") {
+    return false;
+  }
+  // Only stale records whose payload is actually missing qualify. A record
+  // whose install directory still exists is a live (if duplicate) install.
+  if (!isInstalledRecordMissingOnDisk(record, env)) {
+    return false;
+  }
+  if (!configOriginPlugin || configOriginPlugin.id !== pluginId) {
+    return false;
+  }
+  // The shadowing plugin must be a configured load-path plugin, not the stale
+  // record itself or some other origin.
+  if (configOriginPlugin.origin !== "config" || !configOriginPlugin.rootDir?.trim()) {
+    return false;
+  }
+  const configRootDir = path.resolve(resolveUserPath(configOriginPlugin.rootDir, env));
+  for (const candidate of [record.installPath, record.sourcePath]) {
+    if (candidate?.trim()) {
+      const resolved = path.resolve(resolveUserPath(candidate, env));
+      if (installPathsEqual(resolved, configRootDir)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}

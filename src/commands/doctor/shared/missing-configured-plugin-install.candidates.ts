@@ -36,6 +36,7 @@ import {
   collectConfiguredPluginIds,
   collectEffectiveConfiguredChannelOwnerPluginIds,
 } from "./missing-configured-plugin-install.ids.js";
+import { isStalePathInstallRecordShadowedByConfigLoad } from "./missing-configured-plugin-install.records.js";
 
 export type DownloadableInstallCandidate = {
   pluginId: string;
@@ -122,11 +123,39 @@ export async function resolveConfiguredPluginInstallContext(params: {
       blockedPluginIds: params.blockedPluginIds,
     }).keys(),
   );
+  const configOriginPluginsById = new Map<string, { rootDir: string | undefined }>();
+  for (const plugin of snapshot.plugins) {
+    if (plugin.origin === "config") {
+      configOriginPluginsById.set(plugin.id, { rootDir: plugin.rootDir });
+    }
+  }
+  const stalePathInstallPluginIds = new Set<string>();
+  for (const [pluginId, record] of Object.entries(records)) {
+    if (
+      installedPluginIdsWithRepairablePackages.has(pluginId) ||
+      installedPluginIdsWithStaleVersionBoundRuntimePackages.has(pluginId)
+    ) {
+      continue;
+    }
+    if (
+      isStalePathInstallRecordShadowedByConfigLoad({
+        pluginId,
+        record,
+        configOriginPlugin: configOriginPluginsById.has(pluginId)
+          ? { id: pluginId, origin: "config", ...configOriginPluginsById.get(pluginId)! }
+          : undefined,
+        env: params.env,
+      })
+    ) {
+      stalePathInstallPluginIds.add(pluginId);
+    }
+  }
   return {
     knownIds,
     configuredChannelOwnerPluginIds,
     bundledPluginsById,
     configuredPluginIdsWithStaleDescriptors,
+    stalePathInstallPluginIds,
     records,
     updateChannel,
     installedPluginIdsWithRepairablePackageDiagnostics,

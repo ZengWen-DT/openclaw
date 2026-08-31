@@ -148,6 +148,7 @@ async function repairMissingPluginInstallsWithLease(
     configuredChannelOwnerPluginIds,
     bundledPluginsById,
     configuredPluginIdsWithStaleDescriptors,
+    stalePathInstallPluginIds,
     records,
     updateChannel,
     installedPluginIdsWithRepairablePackageDiagnostics,
@@ -207,6 +208,23 @@ async function repairMissingPluginInstallsWithLease(
     }
     delete nextRecords[pluginId];
     changes.push(`Removed stale managed install record for bundled plugin "${pluginId}".`);
+  }
+
+  // A `source: "path"` record whose payload directory no longer exists and
+  // whose plugin id is now loaded from a distinct configured load path is a
+  // stale leftover. Doctor prunes it instead of reinstalling, matching the
+  // "reinstall is wrong" guidance from the stale path-record report.
+  for (const pluginId of stalePathInstallPluginIds) {
+    if (!Object.hasOwn(nextRecords, pluginId)) {
+      continue;
+    }
+    if (nextRecords === records) {
+      nextRecords = { ...records };
+    }
+    delete nextRecords[pluginId];
+    changes.push(
+      `Removed stale path-install record for plugin "${pluginId}" (loaded from a configured load path).`,
+    );
   }
 
   if (shouldDeferConfiguredPluginInstallRepair(env)) {
