@@ -58,6 +58,24 @@ function makeOversizedStreamResponse(): Response {
   );
 }
 
+// Builds a JSON-shaped success body that is otherwise well-formed but carries
+// a raw 0xFF byte (invalid UTF-8) inside the message field. A non-fatal UTF-8
+// decoder would silently substitute U+FFFD and let JSON.parse succeed.
+function makeInvalidUtf8Response(code: number): Response {
+  const coding = Buffer.from(`{"code":${code},"message":"bad`);
+  const invalidByte = Buffer.from([0xff]);
+  const suffix = Buffer.from('","data":"dm9pY2UtaW52YWxpZC1iYXNlNjQ="}');
+  const body = Buffer.concat([coding, invalidByte, suffix]);
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(body));
+        controller.close();
+      },
+    }),
+  );
+}
+
 describe("Volcengine speech provider", () => {
   const provider = buildVolcengineSpeechProvider();
 
@@ -273,6 +291,43 @@ describe("volcengineTTS", () => {
     });
 
     expect(audio.toString()).toBe("audio-1audio-2");
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects Seed Speech responses with invalid UTF-8 in the body", async () => {
+    const release = vi.fn();
+    fetchWithSsrFGuardMock.mockResolvedValue({
+      response: makeInvalidUtf8Response(0),
+      release,
+    });
+
+    await expect(
+      volcengineTTS({ text: "hello", apiKey: "secret-api-key", timeoutMs: 1000 }),
+    ).rejects.toThrow(Error);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects invalid UTF-8 in otherwise well-formed legacy TTS JSON instead of accepting replacement characters", async () => {
+    const release = vi.fn();
+    fetchWithSsrFGuardMock.mockResolvedValue({
+      response: makeInvalidUtf8Response(3000),
+      release,
+    });
+
+    let error: unknown;
+    try {
+      await volcengineTTS({
+        text: "hello",
+        appId: "app-id",
+        token: "secret-token",
+        timeoutMs: 1000,
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect(fetchWithSsrFGuardMock).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(1);
   });
 
