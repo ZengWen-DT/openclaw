@@ -10,10 +10,6 @@ import {
   resolvePluginNpmPackageDir,
 } from "../../../plugins/install-paths.js";
 import { resolveUserPath } from "../../../utils.js";
-import type {
-  BundledPluginPackageDescriptor,
-  DownloadableInstallCandidate,
-} from "./missing-configured-plugin-install.candidates.js";
 
 export function forceNpmInstallRecordRepair(record: PluginInstallRecord): PluginInstallRecord {
   if (record.source !== "npm") {
@@ -58,9 +54,10 @@ export function resolveLegacyNpmPackageInstallPath(params: {
   return path.join(params.npmRoot, "node_modules", ...params.packageName.split("/"));
 }
 
-function collectCandidateOfficialPackageNames(
-  candidate: DownloadableInstallCandidate,
-): Set<string> {
+function collectCandidateOfficialPackageNames(candidate: {
+  npmSpec?: string;
+  clawhubSpec?: string;
+}): Set<string> {
   const names = new Set<string>();
   const npmName = candidate.npmSpec ? parseRegistryNpmSpec(candidate.npmSpec)?.name : undefined;
   const clawhubName = candidate.clawhubSpec
@@ -101,7 +98,7 @@ function collectInstalledRecordPackageNames(record: PluginInstallRecord): Set<st
 
 export function isTrustedOfficialInstallRecordForCandidate(params: {
   record: PluginInstallRecord | undefined;
-  candidate: DownloadableInstallCandidate;
+  candidate: { npmSpec?: string; clawhubSpec?: string };
 }): boolean {
   const record = params.record;
   if (!record) {
@@ -127,7 +124,7 @@ export function isTrustedOfficialInstallRecordForCandidate(params: {
 
 export function resolveSafeBrokenOfficialInstallRemovalPath(params: {
   pluginId: string;
-  candidate: DownloadableInstallCandidate;
+  candidate: { npmSpec?: string };
   record: PluginInstallRecord | undefined;
   env: NodeJS.ProcessEnv;
 }): string | null {
@@ -171,7 +168,7 @@ export function resolveSafeBrokenOfficialInstallRemovalPath(params: {
 
 export function recordMatchesBundledPackage(
   record: PluginInstallRecord,
-  bundled: BundledPluginPackageDescriptor,
+  bundled: { name?: string; packageName?: string },
 ): boolean {
   const packageName = bundled.packageName?.trim() || bundled.name?.trim();
   if (!packageName) {
@@ -201,48 +198,4 @@ function recordClawHubPackageName(value: string | undefined): string | undefined
     return undefined;
   }
   return parseClawHubPluginSpec(trimmed)?.name ?? trimmed;
-}
-
-/**
- * A `source: "path"` install record is stale when its payload directory no
- * longer exists on disk AND the same plugin id is independently discovered as
- * a healthy configured load-path plugin (`plugins.load.paths`, origin
- * "config") living at a distinct location. The stale record is a leftover that
- * no longer describes the loaded artifact, so Doctor should prune it instead
- * of proposing a reinstall.
- */
-export function isStalePathInstallRecordShadowedByConfigLoad(params: {
-  pluginId: string;
-  record: PluginInstallRecord | undefined;
-  /** The healthy configured load-path plugin manifest, when discovered. */
-  configOriginPlugin: { id: string; origin: string; rootDir: string | undefined } | undefined;
-  env: NodeJS.ProcessEnv;
-}): boolean {
-  const { record, pluginId, configOriginPlugin, env } = params;
-  if (record?.source !== "path") {
-    return false;
-  }
-  // Only stale records whose payload is actually missing qualify. A record
-  // whose install directory still exists is a live (if duplicate) install.
-  if (!isInstalledRecordMissingOnDisk(record, env)) {
-    return false;
-  }
-  if (!configOriginPlugin || configOriginPlugin.id !== pluginId) {
-    return false;
-  }
-  // The shadowing plugin must be a configured load-path plugin, not the stale
-  // record itself or some other origin.
-  if (configOriginPlugin.origin !== "config" || !configOriginPlugin.rootDir?.trim()) {
-    return false;
-  }
-  const configRootDir = path.resolve(resolveUserPath(configOriginPlugin.rootDir, env));
-  for (const candidate of [record.installPath, record.sourcePath]) {
-    if (candidate?.trim()) {
-      const resolved = path.resolve(resolveUserPath(candidate, env));
-      if (installPathsEqual(resolved, configRootDir)) {
-        return false;
-      }
-    }
-  }
-  return true;
 }

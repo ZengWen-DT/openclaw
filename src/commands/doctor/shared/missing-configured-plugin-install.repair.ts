@@ -150,6 +150,7 @@ async function repairMissingPluginInstallsWithLease(
     configuredPluginIdsWithStaleDescriptors,
     stalePathInstallPluginIds,
     records,
+    persistedRecords,
     updateChannel,
     installedPluginIdsWithRepairablePackageDiagnostics,
     installedPluginIdsWithStaleVersionBoundRuntimePackages,
@@ -210,18 +211,7 @@ async function repairMissingPluginInstallsWithLease(
     changes.push(`Removed stale managed install record for bundled plugin "${pluginId}".`);
   }
 
-  // A `source: "path"` record whose payload directory no longer exists and
-  // whose plugin id is now loaded from a distinct configured load path is a
-  // stale leftover. Doctor prunes it instead of reinstalling, matching the
-  // "reinstall is wrong" guidance from the stale path-record report.
   for (const pluginId of stalePathInstallPluginIds) {
-    if (!Object.hasOwn(nextRecords, pluginId)) {
-      continue;
-    }
-    if (nextRecords === records) {
-      nextRecords = { ...records };
-    }
-    delete nextRecords[pluginId];
     changes.push(
       `Removed stale path-install record for plugin "${pluginId}" (loaded from a configured load path).`,
     );
@@ -420,7 +410,7 @@ async function repairMissingPluginInstallsWithLease(
   }
 
   const persistedIndexOptions = { config: params.cfg, env };
-  if (nextRecords !== records) {
+  if (nextRecords !== persistedRecords) {
     await writePersistedInstalledPluginIndexInstallRecords(nextRecords, persistedIndexOptions);
   } else if (params.baselineRecords) {
     // The caller seeded us from in-memory state that may not yet have been
@@ -430,7 +420,7 @@ async function repairMissingPluginInstallsWithLease(
     // a stale snapshot.
     await writePersistedInstalledPluginIndexInstallRecords(nextRecords, persistedIndexOptions);
   }
-  const pluginInventoryChanged = nextRecords !== records || repairedPluginIds.size > 0;
+  const pluginInventoryChanged = nextRecords !== persistedRecords || repairedPluginIds.size > 0;
   return {
     changes,
     warnings,

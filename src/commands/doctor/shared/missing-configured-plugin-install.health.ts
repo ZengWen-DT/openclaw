@@ -96,7 +96,6 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
     configuredChannelOwnerPluginIds,
     bundledPluginsById,
     configuredPluginIdsWithStaleDescriptors: staleDescriptorPluginIds,
-    stalePathInstallPluginIds,
     records,
     updateChannel,
     installedPluginIdsWithRepairablePackageDiagnostics: repairablePackageDiagnosticPluginIds,
@@ -144,7 +143,6 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
     (pluginId) =>
       !deferredPluginIds.has(pluginId) &&
       !officialReplacementPluginIds.has(pluginId) &&
-      !stalePathInstallPluginIds.has(pluginId) &&
       !bundledPluginsById.has(pluginId) &&
       ((pluginIds.has(pluginId) &&
         (!knownIds.has(pluginId) || isInstalledRecordMissingOnDisk(records[pluginId], env))) ||
@@ -181,7 +179,7 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
 
   const missingPluginIds = new Set(
     [...pluginIds].filter((pluginId) => {
-      if (deferredPluginIds.has(pluginId) || stalePathInstallPluginIds.has(pluginId)) {
+      if (deferredPluginIds.has(pluginId)) {
         return false;
       }
       const hasRecord = Object.hasOwn(records, pluginId);
@@ -210,11 +208,6 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
       continue;
     }
     if (reportedPluginIds.has(candidate.pluginId)) {
-      continue;
-    }
-    // A stale path record shadowed by a configured load-path plugin is not a
-    // missing install even when a downloadable candidate exists for the id.
-    if (stalePathInstallPluginIds.has(candidate.pluginId)) {
       continue;
     }
     const shouldReplaceBrokenOfficialInstall = officialReplacementPluginIds.has(candidate.pluginId);
