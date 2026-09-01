@@ -58,24 +58,6 @@ function makeOversizedStreamResponse(): Response {
   );
 }
 
-// Builds a JSON-shaped success body that is otherwise well-formed but carries
-// a raw 0xFF byte (invalid UTF-8) inside the message field. A non-fatal UTF-8
-// decoder would silently substitute U+FFFD and let JSON.parse succeed.
-function makeInvalidUtf8Response(code: number): Response {
-  const coding = Buffer.from(`{"code":${code},"message":"bad`);
-  const invalidByte = Buffer.from([0xff]);
-  const suffix = Buffer.from('","data":"dm9pY2UtaW52YWxpZC1iYXNlNjQ="}');
-  const body = Buffer.concat([coding, invalidByte, suffix]);
-  return new Response(
-    new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array(body));
-        controller.close();
-      },
-    }),
-  );
-}
-
 describe("Volcengine speech provider", () => {
   const provider = buildVolcengineSpeechProvider();
 
@@ -294,66 +276,53 @@ describe("volcengineTTS", () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects Seed Speech responses with invalid UTF-8 in the body", async () => {
-    const release = vi.fn();
-    fetchWithSsrFGuardMock.mockResolvedValue({
-      response: makeInvalidUtf8Response(0),
-      release,
-    });
-
-    await expect(
-      volcengineTTS({ text: "hello", apiKey: "secret-api-key", timeoutMs: 1000 }),
-    ).rejects.toThrow(Error);
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
-  it("rejects invalid UTF-8 in otherwise well-formed legacy TTS JSON instead of accepting replacement characters", async () => {
-    const release = vi.fn();
-    fetchWithSsrFGuardMock.mockResolvedValue({
-      response: makeInvalidUtf8Response(3000),
-      release,
-    });
-
-    let error: unknown;
-    try {
-      await volcengineTTS({
-        text: "hello",
-        appId: "app-id",
-        token: "secret-token",
-        timeoutMs: 1000,
-      });
-    } catch (err) {
-      error = err;
-    }
-
-    expect(error).toBeInstanceOf(Error);
-    expect(fetchWithSsrFGuardMock).toHaveBeenCalledTimes(1);
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
   it.each([
     {
       name: "Seed Speech",
-      response: { code: 0, data: "%%%not-base64!!" },
+      response: JSON.stringify({ code: 0, data: "%%%not-base64!!" }),
       params: { text: "hello", apiKey: "secret-api-key", timeoutMs: 1000 },
       error: "BytePlus Seed Speech TTS returned malformed base64 audio data",
     },
     {
       name: "legacy",
-      response: { code: 3000, data: "%%%not-base64!!" },
+      response: JSON.stringify({ code: 3000, data: "%%%not-base64!!" }),
       params: { text: "hello", appId: "app-id", token: "secret-token", timeoutMs: 1000 },
       error: "Volcengine TTS returned malformed base64 audio data",
     },
-  ])("rejects malformed base64 in $name responses", async ({ response, params, error }) => {
-    const release = vi.fn();
-    fetchWithSsrFGuardMock.mockResolvedValue({
-      response: new Response(JSON.stringify(response)),
-      release,
-    });
+    ...[
+      {
+        name: "Seed Speech",
+        code: 0,
+        params: { text: "hello", apiKey: "test-key", timeoutMs: 1000 },
+      },
+      {
+        name: "legacy",
+        code: 3000,
+        params: { text: "hello", appId: "app", token: "test-token", timeoutMs: 1000 },
+      },
+    ].map(({ name, code, params }) => ({
+      name: `${name} UTF-8`,
+      response: Buffer.concat([
+        Buffer.from(`{"code":${code},"message":"bad`),
+        Buffer.from([0xff]),
+        Buffer.from(`","data":"${Buffer.from("audio").toString("base64")}"}`),
+      ]),
+      params,
+      error: TypeError,
+    })),
+  ])(
+    "rejects malformed $name responses and releases the request",
+    async ({ response, params, error }) => {
+      const release = vi.fn();
+      fetchWithSsrFGuardMock.mockResolvedValue({
+        response: new Response(response),
+        release,
+      });
 
-    await expect(volcengineTTS(params)).rejects.toThrow(error);
-    expect(release).toHaveBeenCalledTimes(1);
-  });
+      await expect(volcengineTTS(params)).rejects.toThrow(error);
+      expect(release).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("reports Seed Speech provider errors without exposing credentials", async () => {
     const release = vi.fn();
