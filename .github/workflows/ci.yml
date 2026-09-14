@@ -3113,7 +3113,12 @@ jobs:
               ;;
             bun-launcher)
               OPENCLAW_E2E_SKIP_BUILD=1 OPENCLAW_TEST_BUN_LAUNCHER=1 pnpm test test/openclaw-launcher.e2e.test.ts
-              OPENCLAW_TEST_BUN_LAUNCHER=1 pnpm test src/plugins/plugin-module-generation.test.ts --testNamePattern Bun
+              if [[ -f src/plugins/plugin-module-generation.test.ts ]]; then
+                OPENCLAW_TEST_BUN_LAUNCHER=1 pnpm test src/plugins/plugin-module-generation.test.ts --testNamePattern Bun
+              elif [[ "${{ needs.preflight.outputs.frozen_target }}" != "true" ]]; then
+                echo "Current CI targets must provide src/plugins/plugin-module-generation.test.ts." >&2
+                exit 1
+              fi
               ;;
             *)
               echo "Unsupported checks-fast task: $TASK" >&2
