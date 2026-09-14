@@ -283,6 +283,29 @@ async function runLoop(
     return true;
   };
 
+  const commitPendingMessages = async () => {
+    const messagesToInject = pendingMessages;
+    pendingMessages = [];
+    let injectedMessage = false;
+    for (const message of messagesToInject) {
+      if (config.consumeQueuedMessageCancellation?.(message)) {
+        continue;
+      }
+      await emit({ type: "message_start", message });
+      if (config.consumeQueuedMessageCancellation?.(message)) {
+        continue;
+      }
+      if (message.role === "user") {
+        turnTainted = false;
+      }
+      await emit({ type: "message_end", message });
+      state.context.messages.push(message);
+      newMessages.push(message);
+      injectedMessage = true;
+    }
+    return injectedMessage;
+  };
+
   // Outer loop: continues when queued follow-up messages arrive after agent would stop
   while (true) {
     let hasMoreToolCalls = true;
@@ -302,25 +325,7 @@ async function runLoop(
 
       // Process pending messages (inject before next assistant response)
       if (pendingMessages.length > 0) {
-        const messagesToInject = pendingMessages;
-        let injectedMessage = false;
-        pendingMessages = [];
-        for (const message of messagesToInject) {
-          if (config.consumeQueuedMessageCancellation?.(message)) {
-            continue;
-          }
-          await emit({ type: "message_start", message });
-          if (config.consumeQueuedMessageCancellation?.(message)) {
-            continue;
-          }
-          if (message.role === "user") {
-            turnTainted = false;
-          }
-          await emit({ type: "message_end", message });
-          state.context.messages.push(message);
-          newMessages.push(message);
-          injectedMessage = true;
-        }
+        const injectedMessage = await commitPendingMessages();
         if (!injectedMessage && !hasMoreToolCalls) {
           // The entire drained batch was cancelled before transcript commit.
           // Re-evaluate the loop instead of issuing an empty provider continuation.
@@ -359,6 +364,7 @@ async function runLoop(
             toolLoopRecoveryState.criticalToolLoopSeen,
             toolCalls,
             scheduling,
+            scheduling.hasUnobservedAsyncToolResults,
           );
           if (batch.intervention) {
             toolLoopRecoveryState.criticalToolLoopSeen = true;
@@ -400,6 +406,8 @@ async function runLoop(
               emit,
               toolLoopRecoveryState.criticalToolLoopSeen,
               remainingToolCalls,
+              undefined,
+              streamed.executedIds.size > 0,
             )
           : undefined;
       const batches = [...streamed.batches, ...(terminalToolBatch ? [terminalToolBatch] : [])];
@@ -417,6 +425,9 @@ async function runLoop(
       turnTainted ||= toolResults.some(toolResultTaintsTurn);
       hasMoreToolCalls =
         streamed.continuationRequired ||
+        (message.stopReason === "stop" &&
+          message.endTurn === false &&
+          !executedToolBatch?.terminate) ||
         (executedToolBatch !== undefined && !executedToolBatch.terminate);
       pendingMessages = executedToolBatch?.steeringMessages ?? [];
       if (executedToolBatch?.intervention) {
@@ -485,12 +496,13 @@ async function runLoop(
 
       if (pendingMessages.length === 0) {
         if (
-          await config.shouldStopAfterTurn?.({
+          !nextTurnSnapshot?.stop &&
+          (await config.shouldStopAfterTurn?.({
             message,
             toolResults,
             context: state.context,
             newMessages,
-          })
+          }))
         ) {
           await emit({ type: "agent_end", messages: newMessages });
           return newMessages;
@@ -500,6 +512,12 @@ async function runLoop(
         pendingMessages = Array.isArray(steering) ? steering : await steering;
       }
       if (await stopIfAborted()) {
+        return newMessages;
+      }
+      if (nextTurnSnapshot?.stop) {
+        // The old owner is about to close; commit accepted steering before re-admission.
+        await commitPendingMessages();
+        await emit({ type: "agent_end", messages: newMessages });
         return newMessages;
       }
     }
@@ -531,6 +549,7 @@ async function executeToolCalls(
   criticalToolLoopSeen: boolean,
   toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall"),
   scheduling?: AsyncToolBatchScheduling,
+  hasUnobservedAsyncToolResults = false,
 ): Promise<ExecutedToolCallBatch> {
   const batch: ToolBatchContext = {
     currentContext,
@@ -541,6 +560,7 @@ async function executeToolCalls(
     resolved: new Map(),
     validated: new Map(),
     onParallelStarted: scheduling?.onParallelStarted,
+    hasUnobservedAsyncToolResults,
   };
   if (config.beforeToolBatch) {
     for (const toolCall of toolCalls) {
@@ -605,6 +625,7 @@ type ToolBatchContext = {
   lifecycle?: InternalToolBatchLifecycle;
   warnings?: ToolLoopWarning[];
   onParallelStarted?: () => void;
+  hasUnobservedAsyncToolResults: boolean;
 };
 
 type ResolvedToolCallOutcome =
@@ -897,7 +918,15 @@ async function prepareToolCallEntry(
   }
   const execution = await prepareToolCallExecution(
     preparation,
-    { assistantMessage: batch.assistantMessage, toolCall: preparation.toolCall },
+    {
+      assistantMessage: batch.assistantMessage,
+      toolCall: preparation.toolCall,
+      hasUnobservedAsyncToolResults:
+        batch.hasUnobservedAsyncToolResults ||
+        batch.assistantMessage.content
+          .slice(0, batch.assistantMessage.content.indexOf(toolCall))
+          .some((item) => item.type === "toolCall" && item.async === true),
+    },
     batch.signal,
     batch.emit,
   );

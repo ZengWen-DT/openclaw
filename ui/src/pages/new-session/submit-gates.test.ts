@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CHAT_ROUTE_READY_EVENT } from "../../app/route-transition.ts";
+import { CHAT_ROUTE_READY_EVENT } from "../chat/chat-history-events.ts";
 import { createDraftFixture } from "./draft-submission-flow.test-support.ts";
 import { renderControl } from "./model-control.test-support.ts";
 import { patchNewSessionPreference } from "./preferences.ts";
@@ -315,4 +315,21 @@ describe("DraftSubmissionFlow submit gates", () => {
     );
     expect(fixture.request).not.toHaveBeenCalledWith("node.list", expect.anything());
   });
+});
+
+it("keeps attachment preparation gated without duplicating its composer status after Start", async () => {
+  const { flow, context } = createDraftFixture();
+  flow.setMessage("Include the pending attachment");
+  const signal = flow.attachmentDraft.readSignal;
+  flow.attachmentDraft.updatePending(signal, 1);
+  expect(flow.submitBlock()?.gate).toBe("attachment-reads");
+  expect(flow.canSubmit()).toBe(false);
+  expect(flow.submitDisabledReason()).toBe("Reading attachment");
+
+  await flow.submit();
+
+  expect(context.sessions.createResult).not.toHaveBeenCalled();
+  expect(flow.blockedSubmitNotice()).toBeUndefined();
+  flow.attachmentDraft.updatePending(signal, -1);
+  expect(flow.canSubmit()).toBe(true);
 });

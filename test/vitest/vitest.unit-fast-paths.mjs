@@ -4,6 +4,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { cliProcessTestFiles } from "./vitest.cli-process-paths.mjs";
 import { commandsLightTestFiles } from "./vitest.commands-light-paths.mjs";
+import { isDatabaseWorkerCoreTestFile } from "./vitest.database-worker-core-paths.mjs";
+import {
+  gatewayDatabaseWorkerTestFiles,
+  gatewayPluginTestFiles,
+} from "./vitest.gateway-server-paths.mjs";
 import { pluginSdkLightTestFiles } from "./vitest.plugin-sdk-paths.mjs";
 import { isToolingIsolatedTestFile } from "./vitest.tooling-isolated-paths.mjs";
 import { boundaryTestFiles, bundledPluginDependentUnitTestFiles } from "./vitest.unit-paths.mjs";
@@ -110,7 +115,6 @@ export const forcedUnitFastTestFiles = [
   "src/node-host/invoke-system-run.test.ts",
   "src/pairing/setup-code.test.ts",
   "src/plugin-activation-boundary.test.ts",
-  "src/plugin-sdk/memory-host-events.test.ts",
   "src/proxy-capture/runtime.test.ts",
   "src/proxy-capture/proxy-server.test.ts",
   "src/proxy-capture/store.sqlite.test.ts",
@@ -148,6 +152,7 @@ export const forcedUnitFastTestFiles = [
   "src/test-utils/temp-home.test.ts",
   "src/utils.test.ts",
   "src/version.test.ts",
+  "test/scripts/pr-ci-sweeper.reopen-timer.test.ts",
 ];
 const forcedUnitFastTestFileSet = new Set(forcedUnitFastTestFiles);
 const unitFastCandidateExactFiles = [...pluginSdkLightTestFiles, ...commandsLightTestFiles];
@@ -158,6 +163,7 @@ const broadUnitFastCandidateGlobs = [
   "test/**/*.test.ts",
 ];
 const ownerRoutedUnitTestPatterns = [
+  ...gatewayPluginTestFiles,
   ...cliProcessTestFiles,
   // Real Git process-tree fixtures stay in serial tooling even when their
   // subprocess harness moves into shared test support.
@@ -505,7 +511,9 @@ function analyzeUnitFastTestFile(cwd, file) {
   }
 
   let analysis;
-  if (isToolingIsolatedTestFile(file)) {
+  if (isDatabaseWorkerCoreTestFile(file) || gatewayDatabaseWorkerTestFiles.includes(file)) {
+    analysis = { file, unitFast: false, reasons: ["database-worker-owner"] };
+  } else if (isToolingIsolatedTestFile(file)) {
     // Explicit project ownership wins over inferred eligibility so full-suite
     // configs cannot run the same stateful tooling test in two worker pools.
     analysis = {

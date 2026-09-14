@@ -10,6 +10,7 @@ import {
   resolveTaskScriptPath,
 } from "./schtasks-layout.js";
 import {
+  describeUnverifiedPortListeners,
   findInstalledProcessPid,
   isNodeHostArgv,
   readWindowsProcessSnapshot,
@@ -358,8 +359,9 @@ export async function stopScheduledTask({
     const probeHosts = stopContext?.probeHosts ?? [];
     const released = await waitForGatewayPortRelease(stopPort, 5_000, { probeHosts });
     if (!released) {
+      const listenerDetails = await describeUnverifiedPortListeners(stopPort, probeHosts);
       throw new Error(
-        `gateway port ${stopPort} is still busy after stop; remaining listener ownership could not be verified`,
+        `gateway port ${stopPort} is still busy after stop; remaining listener ownership could not be verified.${listenerDetails}`,
       );
     }
   }
@@ -408,8 +410,10 @@ export async function restartRegisteredScheduledTask(params: {
   mode: { kind: "standard" } | { kind: "fallback-takeover" };
   onEndMutation?: () => void;
   onRunMutation?: () => void;
+  assertCurrent?: () => void;
 }): Promise<GatewayServiceRestartResult> {
   const taskName = resolveTaskName(params.env);
+  params.assertCurrent?.();
   const end = await execSchtasks(["/End", "/TN", taskName]);
   if (end.code === 0) {
     params.onEndMutation?.();
@@ -421,11 +425,15 @@ export async function restartRegisteredScheduledTask(params: {
   const restartPort = restartContext?.port ?? null;
   if (params.mode.kind === "standard") {
     if (manageGatewayPort) {
-      await terminateScheduledTaskGatewayListeners(params.env, restartContext ?? undefined);
+      await terminateScheduledTaskGatewayListeners(
+        params.env,
+        restartContext ?? undefined,
+        params.assertCurrent,
+      );
     } else {
-      await terminateScheduledTaskNodeHost(params.env);
+      await terminateScheduledTaskNodeHost(params.env, params.assertCurrent);
     }
-    await terminateInstalledStartupRuntime(params.env);
+    await terminateInstalledStartupRuntime(params.env, params.assertCurrent);
   } else {
     const replacementRuntime = await resolveFallbackRuntime(params.env, undefined, "control");
     if (replacementRuntime.status === "unknown") {
@@ -435,7 +443,7 @@ export async function restartRegisteredScheduledTask(params: {
       );
     }
     if (replacementRuntime.status === "running" && replacementRuntime.pid) {
-      await terminateGatewayProcessTree(replacementRuntime.pid, 300);
+      await terminateGatewayProcessTree(replacementRuntime.pid, 300, params.assertCurrent);
     }
   }
   if (restartPort) {
@@ -447,13 +455,15 @@ export async function restartRegisteredScheduledTask(params: {
           `replacement gateway port ${restartPort} is occupied by an unverified process`,
         );
       }
+      const listenerDetails = await describeUnverifiedPortListeners(restartPort, probeHosts);
       throw new Error(
-        `gateway port ${restartPort} is still busy before restart; remaining listener ownership could not be verified`,
+        `gateway port ${restartPort} is still busy before restart; remaining listener ownership could not be verified.${listenerDetails}`,
       );
     }
   }
   const activation = await runScheduledTaskOrThrow({
     taskName,
+    assertCurrent: params.assertCurrent,
     env: params.env,
     scriptPath: resolveTaskScriptPath(params.env),
     ...(params.onRunMutation ? { onMutation: params.onRunMutation } : {}),
@@ -470,17 +480,18 @@ export async function restartRegisteredScheduledTask(params: {
     // Captured takeover owns the settling wait even if Startup vanished or its profile changed.
     const hasRunningEvidence = await waitForScheduledTaskRunningEvidence(params.env);
     if (params.mode.kind === "fallback-takeover" && !hasRunningEvidence) {
+      params.assertCurrent?.();
       await execSchtasks(["/End", "/TN", taskName]);
       const failedRuntime = await resolveFallbackRuntime(params.env, undefined, "control").catch(
         () => null,
       );
       if (failedRuntime?.status === "running" && failedRuntime.pid) {
-        await terminateGatewayProcessTree(failedRuntime.pid, 300);
+        await terminateGatewayProcessTree(failedRuntime.pid, 300, params.assertCurrent);
       }
       throw new Error("Replacement Windows Scheduled Task did not produce running evidence.");
     }
     if (shouldRemoveStartup && hasRunningEvidence) {
-      await removeStartupEntries(params.env, params.stdout);
+      await removeStartupEntries(params.env, params.stdout, params.assertCurrent);
     }
   }
   params.stdout.write(`${formatLine("Restarted Scheduled Task", taskName)}\n`);
@@ -492,16 +503,21 @@ export async function restartScheduledTask({
   stdout,
   env,
   onMutation,
+  assertCurrent,
 }: GatewayServiceControlArgs): Promise<GatewayServiceRestartResult> {
   const effectiveEnv = env ?? (process.env as GatewayServiceEnv);
   const reportMutation = createGatewayLifecycleMutationReporter(onMutation);
   if (await shouldControlStartupEntry(effectiveEnv)) {
-    return restartStartupEntry(effectiveEnv, stdout, (kind) =>
-      reportMutation(kind === "stop" ? "startup-entry-stop" : "startup-entry-restart"),
+    return restartStartupEntry(
+      effectiveEnv,
+      stdout,
+      (kind) => reportMutation(kind === "stop" ? "startup-entry-stop" : "startup-entry-restart"),
+      assertCurrent,
     );
   }
   return restartRegisteredScheduledTask({
     preserveDefinition,
+    assertCurrent,
     env: effectiveEnv,
     stdout,
     mode: { kind: "standard" },

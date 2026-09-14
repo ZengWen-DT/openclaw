@@ -74,6 +74,7 @@ import {
   recordUpdateRunStep,
 } from "./update-run-ledger.js";
 import { updateRunStepsFromResultStep } from "./update-run-step.js";
+import { AUTO_UPDATE_STEP_TIMEOUT_MS } from "./update-run-timeouts.js";
 import { runGatewayUpdatePreflight, type UpdateRunResult } from "./update-runner.js";
 
 type UpdateCheckState = {
@@ -215,13 +216,11 @@ export function resetUpdateAvailableStateForTest(): void {
   updateScheduleCache = null;
   void updateCheckLifecycle?.stop();
   updateCheckLifecycle = undefined;
-  gatewayUpdateCampaign.resetForTest();
 }
 
 const UPDATE_CHECK_STATE_KEY = "update.checkState";
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
-const AUTO_UPDATE_COMMAND_TIMEOUT_MS = 45 * 60 * 1000;
 const AUTO_STABLE_DELAY_HOURS = 6;
 const AUTO_STABLE_JITTER_HOURS = 12;
 const DEV_COMMIT_LIMIT = 5;
@@ -425,7 +424,6 @@ async function runAutoUpdateCommand(
   const command = formatManagedServiceUpdateCommand({
     channel: params.channel,
     ...(params.packageTargetVersion ? { tag: params.packageTargetVersion } : {}),
-    timeoutMs: params.timeoutMs,
   });
   const failure = (
     reason: string,
@@ -493,7 +491,7 @@ async function runAutoUpdateCommand(
     const handoffId = randomUUID();
     const started = await startManagedServiceUpdateHandoff({
       root: params.root,
-      timeoutMs: params.timeoutMs,
+      recoveryTimeoutMs: params.timeoutMs,
       restartDrainTimeoutMs:
         resolveGatewayRestartDeferralTimeoutMs(params.restartDrainTimeoutMs) ??
         resolveGatewayRestartDeferralTimeoutMs(),
@@ -824,7 +822,7 @@ async function runCampaignUpdate(params: {
       runId,
       channel: params.channel,
       mode: params.mode,
-      timeoutMs: AUTO_UPDATE_COMMAND_TIMEOUT_MS,
+      timeoutMs: AUTO_UPDATE_STEP_TIMEOUT_MS,
       restartDrainTimeoutMs: resolveGatewayRestartDeferralTimeoutMs(),
       ...(params.root ? { root: params.root } : {}),
       ...(params.channel === "dev" ? {} : { packageTargetVersion: params.version }),
@@ -1317,7 +1315,7 @@ async function runGatewayUpdateCheckOwned(
   const channel = configuredChannel;
   const resolved =
     shouldRunAutoUpdate || channel !== "stable"
-      ? await resolveNpmChannelTag({ channel, timeoutMs: 2500 })
+      ? await resolveNpmChannelTag({ channel })
       : {
           tag: "latest",
           version: telemetryUpdate?.version ?? null,

@@ -36,6 +36,54 @@ function recoverFixtureLock(f: ReturnType<typeof fixture>, oid: string) {
 }
 
 describePosix("native PR main refresh boundaries", () => {
+  it.each([
+    "review-init",
+    "review-checkout-pr",
+    "prepare-init",
+    "prepare-run",
+    "prepare-sync-head",
+    "merge-verify",
+  ])("%s acquires the authenticated head despite a stale pull ref", (command) => {
+    const f = fixture();
+    if (command === "prepare-sync-head" || command === "merge-verify") {
+      const prepared = f.run("prepare-run");
+      expect(prepared.status, prepared.stdout + prepared.stderr).toBe(0);
+    }
+    f.git(f.origin, "update-ref", "refs/pull/42/head", f.main);
+    const result = f.run(command);
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(f.git(f.worktree, "rev-parse", "refs/heads/pr-42")).toBe(f.head);
+    expect(f.git(f.origin, "rev-parse", "refs/pull/42/head")).toBe(f.main);
+    expect(f.git(f.origin, "rev-parse", "refs/heads/topic")).toBe(f.head);
+    expect(f.git(f.worktree, "status", "--porcelain")).toBe("");
+    expect(f.events().filter((event) => event.kind === "unexpected-push")).toEqual([]);
+  });
+
+  it.each(["oid", "branch", "repository"] as const)(
+    "rejects PR %s drift during acquisition before preparation stamps",
+    (boundary) => {
+      const f = fixture();
+      f.configure({ prIdentityDriftAfterFetch: boundary });
+      const result = f.run("prepare-init");
+      expect(result.status, result.stdout + result.stderr).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain("PR head changed");
+      expect(existsSync(join(f.local, "prep-context.env"))).toBe(false);
+      expect(f.git(f.worktree, "rev-parse", "HEAD")).toBe(f.head);
+      expect(f.git(f.worktree, "status", "--porcelain")).toBe("");
+    },
+  );
+
+  it("refuses a non-SHA PR source before fetching or replacing its local ref", () => {
+    const f = fixture();
+    f.git(f.canonical, "branch", "pr-42", f.head);
+    f.configure({ metadata: { ...f.metadata, headRefOid: "refs/heads/main" } });
+    const result = f.run("review-init");
+    expect(result.status, result.stdout + result.stderr).not.toBe(0);
+    expect(result.stderr).toContain("full lowercase commit SHA");
+    expect(f.git(f.worktree, "rev-parse", "refs/heads/pr-42")).toBe(f.head);
+    expect(existsSync(join(f.local, "review-context.env"))).toBe(false);
+  });
+
   it.each(["detached", "pr-42", "pr-42-prep"])(
     "prepares directly from the reviewed head (%s) without visiting main",
     (branch) => {
@@ -442,27 +490,38 @@ ${readFileSync(gitShim, "utf8")}
     expect(readFileSync(join(f.local, "prep.env"), "utf8")).toContain(`PREP_HEAD_SHA=${f.head}\n`);
   });
 
-  it("captures private FETCH_HEAD despite a competing shared-ref write and worktree origin/refmap overrides", () => {
-    const f = fixture();
-    f.git(f.canonical, "remote", "set-url", "origin", "../origin.git");
-    f.git(f.worktree, "config", "--worktree", "remote.origin.url", join(f.root, "wrong-origin"));
-    f.git(
-      f.worktree,
-      "config",
-      "--worktree",
-      "remote.origin.fetch",
-      "+refs/heads/movement:refs/remotes/origin/main",
-    );
-    f.git(f.canonical, "update-ref", "refs/heads/origin/main", f.movedMain);
-    f.configure({ moveSharedAfterFetch: true });
-    const result = f.run("review-checkout-main");
-    expect(result.status, result.stdout + result.stderr).toBe(0);
-    expect(f.git(f.worktree, "rev-parse", "HEAD")).toBe(f.main);
-    expect(f.events().filter((e) => e.kind === "fetched")).toEqual([
-      { kind: "fetched", sha: f.main, shared: f.movedMain },
-    ]);
-    expect(f.git(f.canonical, "rev-parse", "refs/remotes/origin/main")).toBe(f.movedMain);
-  });
+  it.each(["review-checkout-main", "prepare-init"])(
+    "%s preserves private FETCH_HEAD despite shared-ref writes and worktree origin/refmap overrides",
+    (command) => {
+      const f = fixture();
+      const sharedFetchHead = join(f.canonical, ".git", "FETCH_HEAD");
+      const readSharedFetchHead = () =>
+        existsSync(sharedFetchHead) ? readFileSync(sharedFetchHead, "utf8") : null;
+      const beforeSharedFetchHead = readSharedFetchHead();
+      f.git(f.canonical, "remote", "set-url", "origin", "../origin.git");
+      f.git(f.worktree, "config", "--worktree", "remote.origin.url", join(f.root, "wrong-origin"));
+      f.git(
+        f.worktree,
+        "config",
+        "--worktree",
+        "remote.origin.fetch",
+        "+refs/heads/movement:refs/remotes/origin/main",
+      );
+      f.git(f.canonical, "update-ref", "refs/heads/origin/main", f.movedMain);
+      f.configure({ moveSharedAfterFetch: true });
+      const result = f.run(command);
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(f.git(f.worktree, "rev-parse", "HEAD")).toBe(
+        command === "prepare-init" ? f.head : f.main,
+      );
+      expect(f.git(f.worktree, "rev-parse", "FETCH_HEAD")).toBe(f.main);
+      expect(readSharedFetchHead()).toBe(beforeSharedFetchHead);
+      expect(f.events().filter((e) => e.kind === "fetched")).toEqual([
+        { kind: "fetched", sha: f.main, shared: f.movedMain },
+      ]);
+      expect(f.git(f.canonical, "rev-parse", "refs/remotes/origin/main")).toBe(f.movedMain);
+    },
+  );
 
   it("starts a new operation fresh and rejects a stale detached main review", () => {
     const f = fixture();
@@ -697,11 +756,11 @@ read -r release < "$OPENCLAW_TEST_FETCH_HOLD"
         f.configure({ metadata: { ...f.metadata, headRefName: "renamed" } });
       }
       if (boundary === "fetched") {
-        f.git(f.canonical, "push", "origin", `${f.sameTreeHead}:refs/pull/42/head`);
+        f.configure({ wrongPrFetch: true });
       }
       const result = f.run("prepare-run");
       expect(result.status, result.stdout + result.stderr).not.toBe(0);
-      expect(result.stdout).toContain(
+      expect(result.stdout + result.stderr).toContain(
         boundary === "branch" ? "PR head branch changed" : "PR head changed",
       );
       expect(existsSync(join(f.local, "prep-context.env"))).toBe(false);
@@ -738,6 +797,114 @@ read -r release < "$OPENCLAW_TEST_FETCH_HOLD"
       const checks = events.findIndex((e) => e.kind === "required-checks");
       expect(events.findIndex((e) => e.kind === "ci-completed")).toBeLessThan(checks);
       expect(events.findLastIndex((e) => e.kind === "main-fetch")).toBeGreaterThan(checks);
+    },
+  );
+
+  it.each([
+    {
+      name: "exact punctuation and case overlaps",
+      preparedPaths: ["src/A-file.ts", "src/a_file.ts", "src/Mixed.Case.ts"],
+      mainPaths: ["src/A-file.ts", "src/a_file.ts", "src/Mixed.Case.ts"],
+      overlaps: ["src/A-file.ts", "src/Mixed.Case.ts", "src/a_file.ts"],
+    },
+    {
+      name: "case-only nonmatches",
+      preparedPaths: ["src/Case-file.ts"],
+      mainPaths: ["src/case-file.ts"],
+      overlaps: [],
+    },
+  ])(
+    "evaluates $name in C locale without changing its caller",
+    ({ preparedPaths, mainPaths, overlaps }) => {
+      const f = fixture();
+      const commitPaths = (base: string, paths: string[], label: string) => {
+        f.git(f.canonical, "checkout", "--detach", base);
+        for (const path of paths) {
+          writeFileSync(join(f.canonical, path), `${label}\n`);
+        }
+        f.git(f.canonical, "add", "--", ...paths);
+        f.git(f.canonical, "commit", "-qm", label);
+        return f.git(f.canonical, "rev-parse", "HEAD");
+      };
+      const preparedHead = commitPaths(f.head, preparedPaths, "test: prepared paths");
+      const incomingMain = commitPaths(f.main, mainPaths, "test: incoming paths");
+      f.git(
+        f.canonical,
+        "push",
+        "origin",
+        `${preparedHead}:refs/heads/topic`,
+        `${preparedHead}:refs/pull/42/head`,
+        `${incomingMain}:refs/heads/main`,
+      );
+      f.git(f.canonical, "checkout", "--detach", f.main);
+      f.git(f.worktree, "checkout", "--detach", preparedHead);
+      f.configure({ metadata: { ...f.metadata, headRefOid: preparedHead } });
+      for (const artifact of ["pr-meta.json", "pr-meta.env", "review.json", "review.md"]) {
+        const path = join(f.local, artifact);
+        writeFileSync(path, readFileSync(path, "utf8").replaceAll(f.head, preparedHead));
+      }
+      const prepared = f.run("prepare-run");
+      expect(prepared.status, prepared.stdout + prepared.stderr).toBe(0);
+
+      const trace = join(f.root, "drift-locales.log");
+      f.env.LC_ALL = "en_US.UTF-8";
+      f.env.DRIFT_LOCALE_TRACE = trace;
+      for (const command of ["sort", "comm"]) {
+        const realCommand = `DRIFT_REAL_${command.toUpperCase()}`;
+        f.env[realCommand] = execFileSync("which", [command], { encoding: "utf8" }).trim();
+        writeFileSync(
+          join(f.root, "bin", command),
+          `#!/bin/sh
+if [ "\${DRIFT_LOCALE_PROBE:-}" = 1 ]; then
+  printf '%s\\t%s\\n' '${command}' "\${LC_ALL:-}" >> "$DRIFT_LOCALE_TRACE"
+fi
+LC_ALL=C exec "$${realCommand}" "$@"
+`,
+          { mode: 0o755 },
+        );
+      }
+      // Observe the actual evaluator's subprocess environment, not host collation behavior.
+      const result = f.shell(`
+eval "$(declare -f mainline_drift_requires_sync | sed '1s/mainline_drift_requires_sync/evaluate_actual_drift/')"
+mainline_drift_requires_sync() {
+  local DRIFT_LOCALE_PROBE=1
+  export DRIFT_LOCALE_PROBE
+  evaluate_actual_drift "$@"
+}
+merge_verify 42 || exit 1
+printf 'caller-locale=%s\\n' "$LC_ALL"
+`);
+      const output = result.stdout + result.stderr;
+      expect(result.status, output).toBe(0);
+      expect(output).toContain("caller-locale=en_US.UTF-8\n");
+      expect(output).not.toContain("Mainline files touching merge-critical infrastructure");
+      if (overlaps.length > 0) {
+        expect(output).toContain(
+          `Mainline files overlapping prepared files (${overlaps.length}):\n${overlaps.map((path) => `  - ${path}`).join("\n")}\n`,
+        );
+        expect(output).toContain("WARNING — mainline drift");
+      } else {
+        expect(output).not.toContain("Mainline files overlapping prepared files");
+        expect(output).toContain("because behind-main drift is unrelated");
+      }
+      expect(existsSync(join(f.local, "merge-output.log"))).toBe(false);
+      expect(f.events().some((event) => event.kind === "gh" && event.args?.includes("merge"))).toBe(
+        false,
+      );
+      expect(
+        f.git(
+          f.canonical,
+          "for-each-ref",
+          "--format=%(refname)",
+          "refs/openclaw/pr-merge-outcomes/42",
+        ),
+      ).toBe("");
+      expect(f.git(f.origin, "rev-parse", "refs/heads/main")).toBe(incomingMain);
+      expect(readFileSync(trace, "utf8").trim().split("\n")).toEqual([
+        "sort\tC",
+        "sort\tC",
+        "comm\tC",
+      ]);
     },
   );
 

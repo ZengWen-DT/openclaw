@@ -2,12 +2,12 @@ import { once } from "node:events";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import { setSqliteBusyTimeout } from "./sqlite-busy-timeout.js";
-import {
-  readSqliteIntegrityFileIdentity,
-  type SqliteIntegrityWorkerInput,
-  type SqliteIntegrityWorkerMessage,
-  type SqliteIntegrityWorkerPhase,
-  type SqliteIntegrityWorkerResult,
+import { readSqliteIntegrityFileIdentity } from "./sqlite-file-generation.js";
+import type {
+  SqliteIntegrityWorkerInput,
+  SqliteIntegrityWorkerMessage,
+  SqliteIntegrityWorkerPhase,
+  SqliteIntegrityWorkerResult,
 } from "./sqlite-integrity-worker.js";
 import { assertSqliteIntegrity } from "./sqlite-integrity.js";
 
@@ -45,9 +45,12 @@ try {
   readSqliteIntegrityFileIdentity(input.pathname, input.identity);
   database = openNodeSqliteDatabase(input.pathname, { readOnly: true });
   setSqliteBusyTimeout(database, input.busyTimeoutMs);
+  // Full index checks revisit pages. Keep their cache in this disposable child,
+  // without raising the memory budget of the Gateway's retained connections.
+  database.exec("PRAGMA cache_size = -65536;"); // sqlite-allow-raw -- Connection-local page-cache policy for this disposable integrity child.
   readSqliteIntegrityFileIdentity(input.pathname, input.identity);
   await sendPhase("checking");
-  assertSqliteIntegrity(database, input.pathname);
+  assertSqliteIntegrity(database, input.databaseLabel);
 } catch (error) {
   failure = toStringifiedError(error);
 } finally {

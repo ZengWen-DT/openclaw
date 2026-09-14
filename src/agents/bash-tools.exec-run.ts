@@ -5,7 +5,6 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { resolveStateDir } from "../config/paths.js";
 import { createAbortError } from "../infra/abort-signal.js";
 import {
-  type ExecHost,
   loadExecApprovals,
   maxAsk,
   minSecurity,
@@ -243,7 +242,7 @@ export function createExecTool(
       }
       const startedAt = Date.now();
       let execCommandOverride: string | undefined;
-      let revalidateGatewayApproval: GatewayApprovalResult["revalidateBeforeExecution"];
+      let gatewayApproval: GatewayApprovalResult | undefined;
       let approvalReview: ExecToolApprovalReview | undefined;
       const foregroundFallbackWarning =
         !allowBackground && (params.background === true || typeof params.yieldMs === "number")
@@ -308,7 +307,7 @@ export function createExecTool(
         sandboxAvailable: Boolean(defaults?.sandbox),
         sandboxRequired: defaults?.sandboxRequired,
       });
-      const host: ExecHost = target.effectiveHost;
+      const host = target.effectiveHost;
 
       const explicitSecurity = defaults?.security;
       const configuredSecurity = explicitSecurity ?? (host === "sandbox" ? "deny" : "full");
@@ -563,7 +562,7 @@ export function createExecTool(
             return attachExecApprovalReview(immediateResult, approvalReview);
           }
           signal?.throwIfAborted();
-          revalidateGatewayApproval = gatewayResult.revalidateBeforeExecution;
+          gatewayApproval = gatewayResult;
           execCommandOverride = gatewayResult.allowWithoutEnforcedCommand
             ? undefined
             : gatewayResult.execCommandOverride;
@@ -612,7 +611,8 @@ export function createExecTool(
           processContinuationAvailable: allowBackground,
           startupSignal: signal,
           onUpdate,
-          beforeSpawn: revalidateGatewayApproval,
+          beforeSpawn: gatewayApproval?.revalidateBeforeExecution,
+          assertCurrent: gatewayApproval?.assertCurrent,
           onSettledBeforeNotify: settlement.settle,
         });
         discardPreparedSandboxWorkdir = null;
@@ -688,6 +688,7 @@ export function createExecTool(
         // that settles before this timer fires must stay out of the task ledger.
         settlement.backgroundTask = createBackgroundExecTask({
           processSessionId: run.session.id,
+          command: run.session.command,
           sessionKey: notifySessionKey,
           agentId,
           startedAt: run.startedAt,

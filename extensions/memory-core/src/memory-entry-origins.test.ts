@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { SqliteQueryCompiler } from "kysely";
 import {
   openOpenClawAgentDatabase,
   resolveOpenClawAgentSqlitePath,
@@ -61,12 +62,15 @@ describe("memory entry origins", () => {
     };
   }
 
-  it("lazily restores the additive origins table without changing the agent schema version", () => {
+  it("lazily restores the additive origins table without changing the agent schema version", async () => {
+    expect(deleteMemoryEntryOrigins({ agentId: "main", entryKeys: ["candidate"] })).toBe(0);
+    await expect(fs.access(resolveOpenClawAgentSqlitePath({ agentId: "main" }))).rejects.toThrow();
     const db = openOpenClawAgentDatabase({ agentId: "main" }).db;
     const version = db.prepare("PRAGMA user_version").get();
     db.exec("DROP TABLE IF EXISTS memory_entry_origins");
 
     expect(listMemoryEntryOrigins({ agentId: "main" })).toEqual([]);
+    expect(deleteMemoryEntryOrigins({ agentId: "main", entryKeys: ["candidate"] })).toBe(0);
     expect(
       db.prepare("SELECT name FROM sqlite_schema WHERE name = 'memory_entry_origins'").get(),
     ).toBeUndefined();
@@ -196,18 +200,83 @@ describe("memory entry origins", () => {
 
   it("rolls back only newly reserved lineage when a replacement does not commit", () => {
     const priorEntry = "- Keep the original deployment target.";
-    const original = [origin("candidate", "session-2"), origin("prior", "session-1")];
+    const prior = Array.from({ length: 32 }, (_, index) =>
+      origin("prior", `session-${String(index).padStart(2, "0")}`),
+    );
+    const existing = origin("candidate", "session-existing");
+    const original = [existing, ...prior];
     recordMemoryEntryOrigins({ agentId: "main", origins: original });
-    const rollback = reserveMemoryEntryOrigins({
-      agentIds: ["main"],
-      previousMemory: `${buildPromotionMarker("prior")}\n${priorEntry}\n`,
-      operations: [{ candidateKey: "candidate", action: "merged", priorEntries: [priorEntry] }],
-    });
-    expect(listMemoryEntryOrigins({ agentId: "main", entryKeys: ["candidate"] })).toHaveLength(2);
-
-    rollback();
-
+    for (const filter of [
+      { entryKeys: [] },
+      { entryKeys: ["candidate"], sessionIds: [] },
+      { entryKeys: ["missing"] },
+      { entryKeys: ["candidate"], sessionIds: ["session-1"] },
+    ]) {
+      expect(deleteMemoryEntryOrigins({ agentId: "main", ...filter })).toBe(0);
+    }
     expect(listMemoryEntryOrigins({ agentId: "main" })).toEqual(original);
+    const compile = vi.spyOn(SqliteQueryCompiler.prototype, "compileQuery");
+    try {
+      const rollback = reserveMemoryEntryOrigins({
+        agentIds: ["main"],
+        previousMemory: `${buildPromotionMarker("prior")}\n${priorEntry}\n`,
+        operations: [{ candidateKey: "candidate", action: "merged", priorEntries: [priorEntry] }],
+      });
+      expect(listMemoryEntryOrigins({ agentId: "main", entryKeys: ["candidate"] })).toEqual([
+        ...prior.map((entry) => origin("candidate", entry.sessionId)),
+        existing,
+      ]);
+
+      rollback();
+
+      expect(listMemoryEntryOrigins({ agentId: "main" })).toEqual(original);
+      expect(
+        compile.mock.results.filter(
+          (result) =>
+            result.type === "return" &&
+            result.value.sql.startsWith('insert into "memory_entry_origins"'),
+        ).length,
+      ).toBeLessThanOrEqual(2);
+    } finally {
+      compile.mockRestore();
+    }
+  });
+
+  it("keeps fresh origin values and insertion order across conflicts and failed reservations", () => {
+    const first = origin("candidate", "session-z");
+    const second: MemoryEntryOrigin = {
+      entryKey: "candidate",
+      agentId: "main",
+      sessionId: "session-a",
+      sessionKey: null,
+      originClass: "agent",
+      observedAt: 2_000,
+    };
+    const third: MemoryEntryOrigin = {
+      entryKey: "candidate",
+      agentId: "main",
+      sessionId: "session-m",
+      sessionKey: "agent:main:漢😀",
+      originClass: "system",
+      observedAt: 3_000,
+    };
+    expect(
+      recordMemoryEntryOrigins({
+        agentId: "main",
+        origins: [first, second, { ...first, observedAt: 9_000 }, third],
+      }),
+    ).toEqual([first, second, third]);
+    const before = [second, third, first];
+    expect(listMemoryEntryOrigins({ agentId: "main" })).toEqual(before);
+    expect(() =>
+      recordMemoryEntryOrigins({
+        agentId: "main",
+        origins: [origin("next", "new-session"), { ...second, agentId: "other" }],
+      }),
+    ).toThrow("memory entry origin belongs to another agent");
+    expect(listMemoryEntryOrigins({ agentId: "main" })).toEqual(before);
+    closeOpenClawAgentDatabasesForTest();
+    expect(listMemoryEntryOrigins({ agentId: "main" })).toEqual(before);
   });
 
   it.each(["DREAMS.md", "dreams.md"])(

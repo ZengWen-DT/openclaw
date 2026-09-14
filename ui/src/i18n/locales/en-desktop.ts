@@ -15,6 +15,11 @@ const enDesktop = {
     enterFullscreen: "Enter fullscreen",
     exitFullscreen: "Exit fullscreen",
     fullscreenUnavailable: "Fullscreen is unavailable in this browser",
+    enterPictureInPicture: "Open desktop in Picture-in-Picture",
+    exitPictureInPicture: "Close Picture-in-Picture",
+    pictureInPictureTitle: "Desktop — view-only Picture-in-Picture",
+    pictureInPictureUnavailable:
+      "Picture-in-Picture requires a supported browser and a secure connection",
     pickerTitle: "Desktop sources",
     thisMachine: "This machine",
     refresh: "Refresh",
@@ -27,7 +32,7 @@ const enDesktop = {
     macLockStateUnknown:
       "This Mac’s lock state is unknown. Check the desktop before using computer control; Screen Sharing remains available for sign-in.",
     connect: "Connect",
-    connecting: "Connecting to desktop…",
+    connecting: en.desktop.connecting,
     takeControl: "Take control",
     switchToViewOnly: "Switch to view only",
     viewOnly: "View only",
@@ -56,6 +61,8 @@ const enDesktop = {
     closeCode: "connection closed with code {code}",
     unknownReason: "unknown reason",
     errors: {
+      pictureInPictureFailed:
+        "Could not open or update Picture-in-Picture. Check browser permissions and try again from the desktop viewer.",
       listFailed: "Could not load desktop sources: {error}",
       fullscreenFailed: "Could not change fullscreen mode: {error}",
       securityFailed: "Desktop security negotiation failed: {reason}",

@@ -1,6 +1,7 @@
 import { runCommandWithTimeout } from "../process/exec.js";
 import { formatErrorMessage } from "./errors.js";
 import { trimLogTail } from "./restart-sentinel.js";
+import { createUpdateFailureFact } from "./update-failure-facts.js";
 import { createGlobalInstallEnv } from "./update-global.js";
 import { UPDATE_RUN_HEARTBEAT_MS } from "./update-run-timeouts.js";
 import type {
@@ -11,7 +12,6 @@ import type {
   UpdateStepResult,
 } from "./update-runner-types.js";
 
-export const UPDATE_RUNNER_TIMEOUT_MS = 20 * 60_000;
 export const MAX_LOG_CHARS = 8000;
 
 // A run shares its heartbeat callback across steps; weak keys do not retain completed runs.
@@ -66,22 +66,27 @@ export async function runStep(opts: RunStepOptions): Promise<UpdateStepResult> {
   const durationMs = Date.now() - started;
   const stdoutTail = trimLogTail(result.stdout, MAX_LOG_CHARS);
   const stderrTail = trimLogTail(result.stderr, MAX_LOG_CHARS);
+  const failureFacts =
+    result.code !== 0 || result.killed || result.termination === "timeout"
+      ? [
+          createUpdateFailureFact(
+            {
+              check: name.startsWith("global ") ? "package-install" : name,
+              code:
+                result.stderr.match(/\bnpm (?:ERR!|error) code ([A-Z][A-Z0-9_]+)/u)?.[1] ??
+                (result.termination && result.termination !== "exit"
+                  ? result.termination
+                  : "command-failed"),
+              message: result.stderr,
+            },
+            env,
+          ),
+        ]
+      : undefined;
 
-  progress?.onStepComplete?.({
-    ...stepInfo,
-    durationMs,
-    exitCode: result.code,
-    stdoutTail,
-    stderrTail,
-    signal: result.signal,
-    killed: result.killed,
-    termination: result.termination,
-  });
-
-  const stepResult: UpdateStepResult = {
+  const completion: Omit<UpdateStepResult, "cwd"> = {
     name,
     command,
-    cwd,
     durationMs,
     exitCode: result.code,
     stdoutTail,
@@ -89,6 +94,13 @@ export async function runStep(opts: RunStepOptions): Promise<UpdateStepResult> {
     signal: result.signal,
     killed: result.killed,
     termination: result.termination,
+    ...(failureFacts ? { failureFacts } : {}),
+  };
+  progress?.onStepComplete?.({ ...stepInfo, ...completion });
+
+  const stepResult: UpdateStepResult = {
+    ...completion,
+    cwd,
   };
   opts.results?.push(stepResult);
   return stepResult;

@@ -342,6 +342,9 @@ describe("Codex supervision actions", () => {
     const control = createEligibleControl();
     const processFallbackControl = {
       forRequest: () => control,
+      forNode: () => {
+        throw new Error("Node source is outside this local archive fixture");
+      },
       homesForAgent: () => [
         {
           hostId: CODEX_LOCAL_SESSION_HOST_ID,
@@ -360,7 +363,7 @@ describe("Codex supervision actions", () => {
     expect(registerSessionCatalog).toHaveBeenCalledOnce();
     const provider = getProvider();
     expect(provider?.resolveCreateSession?.({ agentId: "main" })).toEqual({
-      model: "openai/gpt-5.6-sol",
+      model: "openai/gpt-6-astra",
       agentRuntime: "codex",
     });
     await withEnvAsync({ CODEX_HOME: undefined }, async () => {

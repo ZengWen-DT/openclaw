@@ -2,11 +2,10 @@ import { html, nothing } from "lit";
 import type { QuestionPrompt } from "../../../app/question-prompt.ts";
 import { icons } from "../../../components/icons.ts";
 import { t } from "../../../i18n/index.ts";
-import type { AssistantIdentity } from "../../../lib/assistant-identity.ts";
 import type { ChatItem, MessageGroup } from "../../../lib/chat/chat-types.ts";
 import { summarizeToolGroup } from "../../../lib/chat/tool-call-grouping.ts";
 import { extractToolCardsCached, isToolCardError } from "../../../lib/chat/tool-cards.ts";
-import { formatDurationCompact } from "../../../lib/format.ts";
+import { formatDurationCompact } from "../../../lib/format-duration.ts";
 import { renderChatAvatar } from "../chat-avatar.ts";
 import { renderGroupedMessage } from "./chat-message-bubble.ts";
 import {
@@ -56,7 +55,7 @@ type StreamMessageOptions = Pick<
 export type StreamGroupOptions = StreamMessageOptions & {
   onReply?: (target: MessageReplyTarget) => void;
   onOpenSidebar?: (content: SidebarContent) => void;
-  assistant?: AssistantIdentity;
+  assistant?: Parameters<typeof renderChatAvatar>[1];
   showAssistantAvatar?: boolean;
   startupLabel?: string;
   waitingApproval?: boolean;
@@ -110,7 +109,7 @@ export function renderStreamGroupParts(
 // arrives as several stream segments renders under a single avatar/footer
 // instead of flashing a separate avatar+bubble per segment (#63956).
 export function renderStreamGroup(parts: StreamGroupPart[], opts: StreamGroupOptions = {}) {
-  const { assistant, resourceBasePath } = opts;
+  const { assistant } = opts;
   const name = assistant?.name ?? "Assistant";
   // Footer (sender + time) anchors to the earliest streamed segment; a run that
   // is only the reading indicator has no timestamp and therefore no footer.
@@ -126,7 +125,7 @@ export function renderStreamGroup(parts: StreamGroupPart[], opts: StreamGroupOpt
   const avatar =
     workingOnly || opts.showAssistantAvatar === false
       ? nothing
-      : renderChatAvatar("assistant", assistant, undefined, resourceBasePath);
+      : renderChatAvatar("assistant", assistant);
   const groupClass = `chat-group assistant${workingOnly ? " chat-group--working" : ""}${footerStartedAt !== null ? " chat-group--with-footer" : ""}`;
 
   return html`
@@ -194,9 +193,9 @@ export function renderWorkGroupSummary(
               >`
             : nothing
         }
+        ${opts.expanded ? nothing : renderToolFailures(cards)}
         <span class="chat-tool-row__chevron" aria-hidden="true">${icons.chevronRight}</span>
       </button>
-      ${opts.expanded ? nothing : renderToolFailures(cards)}
       <div class="chat-work-group__separator" aria-hidden="true"></div>
       ${opts.expanded ? nothing : (opts.browserTabPreviews ?? nothing)}
     </div>

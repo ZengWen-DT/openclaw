@@ -1,5 +1,9 @@
+import type { Locator } from "playwright";
 import { expect, it } from "vitest";
 import { GATEWAY_SERVER_CAPS } from "../../../packages/gateway-protocol/src/index.js";
+import { finishElementAnimations } from "../test-helpers/animations.ts";
+import { createControlUiMockBootstrapConfig } from "../test-helpers/control-ui-e2e.ts";
+import { resolveRenderedColors, type RenderedColor } from "../test-helpers/rendered-colors.ts";
 import {
   chatSessionListResponse,
   createChatFlowE2eSuite,
@@ -13,12 +17,33 @@ import { createControlUiE2eContextOptions } from "./control-ui-e2e-suite.test-su
 
 const suite = createChatFlowE2eSuite();
 
+async function expectReadableButton(button: Locator) {
+  const raw = await button.evaluate((element) => ({
+    foreground: getComputedStyle(element).color,
+    background: getComputedStyle(element).backgroundColor,
+  }));
+  const colors = await button.page().evaluate(resolveRenderedColors, raw);
+  const luminance = (color: RenderedColor) =>
+    [color.red, color.green, color.blue]
+      .map((value) => value / 255)
+      .map((value) => (value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4))
+      .reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index]!, 0);
+  const foreground = colors.foreground!;
+  expect
+    .soft(Math.min(foreground.red, foreground.green, foreground.blue))
+    .toBeGreaterThanOrEqual(240);
+  expect
+    .soft((luminance(foreground) + 0.05) / (luminance(colors.background!) + 0.05))
+    .toBeGreaterThanOrEqual(4.5);
+}
+
 suite.define(() => {
   it.each([
-    { mode: "local", label: "Start in a new session" },
-    { mode: "worktree", label: "Start in a new worktree" },
-    { mode: "session", label: "Start in this session" },
-  ])("starts a suggested task with $mode placement", async ({ mode, label }) => {
+    { mode: "local", label: "Start in a new session", accent: "#da7756" },
+    { mode: "worktree", label: "Start in a new worktree", accent: "#ffffff" },
+    { mode: "session", label: "Start in this session", accent: "#ffffff" },
+    { mode: "worktree", label: "Start in a new worktree", accent: "#00ff00" },
+  ])("starts task ($mode, $accent)", async ({ mode, label, accent }) => {
     const context = await suite.newBrowserContext({
       ...createControlUiE2eContextOptions(),
       colorScheme: mode === "worktree" ? "dark" : "light",
@@ -54,6 +79,12 @@ suite.define(() => {
       },
     });
 
+    await page.route("**/control-ui-config.json", (route) =>
+      route.fulfill({
+        json: { ...createControlUiMockBootstrapConfig(), seamColor: accent },
+      }),
+    );
+
     try {
       await page.goto(`${suite.server.baseUrl}chat`);
       await gateway.waitForRequest("taskSuggestions.list");
@@ -76,14 +107,31 @@ suite.define(() => {
       await options.click();
       await card.getByRole("menuitem", { name: "Start in a new worktree" }).waitFor();
       expect(await gateway.getRequests("taskSuggestions.accept")).toHaveLength(0);
-      await captureUiProof(suite, page, "task-suggestions", `${mode}-menu.png`);
+      const triggerBox = await options.boundingBox();
+      expect(triggerBox).not.toBeNull();
+      const menuBox = await card.getByRole("menu").boundingBox();
+      expect.soft(menuBox?.y).toBeGreaterThanOrEqual(triggerBox!.y + triggerBox!.height);
+      for (const button of [startButton, options]) {
+        await page.mouse.move(0, 0);
+        await button.evaluate(finishElementAnimations);
+        await expectReadableButton(button);
+        await button.hover();
+        await button.evaluate(finishElementAnimations);
+        await expectReadableButton(button);
+      }
+      await captureUiProof(suite, page, "task-suggestions", `${mode}-${accent.slice(1)}-menu.png`);
       await page.keyboard.press("Escape");
       await expect
         .poll(() => options.evaluate((element) => element === document.activeElement))
         .toBe(true);
       expect(await card.getByRole("button", { name: "Copy prompt" }).isEnabled()).toBe(true);
       expect(await gateway.getRequests("environments.list")).toHaveLength(0);
-      await captureUiProof(suite, page, "task-suggestions", `${mode}-split-button.png`);
+      await captureUiProof(
+        suite,
+        page,
+        "task-suggestions",
+        `${mode}-${accent.slice(1)}-split-button.png`,
+      );
       await page.getByText("Show instructions", { exact: true }).click();
       await page
         .getByText("/projects/example", { exact: true })
@@ -121,6 +169,91 @@ suite.define(() => {
           .poll(() => new URL(page.url()).pathname)
           .toBe(controlUiSessionPath("agent:main:dashboard:suggested"));
       }
+    } finally {
+      await suite.closeBrowserContext(context);
+    }
+  });
+
+  it("dismisses suggested tasks immediately and restores a rejected dismissal without changing selection", async () => {
+    const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
+    const page = await context.newPage();
+    const suggestion = {
+      id: "task_dismiss",
+      title: "Remove stale adapter",
+      prompt: "Delete the stale adapter and update its tests.",
+      tldr: "This follow-up is no longer needed.",
+      cwd: "/projects/example",
+      sessionKey: "main",
+      agentId: "main",
+      createdAt: 2,
+    };
+    const nextSuggestion = {
+      ...suggestion,
+      id: "task_next",
+      title: "Inspect remaining tests",
+      prompt: "Inspect coverage of the remaining adapters.",
+      tldr: "This follow-up remains useful.",
+      createdAt: 1,
+    };
+    const gateway = await installMockGateway(page, {
+      featureMethods: [
+        "chat.metadata",
+        "chat.startup",
+        "taskSuggestions.list",
+        "taskSuggestions.accept",
+        "taskSuggestions.dismiss",
+      ],
+      methodResponses: {
+        "taskSuggestions.list": { suggestions: [suggestion, nextSuggestion] },
+      },
+    });
+
+    try {
+      await page.goto(`${suite.server.baseUrl}chat`);
+      const card = page.locator(`.task-suggestion[data-task-id="${suggestion.id}"]`);
+      const nextCard = page.locator(`.task-suggestion[data-task-id="${nextSuggestion.id}"]`);
+      await card.waitFor({ state: "visible", timeout: 10_000 });
+      await gateway.deferNext("taskSuggestions.dismiss");
+      await card.getByRole("button", { name: `Dismiss ${suggestion.title}` }).click();
+      const dismissal = await gateway.waitForRequest("taskSuggestions.dismiss");
+      expect(dismissal.params).toEqual({ taskId: suggestion.id });
+      await captureUiProof(suite, page, "task-suggestions", "dismiss-pending.png");
+
+      await expect.poll(() => card.count()).toBe(0);
+      await nextCard.waitFor({ state: "visible" });
+      expect(
+        await nextCard.getByRole("button", { name: "Start in a new session" }).isEnabled(),
+      ).toBe(true);
+      const composer = page.locator(".agent-chat__composer-combobox textarea");
+      await composer.fill("Continue working while the suggestion closes.");
+
+      await gateway.deferNext("taskSuggestions.list");
+      await gateway.emitGatewayEvent("task.suggestion", { action: "created", suggestion });
+      await waitForRequests(gateway, "taskSuggestions.list", 2);
+      const refreshedSuggestion = {
+        ...nextSuggestion,
+        tldr: "This follow-up remains available after refreshing the list.",
+      };
+      await gateway.resolveDeferred("taskSuggestions.list", {
+        suggestions: [suggestion, refreshedSuggestion],
+      });
+      await nextCard.getByText(refreshedSuggestion.tldr, { exact: true }).waitFor();
+      expect(await card.count()).toBe(0);
+
+      const failure = "The suggestion could not be dismissed.";
+      await gateway.rejectDeferred("taskSuggestions.dismiss", { message: failure });
+      await page.getByText(failure, { exact: true }).first().waitFor();
+      await expect.poll(() => card.count()).toBe(1);
+      expect(await card.isVisible()).toBe(false);
+      expect(await nextCard.isVisible()).toBe(true);
+      expect(await composer.inputValue()).toBe("Continue working while the suggestion closes.");
+      await nextCard.getByRole("button", { name: "Previous suggested task" }).click();
+      await card.waitFor({ state: "visible" });
+      expect(await card.getByRole("button", { name: "Start in a new session" }).isEnabled()).toBe(
+        true,
+      );
+      expect(await gateway.getRequests("taskSuggestions.dismiss")).toHaveLength(1);
+      expect(await gateway.getRequests("taskSuggestions.accept")).toHaveLength(0);
     } finally {
       await suite.closeBrowserContext(context);
     }

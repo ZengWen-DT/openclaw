@@ -318,7 +318,7 @@ function clarifyNodeExecCwdSpawnError(
   cwd: string | undefined,
 ): string {
   const message = error.message;
-  if (!cwd || (error.code !== "ENOENT" && error.code !== "ENOTDIR")) {
+  if (!cwd || (error.code && error.code !== "ENOENT" && error.code !== "ENOTDIR")) {
     return message;
   }
   let reason: "does not exist" | "is not a directory";
@@ -347,7 +347,9 @@ async function runCommand(
   env: Record<string, string> | undefined,
   timeoutMs: number | undefined,
   signal?: AbortSignal,
+  assertCurrent?: () => void,
 ): Promise<RunResult> {
+  assertCurrent?.();
   try {
     const result = await runCommandWithTimeout(argv, {
       baseEnv: env,

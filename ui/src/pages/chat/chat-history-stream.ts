@@ -1,3 +1,5 @@
+import { readSessionMessageIdentity } from "@openclaw/gateway-client/browser";
+import { asNullableRecord, asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import type { GatewaySessionRow } from "../../api/types.ts";
 import { accumulatedStreamText, advanceAccumulatedStreamText } from "../../lib/chat/chat-types.ts";
 import { extractText } from "../../lib/chat/message-extract.ts";
@@ -74,6 +76,25 @@ function resolveInFlightAssistantText(bufferedText: unknown): string | null {
     : null;
 }
 
+function replayedCommentaryItemIds(
+  run: NonNullable<ChatHistoryResult["inFlightRun"]>,
+): ReadonlySet<string> {
+  const itemIds = new Set<string>();
+  for (const event of run.events ?? []) {
+    const itemId = event.data.itemId;
+    if (
+      event.runId === run.runId &&
+      event.stream === "item" &&
+      event.data.kind === "preamble" &&
+      typeof itemId === "string" &&
+      itemId.trim()
+    ) {
+      itemIds.add(itemId.trim());
+    }
+  }
+  return itemIds;
+}
+
 function onlyInFlightRunProjectionChanged(
   previous: ReturnType<typeof getChatSessionProjection>["runs"],
   current: ReturnType<typeof getChatSessionProjection>["runs"],
@@ -101,6 +122,20 @@ function runProjectionsUnchanged(
     previousEntries.length === Object.keys(current).length &&
     previousEntries.every(([runId, run]) => current[runId] === run)
   );
+}
+
+function hasExactHistoryTerminal(state: ChatState, runId: string): boolean {
+  return state.chatMessages.some((message) => {
+    const identity = readSessionMessageIdentity(message);
+    const metadata = asNullableRecord(asNullableRecord(message)?.["__openclaw"]);
+    return (
+      identity?.role === "assistant" &&
+      !identity.isImported &&
+      (identity.id !== null || identity.sequence !== null) &&
+      identity.runId === runId &&
+      metadata?.runTerminal === true
+    );
+  });
 }
 
 export function readRunProjections(state: ChatState, sessionKey: string, agentId?: string) {
@@ -147,7 +182,13 @@ export function applyHistoryRun(params: {
   } = params;
   const inFlightRunId = run?.runId?.trim();
   if (!inFlightRunId || !run) {
-    const terminalRunId = sessionInfo?.lastRunId;
+    if (!sessionInfo) {
+      return;
+    }
+    const localRunId = state.chatRunId?.trim();
+    const terminalRunId =
+      sessionInfo.lastRunId ??
+      (localRunId && hasExactHistoryTerminal(state, localRunId) ? localRunId : undefined);
     const knownRun = terminalRunId ? currentRunProjections[terminalRunId] : undefined;
     if (
       terminalRunId &&
@@ -170,6 +211,13 @@ export function applyHistoryRun(params: {
       // A copied row cannot reclaim retired display ownership. The pane retains
       // its accepted owner past active cleanup; unseen runs recover through the
       // reducer, whose full diagnostic wins over the bounded history summary.
+      const failureNotice = getChatSessionProjection(state).entries.findLast(
+        (entry) =>
+          entry.identity?.runId === terminalRunId &&
+          !entry.identity.isImported &&
+          entry.identity.role === "custom" &&
+          asOptionalRecord(entry.message)?.customType === "run-failed-before-reply",
+      );
       const projection = reduceChatSessionProjection(state, {
         type: "runTerminal",
         runId: terminalRunId,
@@ -179,7 +227,10 @@ export function applyHistoryRun(params: {
             : sessionInfo.status === "timeout"
               ? "timeout"
               : "error",
-        errorMessage: sessionInfo.lastRunError,
+        errorMessage:
+          sessionInfo.status === "failed" || sessionInfo.status === "timeout"
+            ? (extractText(failureNotice?.message) ?? sessionInfo.lastRunError)
+            : sessionInfo.lastRunError,
       });
       setChatRunOwner(state, terminalRunId);
       const terminal = projection.runs[terminalRunId];
@@ -254,6 +305,7 @@ export function applyHistoryRun(params: {
           state.chatStream,
           inFlightRunId,
           boundary?.index,
+          replayedCommentaryItemIds(run),
         );
   const prefix = state.chatStream?.slice(0, state.chatStream.length - (tail?.length ?? 0)) ?? "";
   const accumulated = accumulatedStreamText(state.chatStreamSegments ?? []);
@@ -280,6 +332,7 @@ export function applyHistoryRun(params: {
     startupPhase === "running_setup" ||
     startupPhase === "provisioning_environment" ||
     startupPhase === "preparing_context" ||
+    startupPhase === "memory_flushing" ||
     startupPhase === "starting_model";
   if (
     run.text &&

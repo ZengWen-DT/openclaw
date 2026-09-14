@@ -6,6 +6,7 @@ import type {
   GatewayContextResolver,
   GatewayRequestContext,
 } from "../../gateway/server-methods/types.js";
+import type { GatewayUiCommandTarget } from "../../gateway/ui-command-target.types.js";
 import type { WorkerSessionTurnClaim } from "../../gateway/worker-environments/placement-record.js";
 import type { WorkerTurnExecutionIdentityCapability } from "../../gateway/worker-environments/placement-turn-claim-events.js";
 import type { AgentRunDelegatedAuthority } from "../../infra/agent-run-registry.js";
@@ -26,6 +27,7 @@ import type { AnyAgentTool } from "./common.js";
 type GatewayToolCallerIdentity = {
   agentId: string;
   sessionKey: string;
+  gatewayUiCommandTarget?: GatewayUiCommandTarget;
   /** Prepared requesting-tool posture; absent authority never bypasses approvals. */
   fullPermission?: boolean;
   operationalRunInstance?: OperationalRunInstanceRef;
@@ -40,7 +42,7 @@ type GatewayToolCallerIdentity = {
   /** Opaque already-signed identity used only by isolated worker transports. */
   signedAgentRuntimeIdentityToken?: string;
   executionIdentityToken?: ExecutionIdentityAdmissionToken;
-  /** Synchronous host-owned fence for before-tool decision receipts. */
+  /** Synchronous host-owned fence for tool effects and decision receipts. */
   receiptAuthority?: () => boolean | void;
   /** Exact Gateway-owned worker claim; never sourced from model or RPC arguments. */
   workerTurnClaim?: WorkerSessionTurnClaim;
@@ -66,6 +68,7 @@ type GatewayToolCallerIdentity = {
 
 type GatewayToolCallerSource = {
   agentSessionKey?: string;
+  gatewayUiCommandTarget?: GatewayUiCommandTarget;
   agentChannel?: string;
   currentMessagingTarget?: string;
   currentChannelId?: string;
@@ -177,6 +180,21 @@ export function getGatewayToolCallerIdentity(): GatewayToolCallerIdentity | unde
   return gatewayToolCallerStorage.getStore();
 }
 
+/** Capture the admitted run and worker owner, independently of optional audit collection. */
+export function captureGatewayToolCallerAssertion(): (() => void) | undefined {
+  const caller = getGatewayToolCallerIdentity();
+  if (!caller?.operationalRunInstance) {
+    return undefined;
+  }
+  const isCurrent = caller.receiptAuthority;
+  const signals = caller.approvalSignals ?? [];
+  return () => {
+    if (!isCurrent || signals.some((signal) => signal.aborted) || isCurrent() === false) {
+      throw new Error("agent tool caller authority is no longer active");
+    }
+  };
+}
+
 /** Process-owned work must not retain the turn that authorized its launch. */
 export function withoutGatewayToolCallerIdentity<T>(run: () => T): T {
   return gatewayToolCallerStorage.exit(run);
@@ -240,6 +258,8 @@ export async function withGatewayToolCallerIdentity<T>(
   const turnSourceAccountId =
     inheritedOwner?.turnSourceAccountId ?? identity.turnSourceAccountId?.trim();
   const turnSourceThreadId = inheritedOwner?.turnSourceThreadId ?? identity.turnSourceThreadId;
+  const gatewayUiCommandTarget =
+    inheritedOwner?.gatewayUiCommandTarget ?? identity.gatewayUiCommandTarget;
   return await gatewayToolCallerStorage.run(
     {
       agentId: inheritedOwner?.agentId ?? identity.agentId.trim(),
@@ -266,6 +286,7 @@ export async function withGatewayToolCallerIdentity<T>(
       ...(workerTurnClaim ? { workerTurnClaim } : {}),
       ...(workerTurnExecutionIdentityCapability ? { workerTurnExecutionIdentityCapability } : {}),
       ...(gatewayContextResolver ? { gatewayContextResolver } : {}),
+      ...(gatewayUiCommandTarget ? { gatewayUiCommandTarget } : {}),
       ...(turnSourceChannel ? { turnSourceChannel } : {}),
       ...(turnSourceLocal === true ? { turnSourceLocal: true } : {}),
       ...(turnSourceTo ? { turnSourceTo } : {}),
@@ -327,6 +348,7 @@ export function createGatewayToolCallerWrapper(
       ? {
           agentId,
           sessionKey: source.agentSessionKey.trim(),
+          gatewayUiCommandTarget: source.gatewayUiCommandTarget,
           turnSourceChannel: source.agentChannel,
           turnSourceTo: source.currentMessagingTarget ?? source.currentChannelId ?? source.agentTo,
           turnSourceAccountId: source.agentAccountId,

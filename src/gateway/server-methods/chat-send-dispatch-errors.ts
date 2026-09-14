@@ -1,7 +1,10 @@
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
+import { describeFailoverError } from "../../agents/failover-error.js";
+import { renderFailoverCodeUserCopy } from "../../agents/failover/user-copy.js";
 import { clearAgentRunContext } from "../../infra/agent-run-registry.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { setGatewayDedupeEntry } from "../agent-turn/agent-job.js";
+import { ExpectedProfileMismatchError } from "../expected-profile.js";
 import { chatAbortMarkerTimestampMs } from "../server-chat-state.js";
 import { persistGatewaySessionLifecycleEvent } from "../session-lifecycle-state.js";
 import { tryResolveSessionCompatibilityOwnerAgentId } from "../session-request-agent.js";
@@ -42,7 +45,17 @@ export async function handleChatSendSetupError(params: {
 }): Promise<void> {
   const { cleanupAdmittedRun, lifecycleGeneration, restartSafeAdmission } = params.admission;
   const { agentId, clientRunId, sessionKey } = params.session;
-  const errorMessage = String(params.error);
+  if (params.error instanceof ExpectedProfileMismatchError) {
+    // Selection failure belongs to this request, not the run's recorded outcome.
+    // Release only this admission; never poison a receipt or replay cache.
+    cleanupAdmittedRun();
+    clearAgentRunContext(clientRunId, lifecycleGeneration);
+    params.context.removeChatRun(clientRunId, clientRunId, sessionKey);
+    params.respond(false, undefined, params.error.error);
+    return;
+  }
+  const errorMessage =
+    renderFailoverCodeUserCopy(describeFailoverError(params.error).code) ?? String(params.error);
   const failureDisposition = classifyAcceptedChatSendFailure({
     error: params.error,
     phase: "pre-ack",
@@ -134,7 +147,7 @@ export function createChatSendDispatchErrorLifecycle(params: {
   let publishDispatchError: (() => void) | undefined;
 
   const handleError = async (err: unknown) => {
-    const errorMessage = String(err);
+    const errorMessage = renderFailoverCodeUserCopy(describeFailoverError(err).code) ?? String(err);
     const failureDisposition =
       params.classifyFailure?.(err) ??
       classifyAcceptedChatSendFailure({ error: err, phase: "post-ack" });

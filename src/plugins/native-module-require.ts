@@ -29,30 +29,40 @@ type ResolveFilename = (
 ) => string;
 const moduleWithResolver = Module as typeof Module & {
   _resolveFilename?: ResolveFilename;
-  registerHooks?: (options: {
-    resolve?: (
-      specifier: string,
-      context: { parentURL?: string | undefined },
-      nextResolve: (
-        specifier: string,
-        context?: { parentURL?: string | undefined },
-      ) => {
-        url: string;
-      },
-    ) => { shortCircuit?: boolean; url: string };
-  }) => { deregister: () => void };
 };
 
-type CapturedModuleResolver = (
-  request: string,
-  parent: string,
-  resolve: () => string,
-) => string | undefined;
+let nativeAliasHookSupport: boolean | undefined;
+
+/** Older Bun loses createRequire's parent when its private resolver is wrapped. */
+export function supportsNativeModuleAliasHooks(): boolean {
+  if (!process.versions.bun) {
+    return true;
+  }
+  if (nativeAliasHookSupport !== undefined) {
+    return nativeAliasHookSupport;
+  }
+  const previous = moduleWithResolver["_resolveFilename"];
+  if (!previous) {
+    return (nativeAliasHookSupport = false);
+  }
+  let retainsParent = false;
+  moduleWithResolver["_resolveFilename"] = (request, parent) => {
+    retainsParent = typeof parent?.filename === "string";
+    return request;
+  };
+  try {
+    createRequire(import.meta.url).resolve(fileURLToPath(import.meta.url));
+  } finally {
+    moduleWithResolver["_resolveFilename"] = previous;
+  }
+  return (nativeAliasHookSupport = retainsParent);
+}
+
 type CapturedModuleBinding = {
-  resolve: CapturedModuleResolver;
+  resolve: (request: string, parent: string, resolve: () => string) => string | undefined;
   prepare: (request: string, parent: string) => string | undefined;
 };
-type BunPluginRuntime = {
+export type BunPluginRuntime = {
   plugin(options: {
     name: string;
     setup(builder: {
@@ -76,6 +86,26 @@ const capturedModuleResolvers = resolveGlobalSingleton(
   }),
 );
 
+function resolveCapturedPluginModule(
+  resolve: (owner: CapturedModuleBinding) => string | undefined,
+): string | undefined {
+  if (capturedModuleResolvers.resolving) {
+    return undefined;
+  }
+  capturedModuleResolvers.resolving = true;
+  try {
+    for (const owner of capturedModuleResolvers.owners) {
+      const target = resolve(owner);
+      if (target) {
+        return target;
+      }
+    }
+  } finally {
+    capturedModuleResolvers.resolving = false;
+  }
+  return undefined;
+}
+
 /** Captured parents retain their resolver while their instance's consumers drain. */
 export function registerCapturedPluginModuleResolver(binding: CapturedModuleBinding): () => void {
   if (!capturedModuleResolvers.installed) {
@@ -85,21 +115,9 @@ export function registerCapturedPluginModuleResolver(binding: CapturedModuleBind
       name: "openclaw-plugin-source-capture",
       setup(builder) {
         builder.onResolve({ filter: /.*/, namespace: "file" }, ({ path: request, importer }) => {
-          if (!capturedModuleResolvers.resolving) {
-            capturedModuleResolvers.resolving = true;
-            try {
-              for (const owner of capturedModuleResolvers.owners) {
-                const target = owner.prepare(request, importer);
-                if (target) {
-                  return { path: target, namespace: "file" };
-                }
-              }
-            } finally {
-              capturedModuleResolvers.resolving = false;
-            }
-          }
+          const target = resolveCapturedPluginModule((owner) => owner.prepare(request, importer));
           // Package selection stays native; owners redirect only captured physical source paths.
-          return undefined;
+          return target ? { path: target, namespace: "file" } : undefined;
         });
       },
     });
@@ -108,23 +126,13 @@ export function registerCapturedPluginModuleResolver(binding: CapturedModuleBind
     if (!bun) {
       const previous = moduleWithResolver["_resolveFilename"]!;
       moduleWithResolver["_resolveFilename"] = (request, parent, isMain, options) => {
-        if (!capturedModuleResolvers.resolving && parent?.filename) {
-          capturedModuleResolvers.resolving = true;
-          try {
-            for (const owner of capturedModuleResolvers.owners) {
-              const target = owner.resolve(request, parent.filename, () =>
-                previous(request, parent, isMain, options),
-              );
-              if (target) {
-                return target;
-              }
-            }
-          } finally {
-            // Original-source Jiti lookup can itself call the native resolver.
-            capturedModuleResolvers.resolving = false;
-          }
-        }
-        return previous(request, parent, isMain, options);
+        const filename = parent?.filename;
+        const target = filename
+          ? resolveCapturedPluginModule((owner) =>
+              owner.resolve(request, filename, () => previous(request, parent, isMain, options)),
+            )
+          : undefined;
+        return target ?? previous(request, parent, isMain, options);
       };
     }
     capturedModuleResolvers.installed = true;

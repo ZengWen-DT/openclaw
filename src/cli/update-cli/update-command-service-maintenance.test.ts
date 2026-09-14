@@ -4,7 +4,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { stableStringify } from "@openclaw/normalization-core/stable-stringify";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import * as schtasksExec from "../../daemon/schtasks-exec.js";
 import { readScheduledTaskRuntime } from "../../daemon/schtasks-runtime.js";
+import { ServiceInspectionError } from "../../daemon/service-inspection-error.js";
 import { readGatewayServiceState, type GatewayService } from "../../daemon/service.js";
 import {
   createMockGatewayService,
@@ -75,6 +77,74 @@ async function withServiceHome(run: (home: string) => Promise<void>): Promise<vo
     await fs.rm(home, { recursive: true, force: true });
   }
 }
+
+it.each(["systemd-user-bus-unavailable", "service-manager-access-denied"] as const)(
+  "retains the native inspection reason for failed preflight: %s",
+  (reason) =>
+    withServiceHome(async (home) => {
+      mockProcessPlatform("linux");
+      const service = createMockGatewayService({
+        readCommand: async () => ({
+          programArguments: [process.execPath, path.join(process.cwd(), "openclaw.mjs"), "gateway"],
+          environment: { HOME: home },
+        }),
+        readRuntime: async () => ({ status: "unknown", inspectionReason: reason }),
+        isLoaded: async () => {
+          throw new ServiceInspectionError(reason);
+        },
+      });
+      mocks.service.mockReturnValue(service);
+      await expect(
+        maybeStopManagedServiceBeforeMutableUpdate({
+          root: process.cwd(),
+          updateInstallKind: "package",
+          shouldRestart: true,
+          phase: "inspect",
+          jsonMode: true,
+        }),
+      ).resolves.toMatchObject({
+        serviceUpdateVerdict: { kind: "unavailable", inspectionReason: reason },
+      });
+      expect(service.stop).not.toHaveBeenCalled();
+    }),
+);
+
+it.each([
+  { state: "failed", tasksCurrent: 2, residual: true },
+  { state: "inactive", tasksCurrent: 1, residual: true },
+  { state: "failed", tasksCurrent: undefined, residual: false },
+  { state: "activating", tasksCurrent: 2, residual: false },
+])("explains a blocked systemd inspection for $state with $tasksCurrent tasks", (scenario) =>
+  withServiceHome(async (home) => {
+    mockProcessPlatform("linux");
+    const service = createMockGatewayService({
+      readCommand: async () => ({
+        programArguments: [process.execPath, path.join(process.cwd(), "openclaw.mjs"), "gateway"],
+        environment: { HOME: home },
+      }),
+      readRuntime: async () => ({
+        status: "unknown",
+        state: scenario.state,
+        systemd: { managerUid: 2001, tasksCurrent: scenario.tasksCurrent },
+      }),
+    });
+    mocks.service.mockReturnValue(service);
+    const result = await maybeStopManagedServiceBeforeMutableUpdate({
+      root: process.cwd(),
+      updateInstallKind: "package",
+      shouldRestart: true,
+      phase: "inspect",
+      jsonMode: true,
+    });
+    expect(result.serviceUpdateVerdict?.kind).toBe("unavailable");
+    expect(result.blockMessage).toContain(
+      scenario.residual
+        ? "processes remain in its systemd service cgroup"
+        : "Gateway service inspection is unavailable",
+    );
+    expect(service.stop).not.toHaveBeenCalled();
+  }),
+);
 
 type NativeOfflineCase = {
   platform: NodeJS.Platform;
@@ -694,5 +764,100 @@ it.each(["before stop", "after stop"] as const)(
       expect(String(nativeFailure)).toMatch(/executor/);
       expect(stop).toHaveBeenCalledTimes(when === "before stop" ? 0 : 1);
       expect(store.read(root).kind).toBe("current");
+    }),
+);
+
+it.each(["disable", "restore", "compensation", "never"] as const)(
+  "retains caller authority when Windows task recovery loses its owner before %s",
+  (lostBefore) =>
+    withServiceHome(async (home) => {
+      mockProcessPlatform("win32");
+      let current = true;
+      let revokeDuringInspection = false;
+      let enabled = true;
+      const mutations: string[] = [];
+      vi.spyOn(schtasksExec, "execSchtasks").mockImplementation(async (args) => {
+        if (args[0] === "/Query") {
+          if (lostBefore === "disable") {
+            current = false;
+          }
+          return {
+            code: 0,
+            stdout: `<Task><Settings><Enabled>${enabled}</Enabled></Settings></Task>`,
+            stderr: "",
+          };
+        }
+        expect(args[0]).toBe("/Change");
+        const action = args.at(-1);
+        if (action !== "/ENABLE" && action !== "/DISABLE") {
+          throw new Error("Unexpected Scheduled Task mutation");
+        }
+        mutations.push(action);
+        enabled = action === "/ENABLE";
+        return { code: 0, stdout: "", stderr: "" };
+      });
+      mocks.service.mockReturnValue(
+        createMockGatewayService({
+          readCommand: async () => ({
+            programArguments: [
+              process.execPath,
+              path.join(process.cwd(), "openclaw.mjs"),
+              "gateway",
+            ],
+            environment: { HOME: home },
+          }),
+          readRuntime: async () => {
+            if (revokeDuringInspection) {
+              current = false;
+            }
+            return { status: "running" };
+          },
+          isLoaded: async () => true,
+        }),
+      );
+      let stopped: PreManagedServiceStop | undefined;
+      let failure: unknown;
+      try {
+        try {
+          stopped = await maybeStopManagedServiceBeforeMutableUpdate({
+            root: process.cwd(),
+            updateInstallKind: "package",
+            shouldRestart: lostBefore !== "disable",
+            jsonMode: true,
+            assertCurrent: () => {
+              if (!current) {
+                throw new Error("Repair continuation no longer owns this task");
+              }
+            },
+          });
+          const recovery = stopped.windowsTaskAutoStartRecovery;
+          if (!recovery) {
+            throw new Error("Missing Windows task recovery");
+          }
+          revokeDuringInspection = lostBefore === "restore";
+          await recovery.restore();
+          revokeDuringInspection = lostBefore === "compensation";
+          await recovery.complete(false);
+        } catch (error) {
+          failure = error;
+        }
+        expect(mutations).toEqual(
+          lostBefore === "disable"
+            ? []
+            : lostBefore === "restore"
+              ? ["/DISABLE"]
+              : lostBefore === "compensation"
+                ? ["/DISABLE", "/ENABLE"]
+                : ["/DISABLE", "/ENABLE", "/DISABLE"],
+        );
+        expect(enabled).toBe(lostBefore === "disable" || lostBefore === "compensation");
+        if (lostBefore === "never") {
+          expect(failure).toBeUndefined();
+        } else {
+          expect(String(failure)).toContain("Repair continuation no longer owns this task");
+        }
+      } finally {
+        await stopped?.windowsTaskAutoStartRecovery?.complete();
+      }
     }),
 );

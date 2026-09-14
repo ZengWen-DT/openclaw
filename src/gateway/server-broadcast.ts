@@ -2,6 +2,7 @@ import {
   GATEWAY_CLIENT_CAPS,
   hasGatewayClientCap,
 } from "../../packages/gateway-protocol/src/client-info.js";
+import { USER_PROFILE_ID_MAX_LENGTH } from "../../packages/gateway-protocol/src/schema/user-profile-constants.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import type { SystemPresence } from "../infra/system-presence.js";
 // Gateway WebSocket broadcaster.
@@ -224,9 +225,21 @@ type FrameBase = {
 };
 // ws bufferedAmount includes the unmasked server frame's 2/4/10-byte header.
 const MAX_SERVER_FRAME_HEADER_BYTES = 10;
+// A queued recipient can grow after a merge; JSON may escape each character to six bytes.
+const MAX_RECIPIENT_PROFILE_FIELD_BYTES =
+  Buffer.byteLength(',"recipientProfileId":""') + USER_PROFILE_ID_MAX_LENGTH * 6;
 
-function frameWithSequence(base: FrameBase, seq: number, payload = base.payloadFragment): string {
-  return `{"type":"event","event":${base.eventJSON}${payload},"seq":${seq}${base.stateVersionFragment}}`;
+function frameWithSequence(
+  base: FrameBase,
+  seq: number,
+  payload = base.payloadFragment,
+  recipientProfileId?: string,
+): string {
+  const recipient =
+    recipientProfileId === undefined
+      ? ""
+      : `,"recipientProfileId":${JSON.stringify(recipientProfileId)}`;
+  return `{"type":"event","event":${base.eventJSON}${payload},"seq":${seq}${base.stateVersionFragment}${recipient}}`;
 }
 
 type PendingLiveText = {
@@ -362,8 +375,13 @@ export function createGatewayBroadcaster(params: {
       event === "presence" ? (payload as { presence: SystemPresence[] }) : undefined;
     let projectPresence: ((client: GatewayWsClient) => SystemPresence[]) | undefined;
     let outboundEventLogged = false;
+    let lastFrameSequence = 0;
+    let lastFrameRecipientProfileId: string | undefined;
+    let lastFrame: string | undefined;
     let frameBase: FrameBase | undefined = retained?.base;
     let frameFields: Omit<FrameBase, "payloadFragment"> | undefined;
+    // Private coalescers preserve inputs; identical pending histories can share this merge.
+    let mergedFrames: Map<unknown, { payload: unknown; base: FrameBase }> | undefined;
     const frameBaseFor = (value: unknown): FrameBase => {
       frameFields ??= {
         eventJSON: JSON.stringify(event),
@@ -404,13 +422,6 @@ export function createGatewayBroadcaster(params: {
       if (!hasEventScope(c, event, explicitPluginScope)) {
         continue;
       }
-      if (
-        sessionKeys.length > 0 &&
-        params.canReceiveSessionEvent &&
-        !params.canReceiveSessionEvent(c, sessionKeys, agentId, event, payload)
-      ) {
-        continue;
-      }
       const requiresSessionSubscription =
         event === "session.typing" ||
         sessionSubscriptionVerified ||
@@ -443,6 +454,13 @@ export function createGatewayBroadcaster(params: {
           // The registry is authoritative; for cap-gated events, unscoped Control UI clients keep full fanout.
           continue;
         }
+      }
+      if (
+        sessionKeys.length > 0 &&
+        params.canReceiveSessionEvent &&
+        !params.canReceiveSessionEvent(c, sessionKeys, agentId, event, payload)
+      ) {
+        continue;
       }
       // Retirement releases progress without suppressing its captured abort terminal.
       if ((retained && !isCurrent(live?.isCurrent)) || (live?.coalesce && live.group.aborted)) {
@@ -511,13 +529,23 @@ export function createGatewayBroadcaster(params: {
           previous = undefined;
         }
         try {
-          const nextPayload = previous ? live.coalesce.merge(previous.payload, payload) : payload;
-          const base = previous ? frameBaseFor(nextPayload) : getFrameBase();
+          const cached = previous ? mergedFrames?.get(previous.payload) : undefined;
+          const nextPayload = cached
+            ? cached.payload
+            : previous
+              ? live.coalesce.merge(previous.payload, payload)
+              : payload;
+          const base =
+            cached?.base ?? (nextPayload === payload ? getFrameBase() : frameBaseFor(nextPayload));
+          if (previous && !cached && nextPayload !== payload) {
+            (mergedFrames ??= new Map()).set(previous.payload, { payload: nextPayload, base });
+          }
           // Reserve the complete frame and maximum sequence width once per serialized base;
           // unrelated sends can advance the sequence while this entry is waiting to drain.
           const bytes = (base.reservedBytes ??=
             Buffer.byteLength(frameWithSequence(base, Number.MAX_SAFE_INTEGER)) +
-            MAX_SERVER_FRAME_HEADER_BYTES);
+            MAX_SERVER_FRAME_HEADER_BYTES +
+            MAX_RECIPIENT_PROFILE_FIELD_BYTES);
           if (bufferedBytes(state) - (previous?.bytes ?? 0) + bytes <= MAX_BUFFERED_BYTES) {
             if (previous) {
               takePending(state, previous);
@@ -589,7 +617,24 @@ export function createGatewayBroadcaster(params: {
             presence: projectPresence(c),
           });
         }
-        frame = frameWithSequence(base, nextSeq, payloadFragment);
+        // A drained write can refresh the recipient; cache only the profile at this send.
+        const recipientProfileId =
+          (c.connect.role ?? "operator") === "operator" ? c.preparedRecipientProfileId : undefined;
+        if (
+          !presencePayload &&
+          lastFrame !== undefined &&
+          lastFrameSequence === nextSeq &&
+          lastFrameRecipientProfileId === recipientProfileId
+        ) {
+          frame = lastFrame;
+        } else {
+          frame = frameWithSequence(base, nextSeq, payloadFragment, recipientProfileId);
+          if (!presencePayload) {
+            lastFrameSequence = nextSeq;
+            lastFrameRecipientProfileId = recipientProfileId;
+            lastFrame = frame;
+          }
+        }
       } catch (err) {
         log.error(`broadcast serialization failed for event ${event}: ${formatErrorMessage(err)}`);
         return;

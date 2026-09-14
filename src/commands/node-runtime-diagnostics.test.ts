@@ -6,17 +6,14 @@ import { resolveDoctorContributionHealthChecks } from "../flows/doctor-health-co
 import * as runtimeGuard from "../infra/runtime-guard.js";
 import { runDoctorLintCli } from "./doctor-lint.js";
 import { statusCommand } from "./status.command.js";
+import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
 const mocks = vi.hoisted(() => ({
   readCommand: vi.fn(),
   readConfigFileSnapshot: vi.fn(),
   resolveNodeRuntimeInfo: vi.fn(),
 }));
-const runtime = {
-  log: vi.fn(),
-  error: vi.fn(),
-  exit: vi.fn(),
-};
+const runtime = createTestRuntime();
 
 vi.mock("../config/config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config/config.js")>()),
@@ -38,7 +35,7 @@ vi.mock("./status-json-command.ts", () => ({
 }));
 
 function mockCliRuntime(version: string, text = true) {
-  vi.spyOn(runtimeGuard, "detectRuntime").mockReturnValue({
+  vi.spyOn(runtimeGuard, "detectRuntime").mockResolvedValue({
     kind: "node",
     version,
     execPath: "/fixture/node",

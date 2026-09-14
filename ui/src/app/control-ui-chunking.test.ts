@@ -50,7 +50,7 @@ describe("Control UI build chunking", () => {
     expect(controlUiCodeSplitting.includeDependenciesRecursively).toBe(false);
     expect(controlUiCodeSplitting.groups[1]).toMatchObject({
       tags: ["$initial"],
-      maxSize: 640 * 1024,
+      maxSize: 1024 * 1024,
     });
   });
 
@@ -71,7 +71,8 @@ describe("Control UI build chunking", () => {
     expect(bootGroup.test(`${repoRoot}/ui/src/components/app-sidebar.ts`)).toBe(true);
     expect(bootGroup.test(`${repoRoot}/ui/src/pages/chat/chat-page.ts`)).toBe(false);
     expect(bootGroup.test(`${repoRoot}/ui/src/styles/chat.ts`)).toBe(false);
-    expect(bootGroup.test(`${repoRoot}/ui/src/components/assistant-panel.ts`)).toBe(false);
+    expect(bootGroup.test(`${repoRoot}/ui/src/components/assistant-panel-content.ts`)).toBe(false);
+    expect(bootGroup.test(`${repoRoot}/ui/src/pages/debug/debug-overlay-content.ts`)).toBe(false);
     expect(bootGroup.test(`${repoRoot}/node_modules/ghostty-web/dist/index.js`)).toBe(false);
   });
 

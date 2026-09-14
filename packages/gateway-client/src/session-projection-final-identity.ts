@@ -23,6 +23,19 @@ type TerminalProjectionRun = {
   acceptedFinalMessageIdentities?: readonly string[];
 };
 
+/** Tool-bearing assistant rows are continuations even without a tool stop reason. */
+export function isSessionProjectionToolContinuation(message: unknown): boolean {
+  const record = readRecord(message);
+  return (
+    record?.stopReason === "toolUse" ||
+    (Array.isArray(record?.content) &&
+      record.content.some((block) => {
+        const type = readRecord(block)?.type;
+        return type === "toolCall" || type === "toolUse" || type === "functionCall";
+      }))
+  );
+}
+
 function readPersistedFinalIdentity(message: unknown): string | null {
   const identity = readSessionMessageIdentity(message);
   if (identity?.externalSource) {
@@ -104,29 +117,6 @@ function hasTerminalStopReason(message: unknown): boolean {
   );
 }
 
-function hasCompletedRunSnapshotContext(
-  entry: TerminalProjectionEntry,
-  snapshot: readonly TerminalProjectionEntry[],
-  runId: string | null,
-): boolean {
-  if (!runId || entry.identity?.runId !== runId) {
-    return false;
-  }
-  const entryIndex = snapshot.indexOf(entry);
-  if (entryIndex < 0) {
-    return false;
-  }
-  const hasEarlierUser = snapshot
-    .slice(0, entryIndex)
-    .some((candidate) => candidate.identity?.role === "user" && candidate.identity.runId === runId);
-  const hasLaterAssistant = snapshot
-    .slice(entryIndex + 1)
-    .some(
-      (candidate) => candidate.identity?.role === "assistant" && candidate.identity.runId === runId,
-    );
-  return hasEarlierUser && !hasLaterAssistant;
-}
-
 /** Read stable persisted identity first, falling back to canonical display content. */
 export function readSessionProjectionFinalMessageIdentity(message: unknown): string | null {
   if (!hasDisplayableSessionMessage(message)) {
@@ -176,7 +166,8 @@ export function findUniqueSnapshotTerminalMatch(
     current.identity.id ||
     current.identity.sequence !== null ||
     !run ||
-    run.status === "streaming"
+    run.status === "streaming" ||
+    matches.length === 0
   ) {
     return null;
   }
@@ -184,13 +175,46 @@ export function findUniqueSnapshotTerminalMatch(
   if (!terminalContent || readFinalContentIdentity(run.message) !== terminalContent) {
     return null;
   }
+  let snapshotIndexes: Map<TerminalProjectionEntry, number> | undefined;
+  let firstUserIndex = -1;
+  let lastAssistantIndex = -1;
+  const hasCompletedRunSnapshotContext = (entry: TerminalProjectionEntry): boolean => {
+    const runId = current.identity?.runId;
+    if (!runId || entry.identity?.runId !== runId) {
+      return false;
+    }
+    if (!snapshotIndexes) {
+      const indexes = new Map<TerminalProjectionEntry, number>();
+      snapshot.forEach((candidate, index) => {
+        if (candidate.identity?.runId === runId) {
+          // Keep indexOf's first-occurrence identity when a snapshot repeats an entry.
+          if (!indexes.has(candidate)) {
+            indexes.set(candidate, index);
+          }
+          if (candidate.identity.role === "user" && firstUserIndex < 0) {
+            firstUserIndex = index;
+          } else if (candidate.identity.role === "assistant") {
+            lastAssistantIndex = index;
+          }
+        }
+      });
+      snapshotIndexes = indexes;
+    }
+    const entryIndex = snapshotIndexes.get(entry);
+    return (
+      entryIndex !== undefined &&
+      firstUserIndex >= 0 &&
+      firstUserIndex < entryIndex &&
+      lastAssistantIndex <= entryIndex
+    );
+  };
   const durableTerminalMatches = matches.filter((entry) => {
     const metadata = readRecord(readRecord(entry.message)?.["__openclaw"]);
     return (
       (metadata?.runTerminal === true ||
         (entry.identity?.runId === current.identity?.runId &&
           hasTerminalStopReason(entry.message)) ||
-        hasCompletedRunSnapshotContext(entry, snapshot, current.identity?.runId ?? null)) &&
+        hasCompletedRunSnapshotContext(entry)) &&
       readFinalContentIdentity(entry.message) === terminalContent
     );
   });

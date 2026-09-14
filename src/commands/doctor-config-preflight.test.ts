@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { applyCliProfileEnv } from "../cli/profile.js";
 import { promoteConfigSnapshotToLastKnownGood, readConfigFileSnapshot } from "../config/config.js";
-import { writeConfigHealthStateToStore } from "../config/io.health-state.js";
+import { patchConfigHealthEntryToStore } from "../config/io.health-state.js";
 import { createConfigHealthFingerprint } from "../config/io.observe-state.js";
 import { writeOpenClawConfig } from "../config/test-helpers.js";
 import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
@@ -21,6 +21,8 @@ import {
 import { ABANDONED_UPDATE_RUN_MS } from "../infra/update-run-timeouts.js";
 import { resetLogger, setLoggerOverride } from "../logging/logger.js";
 import { loggingState } from "../logging/state.js";
+import { readPersistedInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-records.js";
+import { seedInstalledPluginIndex } from "../plugins/test-helpers/installed-plugin-index.js";
 import { readConfigMachineState } from "../state/config-machine-state.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import {
@@ -29,10 +31,8 @@ import {
 } from "../state/openclaw-state-db.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { resolveMigrationCheckpointIdentity } from "./doctor-config-preflight-checkpoint.js";
-import {
-  runDoctorConfigPreflight,
-  shouldSkipPluginValidationForDoctorConfigPreflight,
-} from "./doctor-config-preflight.js";
+import { shouldSkipPluginValidationForDoctorConfigPreflight } from "./doctor-config-preflight-plugin-index.js";
+import { runDoctorConfigPreflight } from "./doctor-config-preflight.js";
 import { startupCheckpointOptions } from "./doctor-config-preflight.state-migration.test-helpers.js";
 import { withDoctorConfigPreflightHome } from "./doctor-config-preflight.test-support.js";
 import { isStartupConfigRepairResult } from "./doctor/shared/automatic-startup-config-repair.js";
@@ -105,24 +105,41 @@ async function seedLastKnownGood(
     parsed: config,
     stat: await fs.stat(lastGoodPath),
   });
-  writeConfigHealthStateToStore(
+  patchConfigHealthEntryToStore(
     {
       env: { ...process.env, HOME: home },
       homedir: () => home,
       logger: { warn: () => {} },
     },
-    {
-      entries: {
-        [configPath]: {
-          lastKnownGood: fingerprint,
-          lastPromotedGood: fingerprint,
-        },
-      },
-    },
+    configPath,
+    { lastKnownGood: fingerprint, lastPromotedGood: fingerprint },
   );
 }
 
 describe("runDoctorConfigPreflight", () => {
+  it("reports an activation timeout without reopening its finished history", async () => {
+    await withDoctorConfigPreflightHome(async (home) => {
+      await writeOpenClawConfig(home, { gateway: { mode: "local" } });
+      const run = createUpdateRun({ trigger: "cli" });
+      const finished = finishUpdateRun(run.runId, {
+        status: "failed",
+        reason: "update-activation-timeout",
+      });
+
+      await runDoctorConfigPreflight({ migrateState: false, migrateLegacyConfig: false });
+
+      expect(noteMock).toHaveBeenCalledWith(
+        expect.stringContaining("update-activation-timeout"),
+        "Update history",
+      );
+      const output = noteMock.mock.calls.flat().join("\n");
+      expect(output).toContain("openclaw update status");
+      expect(output).toContain("Wait for the owning updater and its child processes to stop");
+      expect(output).toContain("openclaw update repair");
+      expect(getUpdateRun(run.runId)).toEqual(finished);
+    });
+  });
+
   it("surfaces recorded cleanup warnings from a successful update", async () => {
     await withDoctorConfigPreflightHome(async (home) => {
       await writeOpenClawConfig(home, { gateway: { mode: "local" } });
@@ -240,6 +257,92 @@ describe("runDoctorConfigPreflight", () => {
       );
     });
   });
+
+  it("imports an old parent's restored records after the same build already checkpointed", async () => {
+    await withDoctorConfigPreflightHome(async (home) => {
+      await withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
+        const config = {
+          gateway: { mode: "local" as const },
+          agents: { entries: { main: { name: "Operator" } } },
+          plugins: { enabled: false },
+        };
+        const configPath = await writeOpenClawConfig(home, config);
+        const canonical = { source: "path" as const, installPath: path.join(home, "canonical") };
+        const legacy = { source: "path" as const, installPath: path.join(home, "legacy") };
+        await seedInstalledPluginIndex({ existing: canonical }, { config });
+        const options = { ...startupCheckpointOptions, skipPristineStartupStateMigrations: true };
+        const checkpointStatus = (
+          preflight: Awaited<ReturnType<typeof runDoctorConfigPreflight>>,
+        ) =>
+          readMigrationCheckpointStatus({
+            identity: resolveMigrationCheckpointIdentity({
+              snapshot: preflight.snapshot,
+              baseConfig: preflight.baseConfig,
+              pluginMigrationFingerprint:
+                preflight.pluginMetadataSnapshot?.configFingerprint ?? null,
+            }),
+          });
+        expect(checkpointStatus(await runDoctorConfigPreflight(options))).toBe("startup-current");
+        const restored = JSON.stringify({
+          ...config,
+          agents: { list: [{ id: "main", name: "Operator" }] },
+          meta: { lastTouchedAt: "2026-02-15T00:00:00.000Z" },
+          plugins: { ...config.plugins, installs: { existing: legacy, imported: legacy } },
+        });
+        await fs.writeFile(configPath, restored);
+
+        const repaired = await runDoctorConfigPreflight(options);
+
+        expect(repaired.snapshot.valid).toBe(true);
+        expect(repaired.baseConfig).not.toHaveProperty("plugins.installs");
+        expect(repaired.baseConfig).not.toHaveProperty("meta.lastTouchedAt");
+        expect(repaired.baseConfig.agents?.entries?.main).toEqual({ name: "Operator" });
+        expect(readPersistedInstalledPluginIndexInstallRecords()).toEqual({
+          existing: canonical,
+          imported: legacy,
+        });
+        expect(await fs.readFile(`${configPath}.bak`, "utf8")).toBe(restored);
+        expect(checkpointStatus(repaired)).toBe("startup-current");
+        const saved = await fs.readFile(configPath, "utf8");
+        expect(checkpointStatus(await runDoctorConfigPreflight(options))).toBe("startup-current");
+        expect(await fs.readFile(configPath, "utf8")).toBe(saved);
+        expect(await fs.readFile(`${configPath}.bak`, "utf8")).toBe(restored);
+      });
+    });
+  });
+
+  it.each(["prefix", "invalid"] as const)(
+    "does not recover %s config owned by a legacy update parent",
+    async (kind) => {
+      await withDoctorConfigPreflightHome(async (home) => {
+        const configPath = await writeOpenClawConfig(home, { gateway: { mode: "local" } });
+        await seedLastKnownGood(home, configPath, { gateway: { mode: "local" } });
+        const original =
+          kind === "prefix"
+            ? 'diagnostic prefix\n{"gateway":{"mode":"local"}}'
+            : '{"gateway":{"port":"invalid"}}';
+        await fs.writeFile(configPath, original);
+        await withEnvAsync(
+          {
+            OPENCLAW_UPDATE_IN_PROGRESS: "off",
+            OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE: undefined,
+          },
+          async () => {
+            await runDoctorConfigPreflight({
+              migrateState: false,
+              migrateLegacyConfig: false,
+              repairPrefixedConfig: true,
+            });
+          },
+        );
+        expect(await fs.readFile(configPath, "utf8")).toBe(original);
+        await expect(fs.access(`${configPath}.bak`)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(
+          (await fs.readdir(path.dirname(configPath))).some((name) => name.includes("clobbered")),
+        ).toBe(false);
+      });
+    },
+  );
 
   it.each([
     {
@@ -530,13 +633,18 @@ describe("runDoctorConfigPreflight", () => {
       });
       expect(inspectOnly.snapshot.valid).toBe(false);
 
-      const repaired = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
-        runDoctorConfigPreflight({
-          migrateState: false,
-          migrateLegacyConfig: false,
-          repairPrefixedConfig: true,
-          invalidConfigNote: false,
-        }),
+      const repaired = await withEnvAsync(
+        {
+          OPENCLAW_UPDATE_IN_PROGRESS: "1",
+          OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE: "1",
+        },
+        () =>
+          runDoctorConfigPreflight({
+            migrateState: false,
+            migrateLegacyConfig: false,
+            repairPrefixedConfig: true,
+            invalidConfigNote: false,
+          }),
       );
 
       expect(repaired.snapshot.valid).toBe(true);
@@ -595,13 +703,18 @@ describe("runDoctorConfigPreflight", () => {
       );
 
       const before = await readConfigFileSnapshot();
-      const repaired = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
-        runDoctorConfigPreflight({
-          migrateState: false,
-          migrateLegacyConfig: false,
-          repairPrefixedConfig: true,
-          invalidConfigNote: false,
-        }),
+      const repaired = await withEnvAsync(
+        {
+          OPENCLAW_UPDATE_IN_PROGRESS: "1",
+          OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE: "1",
+        },
+        () =>
+          runDoctorConfigPreflight({
+            migrateState: false,
+            migrateLegacyConfig: false,
+            repairPrefixedConfig: true,
+            invalidConfigNote: false,
+          }),
       );
 
       expect(repaired.snapshot.valid).toBe(true);
@@ -651,13 +764,18 @@ describe("runDoctorConfigPreflight", () => {
         "utf-8",
       );
 
-      const repaired = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
-        runDoctorConfigPreflight({
-          migrateState: true,
-          migrateLegacyConfig: false,
-          repairPrefixedConfig: true,
-          invalidConfigNote: false,
-        }),
+      const repaired = await withEnvAsync(
+        {
+          OPENCLAW_UPDATE_IN_PROGRESS: "1",
+          OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE: "1",
+        },
+        () =>
+          runDoctorConfigPreflight({
+            migrateState: true,
+            migrateLegacyConfig: false,
+            repairPrefixedConfig: true,
+            invalidConfigNote: false,
+          }),
       );
 
       expect(repaired.snapshot.valid).toBe(true);
@@ -796,13 +914,18 @@ describe("runDoctorConfigPreflight", () => {
         "utf-8",
       );
 
-      const repaired = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
-        runDoctorConfigPreflight({
-          migrateState: false,
-          migrateLegacyConfig: false,
-          repairPrefixedConfig: true,
-          invalidConfigNote: false,
-        }),
+      const repaired = await withEnvAsync(
+        {
+          OPENCLAW_UPDATE_IN_PROGRESS: "1",
+          OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE: "1",
+        },
+        () =>
+          runDoctorConfigPreflight({
+            migrateState: false,
+            migrateLegacyConfig: false,
+            repairPrefixedConfig: true,
+            invalidConfigNote: false,
+          }),
       );
 
       expect(repaired.snapshot.valid).toBe(true);

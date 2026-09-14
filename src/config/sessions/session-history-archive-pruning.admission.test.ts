@@ -9,6 +9,7 @@ import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import * as sqlite from "../../infra/node-sqlite.js";
 import * as integrity from "../../infra/sqlite-integrity-worker.js";
 import * as logging from "../../logging/logger.js";
+import { invalidateOpenClawAgentDatabaseValidation } from "../../state/openclaw-agent-db-validation-cache.js";
 import {
   closeOpenClawAgentDatabaseByPath,
   closeOpenClawAgentDatabasesAsync,
@@ -266,6 +267,7 @@ it.each([
       inTransaction = database.db.isTransaction;
       if (cold) {
         closed = closeOpenClawAgentDatabaseByPath(database.path);
+        invalidateOpenClawAgentDatabaseValidation(database.path);
       }
       observing = true;
     };
@@ -349,6 +351,15 @@ it.each([
           active = true;
           events.push("maintenance-entered");
           try {
+            if (boundary === "drain") {
+              // A prior writer may yield before this admission starts. Observe only our passes.
+              void own(
+                yieldToEventLoop().then(() => {
+                  firstDrainedPages = initialFreePages - readFreePages(database.db);
+                  arrive();
+                }),
+              );
+            }
             return boundary === "drain"
               ? await reclaimSqliteFreePages(options, archivePruning)
               : await pruneAllSessionTranscriptArchivesToHighWater({
@@ -377,14 +388,6 @@ it.each([
         "session.history.archive-prune",
       ),
     );
-    if (boundary === "drain") {
-      void own(
-        yieldToEventLoop().then(() => {
-          firstDrainedPages = initialFreePages - readFreePages(database.db);
-          arrive();
-        }),
-      );
-    }
     releaseBlocker.resolve();
     const completion = await Promise.race([
       childEntered.promise.then(() => "child" as const),

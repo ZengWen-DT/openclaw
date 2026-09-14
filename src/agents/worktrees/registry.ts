@@ -26,6 +26,22 @@ import type {
 
 type WorktreesTable = OpenClawStateKyselyDatabase["worktrees"];
 type WorktreeRow = Selectable<WorktreesTable>;
+const WORKTREE_RECORD_COLUMNS = [
+  "id",
+  "repo_fingerprint",
+  "repo_root",
+  "path",
+  "branch",
+  "base_ref",
+  "owner_kind",
+  "owner_id",
+  "snapshot_ref",
+  "created_at",
+  "last_active_at",
+  "removed_at",
+  "run_end_cleanup_json",
+] as const satisfies readonly (keyof WorktreeRow)[];
+type WorktreeRecordRow = Pick<WorktreeRow, (typeof WORKTREE_RECORD_COLUMNS)[number]>;
 type WorktreeRegistryDatabase = Pick<OpenClawStateKyselyDatabase, "worktrees">;
 type WorktreeProvisionedDatabase = Pick<
   OpenClawStateKyselyDatabase,
@@ -82,7 +98,7 @@ function parseRunEndCleanup(
   }
 }
 
-function rowToRecord(row: WorktreeRow): ManagedWorktreeRecord {
+function rowToRecord(row: WorktreeRecordRow): ManagedWorktreeRecord {
   const runEndCleanup = parseRunEndCleanup(row.run_end_cleanup_json);
   return {
     id: row.id,
@@ -161,7 +177,7 @@ export function listRegistryWorktrees(env: NodeJS.ProcessEnv): ManagedWorktreeRe
   const db = dbFor(env);
   const query = kyselyFor(db)
     .selectFrom("worktrees")
-    .selectAll()
+    .select(WORKTREE_RECORD_COLUMNS)
     .orderBy("created_at", "desc")
     .orderBy("id", "asc");
   return executeSqliteQuerySync(db, query).rows.map(rowToRecord);
@@ -215,7 +231,10 @@ export function getRegistryWorktree(
   id: string,
 ): ManagedWorktreeRecord | undefined {
   const db = dbFor(env);
-  const query = kyselyFor(db).selectFrom("worktrees").selectAll().where("id", "=", id);
+  const query = kyselyFor(db)
+    .selectFrom("worktrees")
+    .select(WORKTREE_RECORD_COLUMNS)
+    .where("id", "=", id);
   const row = executeSqliteQuerySync(db, query).rows[0];
   return row ? rowToRecord(row) : undefined;
 }
@@ -311,15 +330,17 @@ export function clearRegistryWorktreeProvisionedChunks(
   env: NodeJS.ProcessEnv,
   worktreeId: string,
 ): void {
-  const db = dbFor(env);
-  runOpenClawStateWriteTransaction(() => {
-    executeSqliteQuerySync(
-      db,
-      kyselyProvisionedFor(db)
-        .deleteFrom("worktree_provisioned_file_chunks")
-        .where("worktree_id", "=", worktreeId),
-    );
-  });
+  runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      executeSqliteQuerySync(
+        db,
+        kyselyProvisionedFor(db)
+          .deleteFrom("worktree_provisioned_file_chunks")
+          .where("worktree_id", "=", worktreeId),
+      );
+    },
+    { env },
+  );
 }
 
 export function insertRegistryWorktreeProvisionedChunk(
@@ -331,18 +352,20 @@ export function insertRegistryWorktreeProvisionedChunk(
     data: Uint8Array;
   },
 ): void {
-  const db = dbFor(env);
-  runOpenClawStateWriteTransaction(() => {
-    executeSqliteQuerySync(
-      db,
-      kyselyProvisionedFor(db).insertInto("worktree_provisioned_file_chunks").values({
-        worktree_id: params.worktreeId,
-        path: params.path,
-        chunk_index: params.chunkIndex,
-        data: params.data,
-      }),
-    );
-  });
+  runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      executeSqliteQuerySync(
+        db,
+        kyselyProvisionedFor(db).insertInto("worktree_provisioned_file_chunks").values({
+          worktree_id: params.worktreeId,
+          path: params.path,
+          chunk_index: params.chunkIndex,
+          data: params.data,
+        }),
+      );
+    },
+    { env },
+  );
 }
 
 export function getRegistryWorktreeProvisionedChunk(
@@ -366,7 +389,7 @@ export function findLiveRegistryWorktreeByPath(
   const db = dbFor(env);
   const query = kyselyFor(db)
     .selectFrom("worktrees")
-    .selectAll()
+    .select(WORKTREE_RECORD_COLUMNS)
     .where("path", "=", worktreePath)
     .where("removed_at", "is", null)
     .orderBy("created_at", "desc")
@@ -383,7 +406,7 @@ export function findLiveRegistryWorktreeByOwner(
   const db = dbFor(env);
   const query = kyselyFor(db)
     .selectFrom("worktrees")
-    .selectAll()
+    .select(WORKTREE_RECORD_COLUMNS)
     .where("owner_kind", "=", ownerKind)
     .where("owner_id", "=", ownerId)
     .where("removed_at", "is", null)
@@ -398,13 +421,15 @@ export function insertRegistryWorktree(
   record: ManagedWorktreeRecord,
   options: { provisionedPaths?: readonly string[] } = {},
 ): void {
-  const db = dbFor(env);
-  runOpenClawStateWriteTransaction(() => {
-    executeSqliteQuerySync(
-      db,
-      kyselyFor(db).insertInto("worktrees").values(recordToRow(record, options.provisionedPaths)),
-    );
-  });
+  runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      executeSqliteQuerySync(
+        db,
+        kyselyFor(db).insertInto("worktrees").values(recordToRow(record, options.provisionedPaths)),
+      );
+    },
+    { env },
+  );
 }
 
 export function updateRegistryWorktree(
@@ -419,7 +444,6 @@ export function updateRegistryWorktree(
   },
   options: { onlyIfLive?: boolean; onlyIfActiveAt?: number } = {},
 ): void {
-  const db = dbFor(env);
   const values: Partial<WorktreeRow> = {};
   if (patch.lastActiveAt !== undefined) {
     values.last_active_at = patch.lastActiveAt;
@@ -443,33 +467,38 @@ export function updateRegistryWorktree(
   } else if (patch.provisionedPaths !== undefined) {
     values.provisioned_paths_json = JSON.stringify(patch.provisionedPaths);
   }
-  runOpenClawStateWriteTransaction(() => {
-    let update = kyselyFor(db).updateTable("worktrees").set(values).where("id", "=", id);
-    // Busy/retained/failed outcomes are authoritative only for the lifecycle the
-    // writer observed: the live condition blocks post-finalization overwrites, and
-    // the activity condition blocks prior-lifecycle writes after a concurrent
-    // remove-plus-restore revives the row (restore bumps last_active_at).
-    if (options.onlyIfLive) {
-      update = update.where("removed_at", "is", null);
-    }
-    if (options.onlyIfActiveAt !== undefined) {
-      update = update.where("last_active_at", "=", options.onlyIfActiveAt);
-    }
-    executeSqliteQuerySync(db, update);
-  });
+  runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      let update = kyselyFor(db).updateTable("worktrees").set(values).where("id", "=", id);
+      // Busy/retained/failed outcomes are authoritative only for the lifecycle the
+      // writer observed: the live condition blocks post-finalization overwrites, and
+      // the activity condition blocks prior-lifecycle writes after a concurrent
+      // remove-plus-restore revives the row (restore bumps last_active_at).
+      if (options.onlyIfLive) {
+        update = update.where("removed_at", "is", null);
+      }
+      if (options.onlyIfActiveAt !== undefined) {
+        update = update.where("last_active_at", "=", options.onlyIfActiveAt);
+      }
+      executeSqliteQuerySync(db, update);
+    },
+    { env },
+  );
 }
 
 export function deleteRegistryWorktree(env: NodeJS.ProcessEnv, id: string): void {
-  const db = dbFor(env);
-  runOpenClawStateWriteTransaction(() => {
-    executeSqliteQuerySync(
-      db,
-      kyselyProvisionedFor(db)
-        .deleteFrom("worktree_provisioned_file_chunks")
-        .where("worktree_id", "=", id),
-    );
-    executeSqliteQuerySync(db, kyselyFor(db).deleteFrom("worktrees").where("id", "=", id));
-  });
+  runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      executeSqliteQuerySync(
+        db,
+        kyselyProvisionedFor(db)
+          .deleteFrom("worktree_provisioned_file_chunks")
+          .where("worktree_id", "=", id),
+      );
+      executeSqliteQuerySync(db, kyselyFor(db).deleteFrom("worktrees").where("id", "=", id));
+    },
+    { env },
+  );
 }
 
 const WORKTREE_RUN_LEASE_SCOPE_PREFIX = "worktree-run:";

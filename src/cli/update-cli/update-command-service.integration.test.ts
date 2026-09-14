@@ -161,14 +161,40 @@ vi.mock("./update-command-service-command.js", async (importOriginal) => {
       ),
   };
 });
-vi.mock("../../process/exec.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../process/exec.js")>()),
-  runCommandWithTimeout: mocks.child,
-  runExec: vi.fn(
-    async (_command: string, _args: string[], options: { input: string | Uint8Array }) =>
-      decodeLaunchAgentPlistFixture(options.input),
-  ),
-}));
+vi.mock("../../process/exec.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../process/exec.js")>();
+  const versionProbe = [
+    "busctl",
+    "--user",
+    "--auto-start=no",
+    "get-property",
+    "org.freedesktop.systemd1",
+    "/org/freedesktop/systemd1",
+    "org.freedesktop.systemd1.Manager",
+    "Version",
+  ];
+  return {
+    ...actual,
+    runCommandWithTimeout: (...args: Parameters<typeof actual.runCommandWithTimeout>) => {
+      const [argv] = args;
+      if (argv.length === versionProbe.length && versionProbe.every((arg, i) => argv[i] === arg)) {
+        return Promise.resolve({
+          code: 0,
+          stdout: 's "252.39"',
+          stderr: "",
+          signal: null,
+          killed: false,
+          termination: "exit" as const,
+        });
+      }
+      return mocks.child(...args);
+    },
+    runExec: vi.fn(
+      async (_command: string, _args: string[], options: { input: string | Uint8Array }) =>
+        decodeLaunchAgentPlistFixture(options.input),
+    ),
+  };
+});
 vi.mock("../../infra/gateway-processes.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../infra/gateway-processes.js")>()),
   findVerifiedGatewayListenerPidsOnPortSync: mocks.listenerPids,
@@ -472,7 +498,10 @@ describe("preserved update activation with real version guards", () => {
       );
       expect(mocks.health.mock.calls.every(([args]) => args.port === 19305)).toBe(true);
       if (retried) {
-        expect(mocks.terminateStale).toHaveBeenCalledWith([4242]);
+        expect(mocks.terminateStale).toHaveBeenCalledWith(
+          [4242],
+          expect.objectContaining({ env: expect.any(Object), assertCurrent: expect.any(Function) }),
+        );
       }
       if (allowed) {
         expect(await mocks.command(process.env)).toEqual(commandBefore);
@@ -917,7 +946,10 @@ describe("preserved update activation with real version guards", () => {
       expect(afterBootstrap).not.toContainEqual(["kickstart", "-k", target]);
     }
     if (scenario === "stale retry") {
-      expect(mocks.terminateStale).toHaveBeenCalledWith([4242]);
+      expect(mocks.terminateStale).toHaveBeenCalledWith(
+        [4242],
+        expect.objectContaining({ env: expect.any(Object), assertCurrent: expect.any(Function) }),
+      );
       expect(mocks.launchctl.mock.calls.filter(([args]) => args[0] === "kickstart")).toHaveLength(
         2,
       );

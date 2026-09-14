@@ -684,8 +684,7 @@ function appendParagraphSeparator(
 }
 
 function appendTopLevelListSeparator(state: RenderState) {
-  const trailingNewlines = state.text.match(/\n*$/)?.[0].length ?? 0;
-  if (trailingNewlines < 2) {
+  if (!state.text.endsWith("\n\n")) {
     state.text += "\n";
   }
 }
@@ -867,7 +866,7 @@ function handleLinkClose(state: RenderState) {
   }
   const start = link.labelStart;
   const end = target.text.length;
-  const span = createMarkdownLinkSpan({ start, end, href }, { autoLinked: link.autoLinked });
+  const span = createMarkdownLinkSpan({ start, end, href }, link.autoLinked);
   target.links.push(span);
 }
 

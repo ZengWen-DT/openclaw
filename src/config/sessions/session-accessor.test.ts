@@ -5,6 +5,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { redactIdentifier } from "@openclaw/normalization-core/node-crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred, withTestTimeout } from "../../../test/helpers/promise.js";
+import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { cleanupTempDirs, makeTempDir } from "../../../test/helpers/temp-dir.js";
 import { makeUserMessage } from "../../../test/helpers/user-message.js";
 import type { MsgContext } from "../../auto-reply/templating.js";
@@ -98,6 +99,7 @@ import {
   trimTranscriptForManualCompact,
 } from "./session-accessor.sqlite-transcript-write.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
+import { transcriptMessage } from "./transcript-message.test-support.js";
 import {
   SessionTranscriptWriterClaimReboundError,
   withOwnedSessionTranscriptWrites,
@@ -1196,6 +1198,10 @@ describe("session accessor seam", () => {
         { agentId: "main", sessionKey: childSessionKey, storePath },
         { ...lineage, sessionId: childSessionKey, updatedAt: 43 },
       );
+      recordSessionParticipant(
+        { agentId: "main", sessionKey: childSessionKey, storePath },
+        { identity: { type: "agent", id: childSessionKey }, promptedAt: 43 },
+      );
     }
     const databasePath = expectDefined(
       resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path,
@@ -1210,16 +1216,30 @@ describe("session accessor seam", () => {
       .run("agent:main:unrelated-session", "unrelated-session", unrelatedEntryJson, 1);
 
     const parse = vi.spyOn(JSON, "parse");
+    const participantReads = trackSqliteStatementExecutions(database.db, ["participants"], (sql) =>
+      sql.includes('from "session_participants"') ? "participants" : null,
+    );
     try {
-      expect(
-        listSessionChildEntriesReadOnly({ agentId: "main", sessionKey, storePath }).map(
-          (child) => child.sessionKey,
-        ),
-      ).toEqual([
+      const children = listSessionChildEntriesReadOnly({ agentId: "main", sessionKey, storePath });
+      expect(children.map((child) => child.sessionKey)).toEqual([
         "agent:main:focused-both-child",
         "agent:main:focused-parent-child",
         "agent:main:focused-spawned-child",
       ]);
+      expect(
+        children.map(({ sessionKey: childKey, entry }) => ({
+          sessionKey: childKey,
+          participants: entry.participants,
+          participantCount: entry.participantCount,
+        })),
+      ).toEqual(
+        children.map(({ sessionKey: childKey }) => ({
+          sessionKey: childKey,
+          participants: [{ identity: { type: "agent", id: childKey } }],
+          participantCount: 1,
+        })),
+      );
+      expect(participantReads.counts.participants).toBeLessThanOrEqual(1);
       expect(parse.mock.calls.filter(([value]) => value === unrelatedEntryJson)).toHaveLength(0);
       expect(
         resolveSessionEntrySelection({ agentId: "main", sessionKey, storePath }),
@@ -1246,6 +1266,7 @@ describe("session accessor seam", () => {
       ).toMatchObject({ agentId: "main", sessionId: "focused-session", sessionKey });
       expect(parse.mock.calls.filter(([value]) => value === unrelatedEntryJson)).toHaveLength(0);
     } finally {
+      participantReads.restore();
       parse.mockRestore();
     }
   });
@@ -3712,6 +3733,13 @@ describe("session accessor seam", () => {
         },
       ]);
 
+      const trailingMessages = Array.from({ length: 64 }, (_, index) => ({
+        message: {
+          role: "user",
+          content: `batch continuation ${index}`,
+          timestamp: index + 4,
+        },
+      }));
       const updates: Array<{
         target: unknown;
         message?: unknown;
@@ -3750,6 +3778,7 @@ describe("session accessor seam", () => {
                 timestamp: 3,
               },
             },
+            ...trailingMessages,
           ],
           updateMode: "inline",
         });
@@ -3758,7 +3787,7 @@ describe("session accessor seam", () => {
         unsubscribeInternal();
       }
 
-      expect(result.appendedCount).toBe(2);
+      expect(result.appendedCount).toBe(66);
       expect(updates).toEqual([
         {
           target: {
@@ -3798,9 +3827,22 @@ describe("session accessor seam", () => {
           messageSeq: 3,
           runId: "run-ordered-turn",
         },
+        ...trailingMessages.map(({ message }, index) => ({
+          target: {
+            agentId: scope.agentId,
+            sessionId: scope.sessionId,
+            sessionKey: scope.sessionKey,
+          },
+          sessionKey: scope.sessionKey,
+          agentId: scope.agentId,
+          sessionId: scope.sessionId,
+          message,
+          messageId: result.messages[index + 2]?.messageId,
+          messageSeq: index + 4,
+        })),
       ]);
-      expect(internalUpdates).toEqual([
-        {
+      expect(internalUpdates).toEqual(
+        Array.from({ length: 66 }, () => ({
           lifecycleRevision: "ordered-turn-revision",
           target: {
             agentId: scope.agentId,
@@ -3808,17 +3850,8 @@ describe("session accessor seam", () => {
             sessionKey: scope.sessionKey,
             storePath,
           },
-        },
-        {
-          lifecycleRevision: "ordered-turn-revision",
-          target: {
-            agentId: scope.agentId,
-            sessionId: scope.sessionId,
-            sessionKey: scope.sessionKey,
-            storePath,
-          },
-        },
-      ]);
+        })),
+      );
     },
   );
 
@@ -3836,11 +3869,10 @@ describe("session accessor seam", () => {
     });
     await persistSessionTranscriptTurn(scope, {
       messages: [
-        {
-          eventId: "legacy-unsequenced-root",
-          parentId: null,
-          message: { role: "user", content: "canonical root" },
-        },
+        transcriptMessage("legacy-unsequenced-root", null, {
+          role: "user",
+          content: "canonical root",
+        }),
       ],
       updateMode: "none",
     });
@@ -3943,11 +3975,10 @@ describe("session accessor seam", () => {
     await persistSessionTranscriptTurn(scope, {
       ...expectedSession,
       messages: [
-        {
-          eventId: "diverging-turn-root",
-          parentId: null,
-          message: { role: "user", content: "common branch root" },
-        },
+        transcriptMessage("diverging-turn-root", null, {
+          role: "user",
+          content: "common branch root",
+        }),
       ],
       updateMode: "none",
     });
@@ -3964,24 +3995,16 @@ describe("session accessor seam", () => {
       result = await persistSessionTranscriptTurn(scope, {
         ...expectedSession,
         messages: [
-          {
-            eventId: "diverging-turn-abandoned",
-            parentId: "diverging-turn-root",
-            message: {
-              role: "assistant",
-              content: "abandoned branch",
-              idempotencyKey: "diverging-turn-abandoned",
-            },
-          },
-          {
-            eventId: "diverging-turn-active",
-            parentId: "diverging-turn-root",
-            message: {
-              role: "assistant",
-              content: "final active branch",
-              idempotencyKey: "diverging-turn-active",
-            },
-          },
+          transcriptMessage("diverging-turn-abandoned", "diverging-turn-root", {
+            role: "assistant",
+            content: "abandoned branch",
+            idempotencyKey: "diverging-turn-abandoned",
+          }),
+          transcriptMessage("diverging-turn-active", "diverging-turn-root", {
+            role: "assistant",
+            content: "final active branch",
+            idempotencyKey: "diverging-turn-active",
+          }),
         ],
         updateMode: "inline",
       });

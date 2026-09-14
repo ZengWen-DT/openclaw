@@ -6,8 +6,15 @@ import { hasOperatorWriteAccess } from "../../app/operator-access.ts";
 import { icons } from "../../components/icons.ts";
 import { resolveIdentityAvatarView } from "../../components/identity-avatar-view.ts";
 import type { ImageLightboxItem } from "../../components/image-lightbox.ts";
+import {
+  lobsterPetSeed,
+  resolveLobsterPetMode,
+  resolveLobsterRunOutcome,
+} from "../../components/lobster-pet-contract.ts";
 import { t } from "../../i18n/index.ts";
+import { registerNewSessionSetupEnglish } from "../../i18n/locales/en-new-session-setup.ts";
 import type { HumanMention } from "../../lib/chat/chat-types.ts";
+import { resolveMessageDisplayMarkdown } from "../../lib/chat/message-display.ts";
 import { normalizeMessage } from "../../lib/chat/message-normalizer.ts";
 import { formatSenderLabel } from "../../lib/chat/sender-label.ts";
 import { formatUiError } from "../../lib/format-error.ts";
@@ -31,7 +38,6 @@ import {
   detectJson,
   renderMessageJson,
   renderMessageMarkdown,
-  resolveMessageDisplayMarkdown,
 } from "../chat/components/chat-message-text.ts";
 import { renderChatWorkingIndicator } from "../chat/components/chat-working-indicator.ts";
 import type { buildLocalUserMessage } from "../chat/user-message-content.ts";
@@ -41,6 +47,8 @@ import { isWorktreeNameValid, type NewSessionVisibility } from "./create-params.
 import type { DraftPlaceState } from "./draft-place-state.ts";
 import type { DraftSubmissionFlow } from "./draft-submission-flow.ts";
 import type { NewSessionModelControl } from "./model-control.ts";
+
+registerNewSessionSetupEnglish();
 
 function renderDraftError(message: string, action?: { label: string; onClick: () => void }) {
   return html`
@@ -284,6 +292,16 @@ export function renderNewSessionDraftComposer(options: {
     options.draftOwnerKey,
   );
   return renderNewSessionComposer({
+    renderCritters: (floorEnabled) => html`<openclaw-lobster-pet
+      .seed=${lobsterPetSeed(`${options.textareaController.critterVisit}:${options.draftOwnerKey}`)}
+      .mode=${resolveLobsterPetMode(!gateway?.snapshot.offlineStable, options.context?.sessions.state.result?.sessions)}
+      .runOutcome=${resolveLobsterRunOutcome(options.context?.sessions.state.result?.sessions)}
+      .visitsEnabled=${options.context?.theme.settings.lobsterPetVisits !== false}
+      .soundsEnabled=${options.context?.theme.settings.lobsterPetSounds === true}
+      .gatewayVersion=${options.context?.config.current.serverVersion ?? gateway?.snapshot.hello?.server?.version ?? null}
+      .onVisitsDisabled=${() => options.context?.theme.refresh()}
+      .floorEnabled=${floorEnabled}
+    ></openclaw-lobster-pet>`,
     attachmentLimits: options.context?.gateway.snapshot.hello?.policy?.attachments,
     attachments: options.attachmentDraft.attachments,
     canSubmit: options.canSubmit,

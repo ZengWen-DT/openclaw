@@ -80,6 +80,7 @@ describe("tool-catalog", () => {
       "portal",
       "automations",
       "gateway",
+      "plugins",
       "get_goal",
       "create_goal",
       "update_goal",
@@ -116,6 +117,14 @@ describe("tool-catalog", () => {
       "bundle-mcp",
     ]);
     expect(requirePolicyAllow("minimal")).toEqual(["session_status", "gateway"]);
+  });
+
+  it("treats pdf as a known media core tool, not a plugin id", () => {
+    const mediaIds = listCoreToolSections()
+      .find((section) => section.id === "media")
+      ?.tools.map((tool) => tool.id);
+    expect(mediaIds).toContain("pdf");
+    expect(mediaIds).toContain("tts");
   });
 
   it("full profile uses wildcard to grant all tools (#76507)", () => {

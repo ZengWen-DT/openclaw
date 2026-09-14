@@ -26,6 +26,24 @@ openclaw gateway restart --wait 30s
 
 `--wait <duration>` overrides the drain budget for a plain (non-safe) restart. Accepts bare milliseconds or unit suffixes `ms`, `s`, `m`, `h`, `d` (e.g. `30s`, `5m`, `1h30m`); `--wait 0` waits indefinitely. Not compatible with `--force` or `--safe`.
 
+Native service stop deadlines still apply: the Gateway caps the drain at 315 seconds
+for systemd's 330-second limit, and 5 seconds for launchd's 20-second limit. Both
+leave time for cancellation and cleanup. These caps also apply to `--wait 0`. Longer model or
+heartbeat timeouts do not extend it. When available, the drain log reports the
+largest observed model request timeout for context.
+
+If work still ignores cancellation at the shutdown deadline under systemd or launchd, the process logs
+the remaining work categories, writes a diagnostic stability bundle, and exits
+with status `0`. It does not reuse that unfinished runtime for an in-process
+restart. This lets a requested stop finish cleanly and lets the service manager
+start a fresh Gateway for a restart.
+
+An explicit server-close failure retains exit status `1`, including when final
+provider cleanup crosses the native shutdown deadline.
+
+Foreground/manual Gateways and other supervisors retain exit status `1` when
+cleanup cannot finish before the shutdown deadline.
+
 `--force` skips the active-work drain and restarts immediately. Plain `restart` normally uses the service-manager restart path.
 
 During an upgrade, restart records its reason and drain options in the existing
@@ -42,6 +60,19 @@ by newer update callers take precedence. Ordinary standalone restarts keep their
 existing deadlines. See [Restart recovery](/gateway/restart-recovery).
 
 On Windows, a plain restart launched from a Gateway service process, including an agent's shell command, automatically uses the safe restart path. The running Gateway owns the deferred Scheduled Task handoff, so stopping its process tree cannot kill the caller before relaunch. This requires a reachable Gateway; the command acknowledges the restart request, not successor health. Use `openclaw gateway status` afterward to verify recovery.
+
+The Windows handoff waits for the outgoing Gateway to exit, then requests a task
+launch. It records `restart finished` in `logs/gateway-restart.log` only after a
+different process with the expected executable and Gateway entrypoint listens on
+the configured port. This listener check allows up to three minutes; it does not
+prove channel readiness. A task marked **Running** or a successful launch request
+alone does not count as recovery.
+
+If no replacement listener appears, the log records `restart failed` and a
+profile-aware `openclaw gateway restart --force` command to run from an external
+terminal. The handoff does not end its own Scheduled Task: on installations with
+Job Object containment, doing so could terminate the observer before it records
+the result. A stale running task can still require this external recovery.
 
 On macOS, when `openclaw gateway restart`, `stop`, `install`, or `uninstall` runs inside the managed LaunchAgent's process tree, including an agent's shell command, OpenClaw detects that from launchd's service environment or, when a hand-written plist omits those variables, from process ancestry against the PID launchd reports for the job. Restart hands off to a detached helper so `kickstart -k` cannot kill the caller. Stop, install, and uninstall refuse and ask you to run the command from an external shell.
 

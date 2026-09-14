@@ -682,6 +682,7 @@ describe("session.message websocket events", () => {
       persistOrThrow: vi.fn(),
       clearPendingLifecycleError: vi.fn(),
       countPendingDescendantRuns: () => 0,
+      getLatestRunForChildSession: () => null,
       suppressAnnounceForSteerRestart: () => false,
       resolveSubagentTask: () => ({ lookup: "available" }),
       shouldEmitEndedHookForRun: () => false,
@@ -2854,14 +2855,16 @@ describe("session.message websocket events", () => {
         waitForChat("worker"),
         expectNoMessageWithin({
           watch: (timeoutMs) => waitForSessionMessageEvent(ws, sessionKey, timeoutMs),
-          action: () => expect(push().ok).toBe(true),
+          action: async () => {
+            expect((await push()).ok).toBe(true);
+          },
         }),
       ]);
       const workerChat = requireRecord(workerEvent.payload, "worker chat");
       await expectNoMessageWithin({
         watch: (timeoutMs) => waitForChat("worker", timeoutMs),
-        action: () => {
-          expect(push()).toEqual({ ok: true, result: { ackedSeq: 1 } });
+        action: async () => {
+          expect(await push()).toEqual({ ok: true, result: { ackedSeq: 1 } });
         },
       });
       expect(workerChats).toHaveLength(1);
@@ -2886,7 +2889,9 @@ describe("session.message websocket events", () => {
       expect(workerChat).toEqual(localChat);
       await expectNoMessageWithin({
         watch: (timeoutMs) => waitForChat("stale", timeoutMs),
-        action: () => expect(push(3, "stale").ok).toBe(false),
+        action: async () => {
+          expect((await push(3, "stale")).ok).toBe(false);
+        },
       });
     } finally {
       receiver.clear();

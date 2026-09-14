@@ -16,6 +16,7 @@ import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
 import type { AgentSelectOption } from "../../components/agent-select.ts";
 import { renderLearnMoreLink } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
+import { registerSettingsEnglish } from "../../i18n/locales/en-settings.ts";
 import { listSelectableAgents, normalizeAgentLabel } from "../../lib/agents/display.ts";
 import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import { formatUiError } from "../../lib/format-error.ts";
@@ -25,6 +26,7 @@ import {
   runPluginConfigMutation,
   setPluginEnabled,
 } from "../../lib/plugins/index.ts";
+import { normalizeAgentId } from "../../lib/sessions/session-key.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 import {
@@ -57,6 +59,8 @@ import {
   type MemoryPluginState,
 } from "./memory.ts";
 import type { ConfigRouteData } from "./route-data.ts";
+
+registerSettingsEnglish();
 
 /** Explicit-off sentinel; resolveSlotSelection maps it to an `off` selection. */
 const MEMORY_SLOT_OFF = "none";
@@ -123,6 +127,18 @@ class MemorySettingsPage extends OpenClawLightDomElement {
   private normalizedLocation = "";
 
   private readonly subscriptions = new SubscriptionsController(this)
+    .effect(
+      () => this.context?.agentSelection,
+      () => {
+        this.syncRouteAgent();
+        return undefined;
+      },
+    )
+    .watch(
+      () => this.context?.agentSelection,
+      (selection, notify) => selection.subscribe(notify),
+      (selection) => this.selectAgent(selection.state.selectedId),
+    )
     .watch(
       () => this.context?.gateway,
       (gateway, notify) => gateway.subscribe(notify),
@@ -156,17 +172,32 @@ class MemorySettingsPage extends OpenClawLightDomElement {
     this.syncCanonicalLocation();
   }
 
-  protected override updated(changed: PropertyValues<this>) {
+  private syncRouteAgent(previousRoute?: ConfigRouteData | null) {
+    const routeAgentId = new URLSearchParams(this.routeData?.search).get("agent")?.trim();
+    const previousRouteAgentId = new URLSearchParams(previousRoute?.search).get("agent")?.trim();
+    if (routeAgentId && routeAgentId !== previousRouteAgentId) {
+      this.context.agentSelection.set(normalizeAgentId(routeAgentId));
+    }
+  }
+
+  protected override willUpdate(changed: PropertyValues<this>) {
     if (changed.has("routeData")) {
-      const previous = this.activeTab(
-        (changed.get("routeData") as ConfigRouteData | null | undefined) ?? null,
-      );
+      const previousRoute = changed.get("routeData") as ConfigRouteData | null | undefined;
+      const previous = this.activeTab(previousRoute ?? null);
       const current = this.activeTab();
       if (previous !== current) {
         this.overviewRequest = null;
         this.probingEmbeddings = false;
+      }
+      this.syncRouteAgent(previousRoute);
+      if (previous !== current) {
         void this.loadOverviewStatus();
       }
+    }
+  }
+
+  protected override updated(changed: PropertyValues<this>) {
+    if (changed.has("routeData")) {
       this.syncCanonicalLocation();
     }
     if (changed.has("configObject")) {
@@ -649,7 +680,7 @@ class MemorySettingsPage extends OpenClawLightDomElement {
       canImportMemory: readGatewayOperatorAccess(this.context.gateway.snapshot).canAdmin,
       agentId,
       agents: this.agentOptions(),
-      onAgentChange: (next) => this.selectAgent(next),
+      onAgentChange: (next) => this.context.agentSelection.set(next),
       overview: renderMemoryOverview({
         agentId,
         engineSelection,

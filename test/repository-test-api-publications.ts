@@ -5,9 +5,6 @@ import { normalizeModuleId } from "vite/module-runner";
 // distinct; override stores and production singletons have separate lifecycle owners.
 const publications: Record<string, string | symbol> = {
   "extensions/google/vertex-adc.ts": Symbol.for("openclaw.google.vertexAdcTestApi"),
-  "extensions/memory-lancedb/lancedb-runtime.ts": Symbol.for(
-    "openclaw.memoryLanceDbRuntimeTestApi",
-  ),
   "src/agents/agent-hooks/compaction-safeguard.ts": Symbol.for(
     "openclaw.compactionSafeguardTestApi",
   ),
@@ -77,7 +74,6 @@ const publications: Record<string, string | symbol> = {
   "src/commands/doctor-heartbeat-main-session-repair.ts": Symbol.for(
     "openclaw.doctorHeartbeatMainSessionRepairTestApi",
   ),
-  "src/commands/doctor-sandbox.ts": Symbol.for("openclaw.doctorSandboxTestApi"),
   "src/commands/doctor-session-snapshots.ts": Symbol.for("openclaw.doctorSessionSnapshotsTestApi"),
   "src/commands/doctor/shared/codex-native-assets.ts": Symbol.for(
     "openclaw.codexNativeAssetsTestApi",
@@ -92,7 +88,6 @@ const publications: Record<string, string | symbol> = {
   "src/commands/onboard-non-interactive/local.ts": Symbol.for(
     "openclaw.onboardNonInteractiveLocalTestApi",
   ),
-  "src/commands/status.command.ts": Symbol.for("openclaw.statusCommandTestApi"),
   "src/cron/service/active-run-cancellation.ts": Symbol.for("openclaw.activeCronTaskRunTestApi"),
   "src/cron/service/timer.ts": Symbol.for("openclaw.cronTimerTestApi"),
   "src/cron/session-reaper.ts": Symbol.for("openclaw.cronSessionReaperTestApi"),
@@ -104,7 +99,6 @@ const publications: Record<string, string | symbol> = {
   "src/logging/diagnostic.ts": Symbol.for("openclaw.diagnosticTestApi"),
   "src/logging/secret-redaction-registry.ts": Symbol.for("openclaw.secretRedactionRegistryTestApi"),
   "src/media/playback-transcode.ts": Symbol.for("openclaw.playbackTranscodeTestApi"),
-  "src/media/store.ts": Symbol.for("openclaw.mediaStoreTestApi"),
   "src/model-catalog/remote-overlay.ts": Symbol.for("openclaw.remoteModelCatalogOverlayTestApi"),
   "src/node-host/invoke.ts": Symbol.for("openclaw.nodeHostInvokeTestApi"),
   "src/node-host/plugin-node-host.ts": Symbol.for("openclaw.nodeHostPluginTestApi"),

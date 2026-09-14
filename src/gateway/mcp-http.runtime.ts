@@ -56,6 +56,13 @@ type McpLoopbackScopeParams = {
   skillLibraryAuthoring?: SkillLibraryAuthoringCapability;
   rootedExecution?: PreparedRootedExecutionCapability;
   grantToken?: string;
+  /**
+   * Liveness of the authenticating client grant. Deliberately absent from the
+   * cache key: the grant token is already in it, and every row replacement
+   * evicts that token's cached tools, so a cached closure can only ever observe
+   * the exact row it was built for.
+   */
+  isGrantCurrent?: () => boolean;
   yieldContextCacheKey?: string;
   onYield?: (message: string, acknowledgment?: string) => Promise<void> | void;
   nodeExecAvailability?: Awaited<ReturnType<typeof loadNodeExecAvailability>>;
@@ -167,9 +174,7 @@ async function resolvePairedComputerNodeScope(
       pairedComputerUseAvailability,
     },
   };
-  // An empty inventory preserves the fallback schema, so the policy-resolved
-  // catalog is already final. A prepared inventory must rebuild computer with
-  // the paired action projection.
+  // Rebuild computer with the prepared host/node action projection and target status.
   return pairedComputerUseAvailability.prepared
     ? resolvedParams
     : { ...resolvedParams, policyResolved };
@@ -213,6 +218,7 @@ function resolveMcpLoopbackTools(
     agentDir: params.authProfileStoreAgentDir,
     conversationReadOrigin: "delegated",
     surface: "loopback",
+    isGrantCurrent: params.isGrantCurrent,
     excludeToolNames,
     mediatedToolNames: mediatedNativeTools,
     includeNodeExecTool,

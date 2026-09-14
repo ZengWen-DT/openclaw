@@ -167,6 +167,7 @@ async function writePackagedGatewayFixture(root: string): Promise<string> {
   await writeFile(
     fixturePath,
     `import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 
 const args = process.argv.slice(2);
@@ -243,8 +244,16 @@ if (args[0] === "update") {
     process.stderr.write("unknown option --accept-capabilities");
     process.exit(2);
   }
-  record({ kind: "plugins", args, authDbPath, configPath, stateDir });
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const portProbe = net.createServer();
+  await new Promise((resolve, reject) => {
+    portProbe.once("error", reject);
+    portProbe.listen(config.gateway.port, "127.0.0.1", resolve);
+  });
+  await new Promise((resolve, reject) => {
+    portProbe.close((error) => error ? reject(error) : resolve());
+  });
+  record({ kind: "plugins", args, authDbPath, configPath, stateDir, configPort: config.gateway.port });
   delete config.plugins.entries["qa-lab"];
   config.plugins.allow = config.plugins.allow.filter((id) => id !== "qa-lab");
   fs.writeFileSync(configPath, JSON.stringify(config));
@@ -743,6 +752,36 @@ describe("buildQaRuntimeEnv", () => {
     });
     expect(developmentEnv.NODE_ENV).toBe("development");
   });
+
+  it.each(["parent", "runtime patch"])(
+    "keeps %s supervision out of QA-owned children",
+    (source) => {
+      const supervisorEnv = {
+        OPENCLAW_SUPERVISOR_MODE: "external",
+        OPENCLAW_LAUNCHD_LABEL: "ai.openclaw.gateway",
+        LAUNCH_JOB_LABEL: "ai.openclaw.gateway",
+        LAUNCH_JOB_NAME: "ai.openclaw.gateway",
+        XPC_SERVICE_NAME: "ai.openclaw.gateway",
+        OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway.service",
+        INVOCATION_ID: "synthetic-parent-invocation",
+        SYSTEMD_EXEC_PID: "1234",
+        JOURNAL_STREAM: "8:1234",
+        OPENCLAW_WINDOWS_TASK_NAME: "OpenClaw Gateway",
+        OPENCLAW_SERVICE_MARKER: "openclaw",
+        OPENCLAW_SERVICE_KIND: "gateway",
+      };
+      const env = buildQaRuntimeEnv({
+        ...createParams(source === "parent" ? supervisorEnv : {}),
+        runtimeEnvPatch: source === "runtime patch" ? supervisorEnv : undefined,
+      });
+
+      for (const key of Object.keys(supervisorEnv)) {
+        expect(env[key], key).toBeUndefined();
+      }
+      expect(env.OPENCLAW_NO_RESPAWN).toBe("1");
+      expect(env.OPENCLAW_QA_PARENT_PID).toBe(String(process.pid));
+    },
+  );
 
   it("does not inherit parent channel or provider skip controls", () => {
     const env = buildQaRuntimeEnv({
@@ -1819,6 +1858,7 @@ describe("buildQaRuntimeEnv", () => {
         ],
         configPath: records.at(-1)?.configPath,
         stateDir: records.at(-1)?.stateDir,
+        configPort: records.at(-1)?.configPort,
       });
       expect(new Set(records.map((record) => record.authDbPath)).size).toBe(1);
     },
@@ -1856,7 +1896,11 @@ describe("buildQaRuntimeEnv", () => {
       const gateways = records.filter((record) => record.kind === "gateway");
       expect(gateways).toHaveLength(2);
       expect(gateways.map((record) => record.sourcePluginConfigured)).toEqual([false, false]);
-      expect(records.filter((record) => record.kind === "plugins")).toHaveLength(configBuilds);
+      const repairs = records.filter((record) => record.kind === "plugins");
+      expect(repairs).toHaveLength(configBuilds);
+      expect(repairs.map((record) => record.configPort)).toEqual(
+        retry === "bind" ? gateways.map((record) => record.configPort) : [gateways[0]?.configPort],
+      );
       expect(mutateConfig).toHaveBeenCalledTimes(configBuilds);
       expect(records.filter((record) => record.kind === "auth")).toHaveLength(2);
       expect(records.map((record) => record.kind)).toEqual([

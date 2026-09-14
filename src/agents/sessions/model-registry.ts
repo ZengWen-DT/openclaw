@@ -5,6 +5,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { normalizeResolvedPricing } from "@openclaw/llm-core";
+import type { ModelCatalogContextWindowOption } from "@openclaw/model-catalog-core/model-catalog-types";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
@@ -380,6 +381,7 @@ export class ModelRegistry {
     authStorage: AuthStorage,
     modelsJsonPath: string | undefined,
     options: ModelRegistryOptions = {},
+    publishedModels?: ReadonlyMap<string, readonly Model[]>,
   ) {
     this.authStorage = authStorage;
     this.config = options.config ?? options.sourceSnapshot?.config;
@@ -387,7 +389,16 @@ export class ModelRegistry {
     initializeModelRegistryRuntime(this);
     if (options.sourceSnapshot) {
       const source = options.sourceSnapshot;
-      const sourceSnapshot = source.baseCatalogSnapshot ?? source.captureCatalogSnapshot();
+      const captured = source.baseCatalogSnapshot ?? source.captureCatalogSnapshot();
+      const sourceSnapshot = publishedModels
+        ? {
+            ...captured,
+            models: [
+              ...captured.models.filter((model) => !publishedModels.has(model.provider)),
+              ...[...publishedModels.values()].flat(),
+            ],
+          }
+        : captured;
       this.sourceSnapshot = sourceSnapshot;
       this.baseCatalogSnapshot = sourceSnapshot;
       this.restoreSourceCatalog(sourceSnapshot);
@@ -408,6 +419,7 @@ export class ModelRegistry {
     this.pluginCatalogs = options.pluginCatalogs;
     this.staticProviderConfigs = options.staticProviderConfigs;
     this.pluginMetadataSnapshot = resolveModelPluginMetadataSnapshot({
+      config: this.config,
       ...(options.pluginMetadataSnapshot
         ? { pluginMetadataSnapshot: options.pluginMetadataSnapshot }
         : {}),
@@ -459,8 +471,11 @@ export class ModelRegistry {
   }
 
   /** Creates a request-isolated registry from this lifecycle-owned catalog snapshot. */
-  fork(authStorage: AuthStorage): ModelRegistry {
-    return new ModelRegistry(authStorage, undefined, { sourceSnapshot: this });
+  fork(
+    authStorage: AuthStorage,
+    publishedModels?: ReadonlyMap<string, readonly Model[]>,
+  ): ModelRegistry {
+    return new ModelRegistry(authStorage, undefined, { sourceSnapshot: this }, publishedModels);
   }
 
   /**
@@ -836,6 +851,8 @@ export class ModelRegistry {
           input: runtimeInput,
           cost: normalizeResolvedPricing(modelDef.cost ?? {}),
           contextWindow: modelDef.contextWindow ?? 128000,
+          contextWindows: modelDef.contextWindows,
+          contextWindowDefault: modelDef.contextWindowDefault,
           maxTokens: modelDef.maxTokens ?? 16384,
           ...(modelDef.maxTokens !== undefined
             ? { maxTokensSource: modelDef.maxTokensSource }
@@ -1181,6 +1198,8 @@ export class ModelRegistry {
           input: modelDef.input,
           cost: modelDef.cost,
           contextWindow: modelDef.contextWindow,
+          contextWindows: modelDef.contextWindows,
+          contextWindowDefault: modelDef.contextWindowDefault,
           maxTokens: modelDef.maxTokens,
           params: modelDef.params,
           headers: undefined,
@@ -1227,6 +1246,8 @@ export interface ProviderConfigInput {
     input: ("text" | "image")[];
     cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
     contextWindow: number;
+    contextWindows?: ModelCatalogContextWindowOption[];
+    contextWindowDefault?: string;
     maxTokens: number;
     params?: Record<string, unknown>;
     headers?: Record<string, string>;

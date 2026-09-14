@@ -16,9 +16,14 @@ import { applySharedChannelFieldHelp } from "../src/config/schema.channel-field-
 import { buildBaseHints } from "../src/config/schema.hints.js";
 import { applyConfigTierHints, applyResolvedConfigTierHints } from "../src/config/schema.tiers.js";
 import { CONTROL_UI_BOOTSTRAP_CONFIG_PATH } from "../src/gateway/control-ui-contract.js";
-import { controlUiPluginAssetRoot } from "../src/gateway/control-ui-plugin-assets-contract.js";
+import {
+  controlUiPluginAssetPrefix,
+  controlUiPluginAssetRoot,
+} from "../src/gateway/control-ui-plugin-assets-contract.js";
 import { buildUpdateRestartSentinelPayload } from "../src/infra/update-restart-sentinel-payload.js";
 import type { UpdateRunResult } from "../src/infra/update-runner.js";
+import { buildPluginLoaderAliasMap } from "../src/plugins/sdk-alias.js";
+import { buildNewAgentWelcome } from "../src/system-agent/new-agent-welcome.js";
 import type { UpdateAvailable, UpdateScheduleState } from "../ui/src/api/types.ts";
 import {
   controlUiSessionPath,
@@ -28,8 +33,13 @@ import {
   prepareControlUiMockGatewayScenario,
   type ControlUiMockGatewayScenario,
 } from "../ui/src/test-helpers/control-ui-e2e.ts";
-import { createControlUiSessionRow } from "../ui/src/test-helpers/control-ui-session-fixtures.ts";
+import {
+  createControlUiChatHistoryMessage as chatHistoryMessage,
+  createControlUiMockSessionRow as sessionRow,
+} from "../ui/src/test-helpers/control-ui-session-fixtures.ts";
 import { workboardUi } from "../ui/src/test-helpers/control-ui-workboard-fixture.ts";
+import { buildWorkboardMocks } from "../ui/src/test-helpers/control-ui-workboard-fixtures.ts";
+import { installWorkboardBoardMock } from "../ui/src/test-helpers/control-ui-workboard-mocks.ts";
 import { createOfflineDeviceNode } from "../ui/src/test-helpers/devices-fixtures.ts";
 import {
   resolveExternalPackageAliasesForVite,
@@ -77,11 +87,13 @@ type CliOptions = {
     | "dashboards"
     | "goal"
     | "plugins-dense"
+    | "sidebar-roster"
     | "swarm"
     | "update-available"
     | "update-blocked"
     | "update-failed"
-    | "workboard";
+    | "workboard"
+    | "workboard-states";
   host: string;
   operatorScopes?: string[];
   port: number;
@@ -397,11 +409,13 @@ function parseFixture(value: string | undefined): CliOptions["fixture"] {
     value !== "dashboards" &&
     value !== "goal" &&
     value !== "plugins-dense" &&
+    value !== "sidebar-roster" &&
     value !== "swarm" &&
     value !== "update-available" &&
     value !== "update-blocked" &&
     value !== "update-failed" &&
-    value !== "workboard"
+    value !== "workboard" &&
+    value !== "workboard-states"
   ) {
     throw new Error(`Unknown Control UI mock fixture: ${value}`);
   }
@@ -419,21 +433,6 @@ function parseOperatorScopes(value: string | undefined): string[] | undefined {
     .map((scope) => scope.trim())
     .filter(Boolean);
   return scopes.length > 0 ? scopes : undefined;
-}
-
-function sessionRow(
-  key: string,
-  label: string,
-  updatedAt: number,
-  options: { model?: string; modelProvider?: string } & Record<string, unknown> = {},
-) {
-  const { model, modelProvider, ...extra } = options;
-  return createControlUiSessionRow(key, label, updatedAt, {
-    contextTokens: 200_000,
-    model: model ?? "gpt-5-mini",
-    modelProvider: modelProvider ?? "openai",
-    ...extra,
-  });
 }
 
 function sessionsListResponse(sessions: Array<{ key: string }>, options: SessionListOptions) {
@@ -1234,119 +1233,6 @@ function buildConfigMocks(options: { swarmEnabled?: boolean; workboardEnabled?: 
   };
 }
 
-function buildWorkboardMocks(baseTime: number) {
-  const boardId = "peter-tasks";
-  const card = (
-    id: string,
-    title: string,
-    status: string,
-    priority: string,
-    position: number,
-    labels: string[],
-  ) => ({
-    id,
-    title,
-    status,
-    priority,
-    labels,
-    position,
-    createdAt: baseTime - 86_400_000,
-    updatedAt: baseTime - position * 1_000,
-    metadata: { automation: { boardId } },
-  });
-  const cards = [
-    card("card-inbox", "Capture customer feedback themes", "todo", "normal", 1, ["research"]),
-    card("card-brief", "Draft weekly product brief", "todo", "low", 2, ["writing"]),
-    card("card-ready", "Prepare launch readiness checklist", "ready", "high", 1, ["launch"]),
-    card("card-running", "Validate onboarding flow", "running", "urgent", 1, ["quality"]),
-    card("card-review", "Review accessibility audit", "review", "high", 1, ["frontend"]),
-    card("card-blocked", "Confirm staging environment access", "blocked", "normal", 1, ["ops"]),
-    card("card-done", "Publish support handoff notes", "done", "low", 1, ["docs"]),
-  ];
-  const statuses = ["todo", "ready", "running", "review", "blocked", "done"];
-  const board = {
-    id: boardId,
-    name: "Product Operations",
-    description: "Shared product delivery queue",
-    icon: "✓",
-    color: "#2563eb",
-    automationJobId: "job-product-operations-daily",
-    total: cards.length,
-    active: cards.length - 1,
-    archived: 0,
-    byStatus: Object.fromEntries(
-      statuses.map((status) => [status, cards.filter((entry) => entry.status === status).length]),
-    ),
-    updatedAt: baseTime,
-  };
-  const sessionKey = "agent:main:workboard-proof";
-  return {
-    board,
-    cards,
-    sessionKey,
-    methodResponses: {
-      "board.get": {
-        sessionKey,
-        revision: 1,
-        tabs: [{ tabId: "main", title: "Workboard", position: 0, chatDock: "hidden" }],
-        widgets: [
-          {
-            name: "session-progress",
-            tabId: "main",
-            title: "Session progress",
-            contentKind: "plugin",
-            pluginKind: "session:progress",
-            sizeW: 6,
-            sizeH: 5,
-            position: 0,
-            grantState: "none",
-            revision: 1,
-          },
-          {
-            name: "workboard-product-operations",
-            tabId: "main",
-            title: "Product Operations",
-            contentKind: "plugin",
-            pluginKind: "workboard:board",
-            props: { boardId },
-            heightMode: "fixed",
-            sizeW: 12,
-            sizeH: 16,
-            position: 1,
-            grantState: "none",
-            revision: 1,
-          },
-        ],
-      },
-      "workboard.boards.list": { boards: [board] },
-      "workboard.cards.list": { boards: [board], cards, statuses },
-      "workboard.cards.stats": { ...board, byAgent: {} },
-      "workboard.cards.move": { card: cards[0] },
-      "progressCard.get": {
-        card: {
-          sessionKey,
-          revision: 2,
-          updatedAt: baseTime,
-          markdown: "**Product launch** is moving through final checks.",
-          steps: [
-            { step: "Confirm release scope", status: "completed" },
-            { step: "Validate onboarding flow", status: "in_progress" },
-            { step: "Publish support handoff", status: "pending" },
-          ],
-        },
-      },
-    },
-  };
-}
-
-function chatHistoryMessage(role: "assistant" | "user", text: string, timestamp: number) {
-  return {
-    content: [{ text, type: "text" }],
-    role,
-    timestamp,
-  };
-}
-
 function buildScrollableChatHistory(baseTime: number): unknown[] {
   const messages: unknown[] = Array.from({ length: 10 }, (_, index) => {
     const timestamp = baseTime + index * 3 * 60_000;
@@ -1563,6 +1449,21 @@ function searchPrefixes(term: string): string[] {
   return Array.from({ length: term.length }, (_value, index) => term.slice(0, index + 1));
 }
 
+function syntheticAvatar(color: "coral" | "green"): string {
+  const background = color === "coral" ? "#ffdbcc" : "#d5efd4";
+  const fill = color === "coral" ? "#e87355" : "#65a879";
+  const artwork = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+    <rect width="64" height="64" rx="18" fill="${background}"/>
+    <path d="M12 28 16 10l13 10h6l13-10 4 18v10a20 20 0 0 1-40 0Z" fill="${fill}"/>
+    <g fill="#253331">
+      <circle cx="24" cy="33" r="3"/>
+      <circle cx="40" cy="33" r="3"/>
+    </g>
+    <path d="M26 43q6 6 12 0" fill="none" stroke="#253331" stroke-width="3" stroke-linecap="round"/>
+  </svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(artwork).toString("base64")}`;
+}
+
 async function createChatPickerScenario(
   fixture?: CliOptions["fixture"],
 ): Promise<ControlUiMockGatewayScenario> {
@@ -1574,36 +1475,36 @@ async function createChatPickerScenario(
       name: "Molty",
       theme: "Your everyday coordinator",
       emoji: "🦞",
-      avatar:
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAIElEQVR4nGN4nhWCFTEQkPj64w8ag5AEPqPgiDgdmAgA9YRzYZfFh50AAAAASUVORK5CYII=",
+      avatar: syntheticAvatar("coral"),
       preview: "I am organizing the next steps for the sample project.",
+      sessionLabels: ["Project next steps", "Weekly review"],
     },
     {
       id: "forge",
       name: "Forge",
       theme: "Builds and maintains your projects",
-      emoji: "🛠️",
-      avatar:
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAIElEQVR4nGMInfMAK2IgIPH1xx80BiEJfEbBEXE6MBEAgkh9AfK4IAAAAAAASUVORK5CYII=",
+      emoji: "",
+      avatar: "",
       preview: "The sample dashboard is ready for your review.",
+      sessionLabels: ["Sample dashboard", "Build notes"],
     },
     {
       id: "scout",
       name: "Scout",
       theme: "Finds answers and connects ideas",
       emoji: "🔭",
-      avatar:
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAIElEQVR4nGN4vc0NK2IgIPH1xx80BiEJfEbBEXE6MBEAqnKB0ZTY3IwAAAAASUVORK5CYII=",
+      avatar: "",
       preview: "I found three useful approaches for the research outline.",
+      sessionLabels: ["Research outline", "Source notes"],
     },
     {
       id: "bloom",
       name: "Bloom",
       theme: "Turns rough drafts into clear stories",
       emoji: "🌱",
-      avatar:
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAIElEQVR4nGPI2NqGFTEQkPj64w8ag5AEPqPgiDgdmAgAoqhy8cqD9UUAAAAASUVORK5CYII=",
+      avatar: syntheticAvatar("green"),
       preview: "The welcome guide now has a shorter opening and clear examples.",
+      sessionLabels: ["Welcome guide", "Story ideas"],
     },
   ] as const;
   const pickerInventory = process.env.MOCK_PICKER_INVENTORY === "1";
@@ -1923,7 +1824,11 @@ async function createChatPickerScenario(
           }),
         ]
       : [];
-  const workboardMocks = buildWorkboardMocks(baseTime);
+  const workboardMocks = buildWorkboardMocks(
+    Date.now(),
+    MOCK_ACTOR_PETER,
+    fixture === "workboard-states",
+  );
   const activityTime = Date.now();
   const activitySessions = buildActivitySessionRows(activityTime);
   const dashboardGallerySessions =
@@ -1971,22 +1876,56 @@ async function createChatPickerScenario(
     tokenBudget: 300_000,
     continuationTurns: 3,
   };
-  const sessions = [
-    ...rosterAgents.slice(1).map((agent, index) =>
-      sessionRow(`agent:${agent.id}:main`, agent.name, rosterTime - (index + 1) * 720_000, {
-        agentId: agent.id,
-        isMain: true,
-        lastMessagePreview: agent.preview,
+  const rosterSessions = rosterAgents.flatMap((agent, index) => [
+    sessionRow(`agent:${agent.id}:main`, agent.name, rosterTime - (index + 1) * 720_000, {
+      agentId: agent.id,
+      isMain: true,
+      lastMessagePreview: agent.preview,
+    }),
+    ...agent.sessionLabels.map((label, sessionIndex) => {
+      const working = agent.id === "forge" && sessionIndex === 0;
+      return sessionRow(
+        `agent:${agent.id}:sample-${sessionIndex + 1}`,
+        label,
+        rosterTime - (index + 1) * 60_000 - sessionIndex * 5_000,
+        {
+          agentId: agent.id,
+          pinned: sessionIndex === 0,
+          lastMessagePreview: agent.preview,
+          unread: agent.id === "scout" && sessionIndex === 1,
+          hasActiveRun: working,
+          ...(working ? { activeRunIds: ["mock-forge-dashboard"], status: "running" } : {}),
+        },
+      );
+    }),
+  ]);
+  if (fixture === "sidebar-roster") {
+    rosterSessions.push(
+      sessionRow("agent:forge:subagent:layout", "Check sidebar layout", rosterTime - 20_000, {
+        agentId: "forge",
+        spawnedBy: "agent:forge:sample-1",
+        status: "done",
       }),
-    ),
+      sessionRow("agent:forge:subagent:contrast", "Check nested contrast", rosterTime - 10_000, {
+        agentId: "forge",
+        spawnedBy: "agent:forge:subagent:layout",
+        hasActiveRun: true,
+        status: "running",
+        unread: true,
+      }),
+    );
+  }
+  const gallerySessions = [
+    ...rosterSessions.filter((row) => !row.key.startsWith("agent:main:")),
     ...activitySessions,
     ...dashboardGallerySessions,
-    ...(fixture === "workboard"
+    ...(fixture === "workboard" || fixture === "workboard-states"
       ? [
           sessionRow(workboardMocks.sessionKey, "Product operations dashboard", baseTime, {
             boardFace: "dashboard",
             pinned: true,
           }),
+          ...workboardMocks.cardSessions,
         ]
       : []),
     sessionRow("agent:main:main", "Molty", rosterTime - 1_000, {
@@ -2160,6 +2099,7 @@ async function createChatPickerScenario(
       labelPrefix: "Long running session",
     }),
   ];
+  const sessions = fixture === "sidebar-roster" ? rosterSessions : gallerySessions;
   const archivedSessions = [
     sessionRow("agent:main:archived-launch-notes", "Archived launch notes", baseTime - 86_400_000, {
       archived: true,
@@ -2199,7 +2139,10 @@ async function createChatPickerScenario(
   const modelProviders = buildModelProviderMocks(Date.now());
   const skillWorkshop = buildSkillWorkshopMocks(Date.now());
   const richAttention = fixture === "approval";
-  const cronMocks = buildCronMocks(Date.now(), { richAttention });
+  const cronMocks = buildCronMocks(Date.now(), {
+    richAttention,
+    ...(fixture === "sidebar-roster" ? { secondAgentId: "forge" } : {}),
+  });
   const updateFixtureNow = Date.now();
   const updateFixture = buildUpdateFixture(fixture, updateFixtureNow);
   const updateSchedule = updateFixture?.schedule ?? null;
@@ -2242,7 +2185,7 @@ async function createChatPickerScenario(
   const channelWizard = buildChannelWizardMocks();
   const configMocks = buildConfigMocks({
     swarmEnabled: fixture === "swarm",
-    workboardEnabled: fixture === "workboard",
+    workboardEnabled: fixture === "workboard" || fixture === "workboard-states",
   });
   const fixtureSessionKey =
     fixture === "approval"
@@ -2255,7 +2198,7 @@ async function createChatPickerScenario(
             ? "agent:main:model-budget"
             : fixture === "update-failed"
               ? "agent:main:cloud-refactor"
-              : fixture === "workboard"
+              : fixture === "workboard" || fixture === "workboard-states"
                 ? workboardMocks.sessionKey
                 : "agent:main:main";
   const summaryHistory = buildFixtureSummaryHistory(
@@ -2268,6 +2211,14 @@ async function createChatPickerScenario(
     attachments: buildChatAttachmentHistory(baseTime),
     avatars: buildAvatarChatHistory(baseTime),
     "code-fences": buildCodeFenceChatHistory(baseTime),
+    "sidebar-roster": [
+      chatHistoryMessage("user", "Help me organize the sample project.", rosterTime - 120_000),
+      chatHistoryMessage(
+        "assistant",
+        "The project outline is ready. Forge is building the sample dashboard, Scout is reviewing sources, and Bloom is drafting the welcome guide.",
+        rosterTime - 60_000,
+      ),
+    ],
     "update-blocked": buildCancelledChatHistory(baseTime),
   };
   const historyMessages = fixture
@@ -2335,7 +2286,7 @@ async function createChatPickerScenario(
       },
     ],
   } satisfies SystemChangesListResult;
-  return {
+  const scenario: ControlUiMockGatewayScenario = {
     assistantAgentId: "main",
     assistantName: "Molty",
     defaultAgentId: "main",
@@ -2413,20 +2364,27 @@ async function createChatPickerScenario(
       "environments.list",
       "terminal.open",
       ...(updateFixture ? ["update.hold", "update.run", "update.status"] : []),
-      ...(fixture === "workboard"
+      ...(fixture === "workboard" || fixture === "workboard-states"
         ? [
             "board.get",
+            "cron.get",
             "workboard.boards.list",
+            "workboard.boards.upsert",
             "workboard.cards.list",
             "workboard.cards.move",
+            "workboard.cards.create",
+            "workboard.cards.update",
+            "workboard.cards.comment",
+            "workboard.cards.archive",
+            "workboard.cards.delete",
             "workboard.cards.stats",
           ]
         : []),
     ],
-    ...(fixture === "workboard" ? workboardUi : {}),
+    ...(fixture === "workboard" || fixture === "workboard-states" ? workboardUi : {}),
     controlUiWidgetKinds: [
       { pluginId: "session", kind: "session:progress", label: "Session progress" },
-      ...(fixture === "workboard"
+      ...(fixture === "workboard" || fixture === "workboard-states"
         ? [
             { pluginId: "workboard", kind: "workboard:board", label: "Workboard board" },
             { pluginId: "workboard", kind: "workboard:card", label: "Workboard card" },
@@ -2480,6 +2438,9 @@ async function createChatPickerScenario(
       "agent:main:home-server": { messages: summaryHistory },
       "agent:main:cloud-refactor": { messages: summaryHistory },
       [workboardMocks.sessionKey]: { messages: summaryHistory },
+      ...(fixture === "workboard" || fixture === "workboard-states"
+        ? workboardMocks.cardSessionHistories
+        : {}),
     },
     // Lights up the footer facepile and who's-online roster; the email-only
     // entry keeps the roster's no-display-name row exercised.
@@ -3446,11 +3407,17 @@ async function createChatPickerScenario(
             ...searchPrefixes("claude-sonnet-4-6"),
             ...searchPrefixes("anthropic"),
           ]),
-          ...buildSessionListCases([...sessions, ...archivedSessions], {}, MOCK_SESSION_OWNERS),
+          ...buildSessionListCases(
+            fixture === "sidebar-roster" ? sessions : [...sessions, ...archivedSessions],
+            {},
+            MOCK_SESSION_OWNERS,
+          ),
         ],
       },
       "sessions.search": { results: [] },
-      ...(fixture === "workboard" ? workboardMocks.methodResponses : {}),
+      ...(fixture === "workboard" || fixture === "workboard-states"
+        ? workboardMocks.methodResponses
+        : {}),
     },
     models: modelProviders.models,
     repeatingSessionEvents: {
@@ -3529,6 +3496,55 @@ async function createChatPickerScenario(
     workspace: "/Users/demo/Projects/openclaw",
     workspaceGit: true,
   };
+  if (fixture === "sidebar-roster") {
+    const teamTasks = backgroundTasks.tasks.slice(0, 2).map((task, index) => {
+      const agent = expectDefined(rosterAgents[index], "team task agent");
+      return Object.assign({}, task, {
+        agentId: agent.id,
+        title: agent.sessionLabels[0],
+        sessionKey: `agent:${agent.id}:main`,
+        ownerKey: `agent:${agent.id}:main`,
+        childSessionKey: `agent:${agent.id}:sample-1`,
+      });
+    });
+    scenario.methodResponses = {
+      ...scenario.methodResponses,
+      "sessions.catalog.list": { catalogs: [] },
+      "tasks.list": {
+        cases: [
+          ...rosterAgents.map(({ id }) => ({
+            match: { agentId: id },
+            response: { tasks: teamTasks.filter((task) => task.agentId === id) },
+          })),
+          { response: { tasks: teamTasks } },
+        ],
+      },
+      "tasks.get": {
+        cases: teamTasks.map((task) => ({
+          match: { taskId: task.id },
+          response: { task },
+        })),
+      },
+      "cron.list": {
+        cases: [
+          ...rosterAgents.flatMap(({ id }) =>
+            cronMocks["cron.list"].cases.map((entry) => {
+              const jobs = entry.response.jobs.filter((job) => job.agentId === id);
+              return {
+                match: { ...entry.match, agentId: id },
+                response: { ...entry.response, jobs, total: jobs.length },
+              };
+            }),
+          ),
+          ...cronMocks["cron.list"].cases,
+        ],
+      },
+    };
+    scenario.sessions = rosterSessions;
+    scenario.repeatingSessionEvents = { events: [] };
+    scenario.sessionGroups = [];
+  }
+  return scenario;
 }
 
 function escapeScriptContent(script: string): string {
@@ -3539,16 +3555,45 @@ async function createMockGatewayPlugin(
   scenario: ControlUiMockGatewayScenario,
   fixture?: CliOptions["fixture"],
 ): Promise<Plugin> {
-  const prepared = await prepareControlUiMockGatewayScenario(scenario);
+  const prepared = await prepareControlUiMockGatewayScenario(
+    fixture === "workboard-states" ? { ...scenario, nativePlugins: [] } : scenario,
+  );
+  if (fixture === "workboard-states") {
+    const { assets, catalog } = await buildWorkboardStatesAssets();
+    for (const [url, asset] of assets) {
+      prepared.assets.set(url, asset);
+    }
+    prepared.scenario = {
+      ...prepared.scenario,
+      featureMethods: [
+        ...new Set([
+          ...(prepared.scenario.featureMethods ?? []),
+          "plugins.controlUi.list",
+          "plugins.controlUi.report",
+        ]),
+      ],
+      methodResponses: {
+        ...prepared.scenario.methodResponses,
+        "plugins.controlUi.list": catalog,
+        "plugins.controlUi.report": { ok: true },
+      },
+    };
+  }
   const initScript = escapeScriptContent(createControlUiMockGatewayInitScript(prepared.scenario));
   const sameOriginGatewayScript = escapeScriptContent(createControlUiMockSameOriginGatewayScript());
+  const newAgentWelcome = await buildNewAgentWelcome({
+    engine: { noteAssistantMessage: () => {} },
+  });
   const statefulInitScript = escapeScriptContent(
-    createControlUiPreviewInitScript() +
+    createControlUiPreviewInitScript(newAgentWelcome) +
       skillLibraryMockInitScript(prepared.scenario.models) +
       pluginLifecycleMockInitScript() +
       skillWorkshopMockInitScript(Date.now()) +
-      backgroundTasksMockInitScript(Date.now()) +
-      approvalMockInitScript(fixture === "approval"),
+      (fixture === "sidebar-roster" ? "" : backgroundTasksMockInitScript(Date.now())) +
+      approvalMockInitScript(fixture === "approval") +
+      (fixture === "workboard" || fixture === "workboard-states"
+        ? `(() => { const __name = (target) => target; (${installWorkboardBoardMock.toString()})(${JSON.stringify(buildWorkboardMocks(Date.now(), MOCK_ACTOR_PETER, fixture === "workboard-states"))}); })();`
+        : ""),
   );
   const bootstrapBody = JSON.stringify(createControlUiMockBootstrapConfig(prepared.scenario));
   const pluginIconIds = new Set(
@@ -3662,10 +3707,111 @@ async function createMockGatewayPlugin(
     enforce: "pre",
     name: "openclaw-control-ui-mock-gateway",
     transformIndexHtml(html) {
+      const rosterPreferenceScript = `<script data-openclaw-sidebar-roster>
+        ${fixture === "sidebar-roster" ? 'localStorage.setItem("openclaw:control-ui:community-invite", JSON.stringify({ dismissedAtMs: Date.now() }));' : ""}
+        if (new URLSearchParams(location.search).get("sidebarAgents") === "roster") {
+          const gatewayUrl = window["__OPENCLAW_NATIVE_CONTROL_AUTH__"].gatewayUrl;
+          const key = "openclaw.control.settings.v1:" + gatewayUrl;
+          const prefs = JSON.parse(localStorage.getItem(key) || "{}");
+          localStorage.setItem(key, JSON.stringify({ ...prefs, gatewayUrl, sidebarAgentsMode: "roster" }));
+          localStorage.setItem("openclaw.control.currentGateway.v1:" + new URL(gatewayUrl).origin, gatewayUrl);
+        }
+      </script>`;
       return html.replace(
         "</head>",
-        `${attachmentThemeToggle}    <script data-openclaw-control-ui-mock-storage>\n      try {\n        localStorage.setItem("openclaw.i18n.locale", "en");\n      } catch {}\n    </script>\n    <script data-openclaw-control-ui-mock-gateway>\n${sameOriginGatewayScript}\n${initScript}\n${statefulInitScript}\n    </script>\n  </head>`,
+        `${attachmentThemeToggle}    <script data-openclaw-control-ui-mock-storage>\n      try {\n        localStorage.setItem("openclaw.i18n.locale", "en");\n      } catch {}\n    </script>\n    <script data-openclaw-control-ui-mock-gateway>\n${sameOriginGatewayScript}\n${initScript}\n${statefulInitScript}\n    </script>\n${rosterPreferenceScript}\n  </head>`,
       );
+    },
+  };
+}
+
+async function buildWorkboardStatesAssets() {
+  const { build } = await import("esbuild");
+  const rootDir = path.join(repoRoot, "extensions/workboard");
+  const entry = path.join(rootDir, "browser/index.ts");
+  let transformed = false;
+  const result = await build({
+    absWorkingDir: rootDir,
+    entryPoints: { index: entry },
+    outdir: path.join(rootDir, "dist/control-ui/fixture"),
+    platform: "browser",
+    target: "es2022",
+    format: "esm",
+    bundle: true,
+    write: false,
+    minify: true,
+    legalComments: "none",
+    sourcemap: false,
+    tsconfigRaw: {
+      compilerOptions: { experimentalDecorators: true, useDefineForClassFields: false },
+    },
+    alias: buildPluginLoaderAliasMap(entry, process.argv[1], import.meta.url, "src"),
+    plugins: [
+      {
+        name: "workboard-state-projections",
+        setup(builder) {
+          builder.onLoad(
+            { filter: /[/\\]pages[/\\]workboard[/\\]view-card\.ts$/ },
+            async ({ path: sourcePath }) => {
+              const source = await fs.promises.readFile(sourcePath, "utf8");
+              const lifecycleImport =
+                /\bgetWorkboardLifecycle,(?=[\s\S]*?from "\.\.\/\.\.\/lib\/workboard\/index\.ts")/g;
+              const alertImport =
+                /\bgetCardAlerts,(?=[\s\S]*?from "\.\.\/\.\.\/lib\/workboard\/card-alerts\.ts")/g;
+              if (
+                [...source.matchAll(lifecycleImport)].length !== 1 ||
+                [...source.matchAll(alertImport)].length !== 1
+              ) {
+                throw new Error(
+                  "Workboard state fixture import seam changed; update its exact import transform.",
+                );
+              }
+              transformed = true;
+              return {
+                loader: "ts",
+                resolveDir: path.dirname(sourcePath),
+                contents:
+                  source.replace(lifecycleImport, "").replace(alertImport, "") +
+                  `\nimport { getFixtureLifecycle as getWorkboardLifecycle, getFixtureAlerts as getCardAlerts } from ${JSON.stringify(fileURLToPath(new URL("./control-ui-workboard-state-projections.ts", import.meta.url)))};\n`,
+              };
+            },
+          );
+        },
+      },
+    ],
+  });
+  if (!transformed) {
+    throw new Error("Workboard state fixture did not reach the real card renderer.");
+  }
+  const revision = createHash("sha256");
+  for (const file of result.outputFiles) {
+    revision.update(file.contents);
+  }
+  const hash = revision.digest("hex");
+  const prefix = `${controlUiPluginAssetPrefix("workboard")}${hash}/`;
+  const assets = new Map(
+    result.outputFiles.map((file) => [
+      `${prefix}${path.basename(file.path)}`,
+      {
+        body: Buffer.from(file.contents),
+        contentType: file.path.endsWith(".css") ? "text/css" : "text/javascript",
+      },
+    ]),
+  );
+  return {
+    assets,
+    catalog: {
+      revision: hash,
+      diagnostics: [],
+      plugins: [
+        {
+          pluginId: "workboard",
+          name: "workboard",
+          revision: hash,
+          entryUrl: `${prefix}index.js`,
+          styles: [`${prefix}index.css`],
+        },
+      ],
     },
   };
 }

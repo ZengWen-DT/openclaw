@@ -9,6 +9,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { sliceUtf16Safe, truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { publishTranscriptUpdate } from "../config/sessions/session-accessor.js";
 import type { TranscriptEntryAnchor } from "../config/sessions/transcript-entry-anchor.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   boundedJsonUtf8Bytes,
   firstEnumerableOwnKeys,
@@ -51,6 +52,7 @@ import {
 } from "./tool-call-id.js";
 import {
   copyCodeModeSourceAppend,
+  copyCodeModeSourceAppendOptions,
   prepareCodeModeSourceAppend,
   withCodeModeSourceAppend,
   type CodeModeSourceAppend,
@@ -648,7 +650,7 @@ export function installSessionToolResultGuard(
       event: PluginHookBeforeMessageWriteEvent,
       sourceAppend?: CodeModeSourceAppend,
     ) => PluginHookBeforeMessageWriteResult | undefined;
-    redactLoggingConfig?: ToolResultDetailRedactionConfig;
+    config?: OpenClawConfig;
     maxToolResultChars?: number;
     suppressNextUserMessagePersistence?: boolean;
     suppressTranscriptOnlyAssistantPersistence?: boolean;
@@ -663,6 +665,7 @@ export function installSessionToolResultGuard(
     ) => string;
   },
 ): {
+  hasPendingToolResults: () => boolean;
   flushPendingToolResults: () => void;
   clearPendingToolResults: () => void;
   clearNextUserMessagePersistenceSuppression: () => void;
@@ -693,7 +696,7 @@ export function installSessionToolResultGuard(
   const missingToolResultText = opts?.missingToolResultText;
   const beforeWrite = opts?.beforeMessageWriteHook;
   const toolResultTransformerMayMutate = opts?.transformToolResultForPersistence !== undefined;
-  const redactionConfig = opts?.redactLoggingConfig;
+  const redactionConfig = opts?.config?.logging;
   const maxToolResultChars = resolveMaxToolResultChars(opts);
   const transcriptSeqByEntryId: TranscriptSeqByEntryId = new Map();
   let transcriptRunId = opts?.runId;
@@ -721,14 +724,23 @@ export function installSessionToolResultGuard(
       anchor,
       appended,
       message: persistedMessage,
-    } = withRuntimeUserTurnTranscriptRecorder(runOwnedMessage, () =>
-      originalAppendWithTranscriptAnchor(
+    } = withRuntimeUserTurnTranscriptRecorder(runOwnedMessage, (beforeFreshMessageCommit) => {
+      // SQLite redacts again, so it must resolve the guard's same policy.
+      const appendOptions =
+        opts?.config || beforeFreshMessageCommit
+          ? copyCodeModeSourceAppendOptions(options, {
+              ...options,
+              ...(opts?.config ? { config: opts.config } : {}),
+              ...(beforeFreshMessageCommit ? { beforeFreshMessageCommit } : {}),
+            })
+          : options;
+      return originalAppendWithTranscriptAnchor(
         runOwnedMessage as never,
         sourceAppend
-          ? prepareCodeModeSourceAppend(options ?? {}, runOwnedMessage, sourceAppend)
-          : options,
-      ),
-    );
+          ? prepareCodeModeSourceAppend(appendOptions ?? {}, runOwnedMessage, sourceAppend)
+          : appendOptions,
+      );
+    });
     // Destructive tool-side state commits only after this exact result is durable.
     acknowledgeInternalToolResult(acknowledgementSource);
     const persistedId =
@@ -1041,6 +1053,7 @@ export function installSessionToolResultGuard(
   sessionManager.appendCompaction = guardedAppendCompaction;
 
   return {
+    hasPendingToolResults: () => pending.size > 0,
     flushPendingToolResults,
     clearPendingToolResults,
     clearNextUserMessagePersistenceSuppression: () => {

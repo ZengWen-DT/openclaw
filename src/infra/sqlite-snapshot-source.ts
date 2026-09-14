@@ -6,19 +6,73 @@ import {
 } from "./sqlite-private-directory.js";
 import {
   adoptPreparedLocation,
+  removeTempDirectory,
+  removeTempDirectoryAsync,
+} from "./sqlite-readonly-location-cleanup.js";
+import {
   createSqliteSnapshotStagingDirectory,
   prepareSqliteReadOnlyLocationInProcess,
   prepareSqliteReadOnlyLocationSyncInProcess,
-  removeTempDirectory,
   SQLITE_SNAPSHOT_STAGING_PREFIX,
-  type PreparedSqliteReadOnlyLocation,
 } from "./sqlite-readonly-location.js";
+import type { PreparedSqliteReadOnlyLocation } from "./sqlite-readonly-location.types.js";
 import { runSqliteReadOnlyWorker, runSqliteReadOnlyWorkerSync } from "./sqlite-readonly-worker.js";
+import {
+  readSqliteSchemaHeaderFromSnapshotAsync,
+  type SqliteSchemaHeader,
+} from "./sqlite-schema-header.js";
 import { withSqliteSourceHandleAsync } from "./sqlite-source-handle.js";
 import {
   hasStateDatabaseSourceExclusion,
+  prepareStateDatabaseCanonicalMutation,
   prepareStateDatabaseMutationSnapshot,
 } from "./state-database-coordinator.js";
+
+/** Inspect metadata without copying the payload. Exclusive task-local scopes
+ * must use their snapshot owner: a child cannot borrow that source authority. */
+export async function inspectSqliteSchemaHeader(
+  pathname: string,
+  options: { signal?: AbortSignal; agentSchemaVersionForOwnership?: number } = {},
+) {
+  options.signal?.throwIfAborted();
+  if (
+    prepareStateDatabaseCanonicalMutation(pathname) ||
+    hasStateDatabaseSourceExclusion(pathname)
+  ) {
+    const prepared = await prepareSqliteReadOnlyLocation(pathname, options);
+    return readSqliteSchemaHeaderFromSnapshotAsync(
+      prepared,
+      options.signal,
+      options.agentSchemaVersionForOwnership,
+    );
+  }
+  // Reserve cleanup ownership before launch even if only journal recovery will
+  // need a copy. Cancellation joins the child before deleting unpublished bytes.
+  const stagingRoot = await createSqliteSnapshotStagingDirectory();
+  let header: SqliteSchemaHeader;
+  try {
+    options.signal?.throwIfAborted();
+    header = await runSqliteReadOnlyWorker(pathname, {
+      mode: "schema-header",
+      stagingRoot,
+      signal: options.signal,
+      agentSchemaVersionForOwnership: options.agentSchemaVersionForOwnership,
+    });
+    options.signal?.throwIfAborted();
+  } catch (error) {
+    if (!(await removeTempDirectoryAsync(stagingRoot))) {
+      throw new Error(`SQLite read-only worker snapshot cleanup failed: ${stagingRoot}`, {
+        cause: error,
+      });
+    }
+    throw error;
+  }
+  if (!(await removeTempDirectoryAsync(stagingRoot))) {
+    throw new Error(`SQLite read-only worker snapshot cleanup failed: ${stagingRoot}`);
+  }
+  options.signal?.throwIfAborted();
+  return header;
+}
 
 // Keep parent launch orchestration out of the native snapshot child's import graph.
 export async function prepareSqliteReadOnlyLocation(
@@ -35,7 +89,7 @@ export async function prepareSqliteReadOnlyLocation(
         options.signal?.throwIfAborted();
         return prepared;
       } catch (error) {
-        prepared.cleanup();
+        await prepared.cleanupAsync();
         throw error;
       }
     }
@@ -47,7 +101,7 @@ export async function prepareSqliteReadOnlyLocation(
         options.signal?.throwIfAborted();
         return prepared;
       } catch (error) {
-        prepared.cleanup();
+        await prepared.cleanupAsync();
         throw error;
       }
     }
@@ -65,7 +119,7 @@ export async function prepareSqliteReadOnlyLocation(
     // read-only handles report false so their owner can retry close.
     return adoptPreparedLocation(location, stagingRoot, options.signal !== undefined);
   } catch (error) {
-    if (stagingRoot && !removeTempDirectory(stagingRoot)) {
+    if (stagingRoot && !(await removeTempDirectoryAsync(stagingRoot))) {
       throw new Error(`SQLite read-only worker snapshot cleanup failed: ${stagingRoot}`, {
         cause: error,
       });
@@ -139,6 +193,6 @@ export async function withSqliteSnapshotSource<T>(
       return await operation(prepared.location);
     }
   } finally {
-    prepared?.cleanup();
+    await prepared?.cleanupAsync();
   }
 }

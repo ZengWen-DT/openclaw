@@ -105,6 +105,10 @@ export const RUNTIME_FIELD_HELP: Record<string, string> = {
     "Model-backed exec reviewer used by auto mode before human approval fallback. Configure a narrow model override here when you want exec review isolated from the main agent model.",
   "tools.exec.reviewer.model":
     "Optional provider/model override for the exec reviewer agent. Omit to reuse the configured primary model for the target agent.",
+  "tools.exec.reviewer.thinking":
+    "Optional reasoning effort for OpenClaw model-backed approval reviews: minimal, low, medium, high, xhigh, or max. Omit to preserve provider defaults. Supported levels are normalized for the selected model. Does not configure native Codex Guardian.",
+  "tools.exec.reviewer.fastMode":
+    "Optional Fast mode for OpenClaw approval reviews: true requests priority processing on supported OpenAI Responses and ChatGPT/OAuth routes; false requests standard processing. Omit to preserve provider defaults. Fast mode may cost more and is subject to provider availability. Does not configure native Codex Guardian.",
   "tools.exec.reviewer.timeoutMs":
     "Per-stage exec reviewer timeout in milliseconds for model preparation and completion before falling back to human approval (default: 30000).",
   "tools.exec.node":
@@ -265,7 +269,7 @@ export const RUNTIME_FIELD_HELP: Record<string, string> = {
   "gateway.reload.mode":
     'Controls how config edits are applied: "off" ignores live edits and "hybrid" applies hot-safe changes then restarts when required.',
   "gateway.nodes.browser.mode":
-    'Node browser routing ("auto" = pick single connected browser node, "manual" = require node param, "off" = disable).',
+    'Node browser routing ("auto" = prefer the host browser, use a single connected browser node when local capability is unavailable; "manual" = require an explicit node selection or configured pin; "off" = disable node routing).',
   "gateway.nodes.browser.node": "Pin browser routing to a specific node id or name (optional).",
   "gateway.nodes.pairing":
     "Node pairing policy settings. SSH-verified auto-approval is enabled by default; CIDR auto-approval stays disabled unless explicit trusted CIDR/IP allowlists are configured.",
@@ -355,11 +359,19 @@ export const RUNTIME_FIELD_HELP: Record<string, string> = {
   "bindings[].acp.backend":
     "ACP backend override for this binding (falls back to agent runtime ACP backend, then global acp.backend).",
   broadcast:
-    "Broadcast routing map for sending the same outbound message to multiple peer IDs per source conversation. Keep this minimal and audited because one source can fan out to many destinations.",
+    "Use agent group threads to run several configured agents on one inbound conversation, each in its own session. Channel-qualified entries support bounded follow-up rounds; legacy WhatsApp peer arrays retain single-pass behavior.",
   "broadcast.strategy":
-    'Delivery order for broadcast fan-out: "parallel" sends to all targets concurrently, while "sequential" sends one-by-one. Use "parallel" for speed and "sequential" for stricter ordering/backpressure control.',
+    'Participant execution order: "parallel" (default) runs agents concurrently, while "sequential" runs them in configured order. Each round completes before the next begins.',
   "broadcast.*":
-    "Per-source broadcast destination list where each key is a source peer ID and the value is an array of destination peer IDs. Keep lists intentional to avoid accidental message amplification.",
+    'Use a channel-qualified peer ID (for example "telegram:-100123") to configure an array of agent IDs or a strict object with agents, mentionGating, maxRounds, and maxTurns. Qualified entries take precedence over legacy WhatsApp peer keys and allow at most 16 agents.',
+  "broadcast.*.agents":
+    "Participant agent IDs from agents.entries (maximum: 16). Each participant uses its own session for this channel, account, conversation, and thread.",
+  "broadcast.*.mentionGating":
+    "Select only explicitly @mentioned participants when any match; otherwise run all participants (default: true). Bare names or emoji do not select participants. Channel allowlists and admission rules still apply.",
+  "broadcast.*.maxRounds":
+    "Maximum rounds per inbound message, including the initial round (integer: 1–4, default: 1). Follow-up rounds share bounded, attributed sibling replies and stop when every participant passes.",
+  "broadcast.*.maxTurns":
+    "Maximum participant turns per inbound message across all rounds (integer: 1–32, default: agents.length). Slots are reserved before parallel dispatch; this bounds agent turns, not physical message chunks or tool sends. Budgets do not resume after restart.",
   "diagnostics.flags":
     'Enable targeted diagnostics logs by flag (e.g. ["telegram.http"]). Supports wildcards like "telegram.*" or "*".',
   "diagnostics.enabled":

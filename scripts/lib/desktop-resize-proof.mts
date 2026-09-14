@@ -57,6 +57,80 @@ function reportInteger(value: unknown, maximum: number) {
   return Number(value);
 }
 
+function nullableFramebuffer(value: unknown) {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new Error("Invalid desktop framebuffer diagnostic");
+  }
+  return {
+    width: reportInteger(value.width, 8192),
+    height: reportInteger(value.height, 8192),
+  };
+}
+
+function desktopSocketCloses(value: unknown) {
+  if (value === null) {
+    return null;
+  }
+  if (!Array.isArray(value) || value.length > 8) {
+    throw new Error("Invalid desktop socket close diagnostics");
+  }
+  return value.map((event) => {
+    const category = (
+      [
+        "takeover",
+        "authority-revoked",
+        "stream-close",
+        "authentication",
+        "other",
+        "unknown",
+      ] as const
+    ).find((candidate) => isRecord(event) && candidate === event.category);
+    if (!isRecord(event) || typeof event.wasClean !== "boolean" || !category) {
+      throw new Error("Invalid desktop socket close diagnostic");
+    }
+    return {
+      socketIndex: reportInteger(event.socketIndex, 9_999),
+      code: reportInteger(event.code, 65_535),
+      wasClean: event.wasClean,
+      category,
+    };
+  });
+}
+
+function desktopViewerResizeFailure(value: unknown) {
+  if (!isRecord(value) || typeof value.pageClosed !== "boolean") {
+    throw new Error("Invalid desktop viewer diagnostic");
+  }
+  const snapshotStatus = (["available", "unavailable", "timed-out"] as const).find(
+    (status) => status === value.snapshotStatus,
+  );
+  const latestReadyState = value.latestReadyState;
+  if (
+    !snapshotStatus ||
+    (latestReadyState !== null &&
+      latestReadyState !== 0 &&
+      latestReadyState !== 1 &&
+      latestReadyState !== 2 &&
+      latestReadyState !== 3)
+  ) {
+    throw new Error("Invalid desktop viewer snapshot state");
+  }
+  return {
+    expected: geometry(value.expected),
+    lastFramebuffer: nullableFramebuffer(value.lastFramebuffer),
+    snapshotStatus,
+    pageClosed: value.pageClosed,
+    canvasCount: value.canvasCount === null ? null : reportInteger(value.canvasCount, 10_000),
+    snapshotFramebuffer: nullableFramebuffer(value.snapshotFramebuffer),
+    socketCount: value.socketCount === null ? null : reportInteger(value.socketCount, 10_000),
+    latestReadyState,
+    socketCloses: desktopSocketCloses(value.socketCloses),
+  };
+}
+
 function publicTestFailure(value: unknown) {
   if (typeof value !== "string" || value.length > 64 * 1024) {
     throw new Error("Invalid desktop test failure");
@@ -138,6 +212,9 @@ export function desktopProofTestReport(value: unknown) {
                 }
               : null,
             failures: test.failureMessages.map(publicTestFailure),
+            ...(test.status === "failed" && meta.desktopViewerResizeFailure !== undefined
+              ? { viewerResize: desktopViewerResizeFailure(meta.desktopViewerResizeFailure) }
+              : {}),
           };
         }),
       };

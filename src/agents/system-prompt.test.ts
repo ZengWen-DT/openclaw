@@ -612,8 +612,11 @@ describe("buildAgentSystemPrompt", () => {
     expect(presentation).toContain("`show_widget`");
     expect(presentation).toContain("pin=true");
     expect(presentation).toContain("result.presentation");
-    expect(presentation).toContain("inline support varies by surface");
+    expect(presentation).toContain("this turn's schema");
+    expect(presentation).toContain("status=pinned means the widget is on the session dashboard");
     expect(presentation).toContain("`dashboard`");
+    expect(presentation).toContain('action="focus_tab" with its tabId');
+    expect(presentation).toContain("do not open hosting URLs as browser pages");
     expect(presentation).toContain("`portal`");
     expect(presentation).toContain("publicUrl");
     expect(presentation).toContain("token URLs stay private");
@@ -1300,7 +1303,7 @@ describe("buildAgentSystemPrompt", () => {
     expect(prompt).not.toContain("config.apply");
     expect(prompt).not.toContain("`config.schema.lookup|get|patch|apply`, `restart`");
     expect(prompt).toContain(
-      "Update OpenClaw: `gateway` action update.run, only on explicit user request; restart and completion notice are automatic.",
+      "Update OpenClaw: `gateway` action update.run, only on an explicit owner request; the runtime coordinates restart and completion notices.",
     );
     expect(prompt).toContain(
       "Never run openclaw update, npm install -g openclaw, or stop/restart the gateway service via exec.",

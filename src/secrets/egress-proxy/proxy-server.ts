@@ -6,11 +6,11 @@ import {
   type IncomingHttpHeaders,
   type IncomingMessage,
 } from "node:http";
-import { Agent as HttpsAgent, createServer as createHttpsServer } from "node:https";
+import { Agent as HttpsAgent } from "node:https";
 import net, { type Socket } from "node:net";
 import path from "node:path";
 import type { Duplex, Readable, Writable } from "node:stream";
-import { rootCertificates } from "node:tls";
+import { createServer as createTlsServer, rootCertificates } from "node:tls";
 import { URL } from "node:url";
 import { normalizeExactAllowedHost as normalizeHostname } from "../exact-hostname.js";
 import {
@@ -25,6 +25,7 @@ import {
   type SecretEgressTlsContext,
 } from "./certificates.js";
 import {
+  createSecretEgressBodyBudget,
   forwardSecretEgressRequest,
   handleUpgradeRequest,
   REFUSAL_BODY,
@@ -227,8 +228,6 @@ function swapRequestHeaders(params: {
       output[name] = swapped.value;
     }
   }
-  delete output["content-length"];
-  delete output["transfer-encoding"];
   return { headers: output, substituted };
 }
 
@@ -252,6 +251,7 @@ export async function startSecretEgressProxyServer(params: {
       ? undefined
       : new Set(params.allowedHosts.map(normalizeHostname));
   const registrations = new Map<string, RegisteredRun>();
+  const acquireBody = createSecretEgressBodyBudget();
   const sockets = new Set<Socket>();
   let stopped = false;
   let stopPromise: Promise<void> | undefined;
@@ -382,46 +382,38 @@ export async function startSecretEgressProxyServer(params: {
       forward.request.resume();
       return;
     }
-    let substituted = false;
-    let target: URL;
-    let headers: IncomingHttpHeaders;
-    try {
-      const swappedUrl = swapRequestText({
-        value: forward.target.toString(),
-        urlMode: true,
-        host,
-        registered: forward.registered,
-      });
-      target = new URL(swappedUrl.value);
-      const swappedHeaders = swapRequestHeaders({
-        headers: forward.request.headers,
-        host,
-        registered: forward.registered,
-      });
-      headers = swappedHeaders.headers;
-      headers.host = target.host;
-      substituted = swappedUrl.substituted || swappedHeaders.substituted;
-    } catch (error) {
-      const reason =
-        error instanceof SecretEgressSubstitutionError ? error.reason : "unresolved-sentinel";
-      audit({ kind: "refused", host, substituted, reason });
-      sendHttpRefusal(
-        forward.response,
-        502,
-        error instanceof SecretEgressSubstitutionError ? `${error.message}\n` : REFUSAL_BODY,
-      );
-      forward.request.resume();
-      return;
-    }
 
     forwardSecretEgressRequest({
       request: forward.request,
       response: forward.response,
       upgrade: forward.upgrade,
-      target,
-      headers,
       host,
-      substituted,
+      acquireBody,
+      prepareRequest: () => {
+        if (!hostAllowed(host, forward.registered)) {
+          const error = new SecretEgressSubstitutionError("host-not-allowed");
+          error.message = hostNotAllowedBody(host).trimEnd();
+          throw error;
+        }
+        const swappedUrl = swapRequestText({
+          value: forward.target.toString(),
+          urlMode: true,
+          host,
+          registered: forward.registered,
+        });
+        const target = new URL(swappedUrl.value);
+        const swappedHeaders = swapRequestHeaders({
+          headers: forward.request.headers,
+          host,
+          registered: forward.registered,
+        });
+        swappedHeaders.headers.host = target.host;
+        return {
+          target,
+          headers: swappedHeaders.headers,
+          substituted: swappedUrl.substituted || swappedHeaders.substituted,
+        };
+      },
       upstreamTlsAgent,
       isActive: forward.registered.isActive,
       ownResource: (resource) => ownResource(forward.registered, resource),
@@ -452,11 +444,26 @@ export async function startSecretEgressProxyServer(params: {
               forwardRequest({ request, response, ...parsed, registered, upgrade });
             }
           };
-          return createHttpsServer(leaf, handleRequest)
-            .on("upgrade", (request, _socket, head) =>
-              handleUpgradeRequest(handleRequest, request, head),
-            )
-            .on("secureConnection", (socket) => ownResource(registered, socket));
+          const httpServer = createHttpServer(handleRequest).on(
+            "upgrade",
+            (request, _socket, head) => handleUpgradeRequest(handleRequest, request, head),
+          );
+          const tlsServer = createTlsServer(leaf).on("secureConnection", (socket) => {
+            ownResource(registered, socket);
+            httpServer.emit("connection", socket);
+          });
+          tlsServer.on("tlsClientError", (_error, socket) => socket.destroy());
+          return {
+            // oxlint-disable-next-line no-warning-comments -- remove after the upstream Bun HTTPS fix ships.
+            // TODO(bun): Remove the split TLS/HTTP endpoint once Bun ships
+            // https://github.com/oven-sh/bun/pull/42594.
+            acceptConnection: (socket) => tlsServer.emit("connection", socket),
+            close: () => {
+              tlsServer.close();
+              httpServer.close();
+            },
+            setSecureContext: (options) => tlsServer.setSecureContext(options),
+          };
         },
       });
       registered.tlsServers.set(key, context);
@@ -570,7 +577,7 @@ export async function startSecretEgressProxyServer(params: {
         if (head.length > 0) {
           clientSocket.unshift(head);
         }
-        tlsServer.emit("connection", clientSocket);
+        tlsServer.acceptConnection(clientSocket);
       } catch (error) {
         if (!authorization.isActive() || clientSocket.destroyed) {
           return;
@@ -645,6 +652,7 @@ export async function startSecretEgressProxyServer(params: {
         SSL_CERT_FILE: trustBundlePath,
         CURL_CA_BUNDLE: trustBundlePath,
         REQUESTS_CA_BUNDLE: trustBundlePath,
+        GIT_SSL_CAINFO: trustBundlePath,
       };
     },
     revokeRun: (run) => {

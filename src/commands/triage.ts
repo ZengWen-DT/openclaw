@@ -96,20 +96,19 @@ async function confirmAutomaticUpdateTriage(
   try {
     answer = await confirm({
       message: stylePromptMessage(
-        `Open ${agent} to diagnose and repair the installation now? [Y/n]`,
+        `Open ${agent} to diagnose and repair the installation now? [y/N]`,
       ),
-      initialValue: true,
+      initialValue: false,
       signal: signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal,
     });
   } finally {
     clearTimeout(timer);
   }
-  // Abort settles Clack and restores stdin before handing the terminal to an agent.
+  // Abort settles Clack and restores stdin, but never grants consent to run an agent.
   if (timeout.signal.aborted && !signal?.aborted) {
-    runtime.log(`No answer; continuing with ${agent}`);
-    return true;
+    runtime.log("No answer; skipping automatic repair.");
   }
-  return !signal?.aborted && answer === true;
+  return !timeout.signal.aborted && !signal?.aborted && answer === true;
 }
 
 async function collectTriageBundle(
@@ -174,6 +173,7 @@ async function readPendingTriageUpdateFailure(
           exitCode: step.log?.exitCode ?? null,
           stderrTail: step.log?.stderrTail,
           stdoutTail: step.log?.stdoutTail,
+          failureFacts: step.failureFacts,
         })),
       },
     },

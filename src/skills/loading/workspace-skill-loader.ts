@@ -9,6 +9,7 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { shouldRejectHardlinkedPluginFiles } from "../../plugins/hardlink-policy.js";
 import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
+import { prepareBinaryAvailability } from "../../shared/config-eval.js";
 import { CONFIG_DIR, resolveUserPath } from "../../utils.js";
 import {
   isSessionSkillEnabled,
@@ -115,11 +116,12 @@ function filterSkillEntries(
   skillFilter?: string[],
   skillOverrides?: Readonly<Record<string, boolean>>,
   eligibility?: SkillEligibilityContext,
+  hasBin?: (bin: string) => boolean,
 ): SkillEntry[] {
   const bundledAllowlist = resolveBundledAllowlist(config);
   assertUnambiguousManagedSkillNames(entries);
   let filtered = entries.filter((entry) =>
-    shouldIncludeSkill({ entry, config, bundledAllowlist, eligibility }),
+    shouldIncludeSkill({ entry, config, bundledAllowlist, eligibility, hasBin }),
   );
   if (skillFilter !== undefined || skillOverrides !== undefined) {
     const normalized = normalizeSkillFilter(skillFilter) ?? [];
@@ -356,7 +358,7 @@ function resolveEffectiveWorkspaceSkillFilter(opts?: {
   return resolveEffectiveAgentSkillFilter(opts.config, opts.agentId);
 }
 
-export function resolveWorkspaceSkillPromptEntries(
+export async function resolveWorkspaceSkillPromptEntries(
   workspaceDir: string,
   opts?: {
     executionWorkspaceDir?: string;
@@ -370,38 +372,149 @@ export function resolveWorkspaceSkillPromptEntries(
     skillOverrides?: Record<string, boolean>;
     eligibility?: SkillEligibilityContext;
     pluginMetadataSnapshot?: PluginMetadataSnapshot;
+    assertCurrent?: () => void;
   },
-): { eligible: SkillEntry[]; skillFilter: string[] | undefined } {
-  const skillFilter = resolveEffectiveWorkspaceSkillFilter(opts);
-  const skillEntries = opts?.entries ?? loadSkillEntries(workspaceDir, opts);
-  return {
-    eligible: filterSkillEntries(
+): Promise<{ eligible: SkillEntry[]; skillFilter: string[] | undefined }> {
+  for (;;) {
+    opts?.assertCurrent?.();
+    const sourceVersion = getSkillsSnapshotVersion(workspaceDir);
+    const skillFilter = resolveEffectiveWorkspaceSkillFilter(opts);
+    const skillEntries = opts?.entries ?? loadSkillEntries(workspaceDir, opts);
+    const probe = await prepareSkillBinaryProbe(skillEntries, opts, opts?.assertCurrent);
+    if (
+      probe.needsRetry() ||
+      (!opts?.entries && getSkillsSnapshotVersion(workspaceDir) !== sourceVersion)
+    ) {
+      continue;
+    }
+    const eligible = filterSkillEntries(
       skillEntries,
       opts?.config,
       skillFilter,
       opts?.skillOverrides,
       opts?.eligibility,
-    ),
-    skillFilter,
+      probe.hasBin,
+    );
+    opts?.assertCurrent?.();
+    if (probe.needsRetry()) {
+      continue;
+    }
+    return { eligible, skillFilter };
+  }
+}
+
+async function prepareSkillBinaryProbe(
+  entries: SkillEntry[],
+  opts?: Pick<WorkspaceSkillLoadOptions, "config" | "eligibility">,
+  assertCurrent?: () => void,
+) {
+  const bins = new Set<string>();
+  const bundledAllowlist = resolveBundledAllowlist(opts?.config);
+  let needsBinaries: boolean;
+  const recordBinaryRequirement = () => {
+    needsBinaries = true;
+    return true;
+  };
+  for (const entry of entries) {
+    const requires = entry.metadata?.requires;
+    if (!requires?.bins?.length && !requires?.anyBins?.length) {
+      continue;
+    }
+    needsBinaries = false;
+    shouldIncludeSkill({
+      entry,
+      config: opts?.config,
+      bundledAllowlist,
+      eligibility: opts?.eligibility,
+      hasBin: recordBinaryRequirement,
+    });
+    if (needsBinaries) {
+      for (const bin of entry.metadata?.requires?.bins ?? []) {
+        bins.add(bin);
+      }
+      for (const bin of entry.metadata?.requires?.anyBins ?? []) {
+        bins.add(bin);
+      }
+    }
+  }
+  const facts = await prepareBinaryAvailability(bins, assertCurrent);
+  let unprepared = false;
+  return {
+    hasBin: (bin: string) => {
+      // Eligibility can change while probing; prepare newly requested facts before publishing.
+      if (!bins.has(bin)) {
+        unprepared = true;
+        return false;
+      }
+      return facts.hasBinary(bin);
+    },
+    needsRetry: () => unprepared || !facts.isCurrent(),
   };
 }
 
-export function loadWorkspaceSkills(
-  workspaceDir: string,
-  opts?: WorkspaceSkillLoadOptions,
-): SkillEntry[] {
+function resolveWorkspaceSkillLoad(workspaceDir: string, opts?: WorkspaceSkillLoadOptions) {
   const roots = normalizeWorkspaceSkillRoots({
     agentWorkspaceDir: workspaceDir,
     executionWorkspaceDir: opts?.executionWorkspaceDir,
   });
   const entries = loadSkillEntries(roots.agentWorkspaceDir, opts);
   const effectiveSkillFilter = resolveEffectiveWorkspaceSkillFilter(opts);
-  if (
-    !roots.executionWorkspaceDir &&
-    effectiveSkillFilter === undefined &&
-    opts?.skillOverrides === undefined &&
-    opts?.eligibility === undefined
-  ) {
+  return {
+    entries,
+    effectiveSkillFilter,
+    shouldFilter:
+      Boolean(roots.executionWorkspaceDir) ||
+      effectiveSkillFilter !== undefined ||
+      opts?.skillOverrides !== undefined ||
+      opts?.eligibility !== undefined,
+  };
+}
+
+/** Runtime preparation shares discovery and filtering with synchronous SDK inventory reads. */
+export async function prepareWorkspaceSkills(
+  workspaceDir: string,
+  opts?: WorkspaceSkillLoadOptions,
+  assertCurrent?: () => void,
+): Promise<SkillEntry[]> {
+  for (;;) {
+    assertCurrent?.();
+    const sourceVersion = getSkillsSnapshotVersion(workspaceDir);
+    const { entries, effectiveSkillFilter, shouldFilter } = resolveWorkspaceSkillLoad(
+      workspaceDir,
+      opts,
+    );
+    if (!shouldFilter) {
+      return entries;
+    }
+    const probe = await prepareSkillBinaryProbe(entries, opts, assertCurrent);
+    if (probe.needsRetry() || getSkillsSnapshotVersion(workspaceDir) !== sourceVersion) {
+      continue;
+    }
+    const eligible = filterSkillEntries(
+      entries,
+      opts?.config,
+      effectiveSkillFilter,
+      opts?.skillOverrides,
+      opts?.eligibility,
+      probe.hasBin,
+    );
+    assertCurrent?.();
+    if (probe.needsRetry()) {
+      continue;
+    }
+    return eligible;
+  }
+}
+
+export function loadWorkspaceSkills(
+  workspaceDir: string,
+  opts?: WorkspaceSkillLoadOptions,
+): SkillEntry[] {
+  const { entries, effectiveSkillFilter, shouldFilter } = resolveWorkspaceSkillLoad(
+    workspaceDir,
+    opts,
+  );
+  if (!shouldFilter) {
     return entries;
   }
   return filterSkillEntries(

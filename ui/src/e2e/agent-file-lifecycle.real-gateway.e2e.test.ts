@@ -15,6 +15,7 @@ import {
   type OpenClawTestInstance,
 } from "../../../test/helpers/openclaw-test-instance.ts";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
+import type { ModelCatalogResult } from "../api/types.ts";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
 import { pickerValue } from "../test-helpers/select-picker-e2e.ts";
 import {
@@ -43,6 +44,30 @@ const refreshInventoryArgs = [
   "--params",
   JSON.stringify({ agentId: "main", view: "all", refresh: true }),
 ];
+async function refreshInventory() {
+  let result = await catalogInstance.cli(refreshInventoryArgs);
+  expect(result.code, result.stderr).toBe(0);
+  let catalog: ModelCatalogResult = JSON.parse(result.stdout);
+  // Refresh can return the previous inventory while discovery continues.
+  await expect
+    .poll(async () => {
+      if (catalog.pendingProviders?.length) {
+        result = await catalogInstance.cli([
+          "gateway",
+          "call",
+          "models.list",
+          "--json",
+          "--params",
+          JSON.stringify({ agentId: "main", view: "all" }),
+        ]);
+        expect(result.code, result.stderr).toBe(0);
+        catalog = JSON.parse(result.stdout);
+      }
+      return catalog.pendingProviders ?? [];
+    })
+    .toEqual([]);
+  return result;
+}
 const catalogModels = (id: string) => [
   { id: "anchor", name: "Anchor" },
   { id: "selected", name: "Selected" },
@@ -104,9 +129,6 @@ const catalogSuite = createControlUiE2eSuite({
     };
     try {
       await catalogInstance.startGateway();
-      const initialInventory = await catalogInstance.cli(refreshInventoryArgs);
-      expect(initialInventory.code, initialInventory.stderr).toBe(0);
-      expect(initialInventory.stdout).toContain("inventory-before");
       return {
         baseUrl: `http://127.0.0.1:${catalogInstance.port}/`,
         close,
@@ -156,6 +178,9 @@ catalogSuite.define(() => {
       expect(result.code, result.stderr).toBe(0);
     };
     try {
+      const initialInventory = await refreshInventory();
+      expect(initialInventory.code, initialInventory.stderr).toBe(0);
+      expect(initialInventory.stdout).toContain("inventory-before");
       await catalogSuite.withPage(
         {
           locale: "en-US",
@@ -259,8 +284,8 @@ catalogSuite.define(() => {
           }
 
           inventoryModel = "inventory-after";
-          const refreshed = await owner.cli(refreshInventoryArgs);
-          commands.push({ args: refreshInventoryArgs, ...refreshed });
+          const refreshed = await refreshInventory();
+          commands.push({ args: refreshInventoryArgs, publishedInventory: refreshed });
           expect(refreshed.code, refreshed.stderr).toBe(0);
           expect(refreshed.stdout).toContain("inventory-after");
           await expect
@@ -272,32 +297,51 @@ catalogSuite.define(() => {
             await picker.locator('[role="option"][data-value="ollama/inventory-before"]').count(),
           ).toBe(0);
 
+          const settleCatalogFrames = () =>
+            page.evaluate(async () => {
+              // SAFETY: Gateway readiness above establishes this app's connected runtime.
+              const app = document.querySelector("openclaw-app") as HTMLElement & {
+                runtime: { context: { gateway: { snapshot: { client: GatewayBrowserClient } } } };
+              };
+              await app.runtime.context.gateway.snapshot.client.request("health", {});
+              await new Promise<void>((resolve) => {
+                requestAnimationFrame(() => resolve());
+              });
+            });
+
           holdCatalog = true;
           inventoryModel = "inventory-held";
-          commands.push(await owner.cli(refreshInventoryArgs));
-          await expect.poll(() => heldCatalogs.length).toBeGreaterThan(0);
-          holdCatalog = false;
+          commands.push(await refreshInventory());
+          await expect.poll(() => heldCatalogs.length).toBe(1);
+          const readsWhileHeld = catalogRequests.size;
           inventoryModel = "inventory-latest";
-          commands.push(await owner.cli(refreshInventoryArgs));
+          commands.push(await refreshInventory());
+          await settleCatalogFrames();
+          expect(catalogRequests.size).toBe(readsWhileHeld);
+          expect(heldCatalogs).toHaveLength(1);
+
+          // Release the retired read, but keep its queued replacement behind the wire gate.
+          for (const release of heldCatalogs.splice(0)) {
+            release();
+          }
+          await expect.poll(() => heldCatalogs.length).toBe(1);
+          expect(catalogRequests.size).toBe(readsWhileHeld + 1);
+          await settleCatalogFrames();
+          expect(
+            await picker.locator('[role="option"][data-value="ollama/inventory-held"]').count(),
+          ).toBe(0);
+          expect(
+            await picker.locator('[role="option"][data-value="ollama/inventory-after"]').count(),
+          ).toBe(1);
+          holdCatalog = false;
+          for (const release of heldCatalogs.splice(0)) {
+            release();
+          }
           await expect
             .poll(() =>
               picker.locator('[role="option"][data-value="ollama/inventory-latest"]').count(),
             )
             .toBe(1);
-          for (const release of heldCatalogs) {
-            release();
-          }
-          // Fence the released replies on this connection before checking that stale data was ignored.
-          await page.evaluate(async () => {
-            // SAFETY: Gateway readiness above establishes this app's connected runtime.
-            const app = document.querySelector("openclaw-app") as HTMLElement & {
-              runtime: { context: { gateway: { snapshot: { client: GatewayBrowserClient } } } };
-            };
-            await app.runtime.context.gateway.snapshot.client.request("health", {});
-            await new Promise<void>((resolve) => {
-              requestAnimationFrame(() => resolve());
-            });
-          });
           if (captureEnabled) {
             await page.screenshot({
               path: path.join(catalogSuite.artifactDir, "latest-publication.png"),

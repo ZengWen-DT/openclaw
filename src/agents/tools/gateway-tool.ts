@@ -173,7 +173,6 @@ export function createGatewayTool(options?: {
             sessionKey: caller?.sessionKey,
             deliveryContext,
             note: readToolStringParam(params, "note"),
-            timeoutMs: DEFAULT_UPDATE_TIMEOUT_MS,
           },
           {
             // An explicit binding prevents the standalone client's remote fallback.
@@ -188,10 +187,12 @@ export function createGatewayTool(options?: {
         throw new ToolInputError(`Action not available: ${action}`);
       }
       const gatewayOpts = readGatewayCallOptions(params);
+      const callConfigGateway = (method: string, requestParams: Record<string, unknown>) =>
+        callGatewayTool(method, gatewayOpts, requestParams, { signal });
 
       if (action === "config.get") {
         const path = readToolStringParam(params, "path");
-        const snapshot = await callGatewayTool("config.get", gatewayOpts, {}, { signal });
+        const snapshot = await callConfigGateway("config.get", {});
         const result = selectGatewayConfigGetResult(snapshot, path);
         return createGatewayConfigGetToolResult(result);
       }
@@ -201,12 +202,7 @@ export function createGatewayTool(options?: {
           label: "path",
         });
         try {
-          const result = await callGatewayTool(
-            "config.schema.lookup",
-            gatewayOpts,
-            { path },
-            { signal },
-          );
+          const result = await callConfigGateway("config.schema.lookup", { path });
           return jsonResult({ ok: true, result });
         } catch (error) {
           if (isConfigSchemaPathNotFoundError(error)) {

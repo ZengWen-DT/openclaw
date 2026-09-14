@@ -127,6 +127,9 @@ export async function createTestSession(
     resourceLoader?: ResourceLoader;
     customTools?: ToolDefinition[];
     contextOverflowRecoveryOwner?: "session" | "caller";
+    withSessionWriteSettlement?: NonNullable<
+      Parameters<typeof createAgentSession>[0]
+    >["withSessionWriteSettlement"];
   } = {},
 ) {
   const model = options.model ?? testModel;
@@ -146,12 +149,14 @@ export async function createTestSession(
   });
   const sessionOptions = {
     model,
+    authStorage,
     noTools: "builtin" as const,
     customTools: options.customTools,
     resourceLoader: options.resourceLoader ?? createResourceLoader(),
     sessionManager,
     settingsManager,
     modelRegistry,
+    withSessionWriteSettlement: options.withSessionWriteSettlement,
   };
   const result = options.contextOverflowRecoveryOwner
     ? await createAgentSessionForEmbeddedRunner(sessionOptions, {

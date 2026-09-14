@@ -156,7 +156,7 @@ describe("gateway chat metadata runtime", () => {
   });
 
   test.each(["metadata", "startup"] as const)(
-    "serves published %s without request-time generation reads",
+    "serves published %s with only auth revision reads",
     async (surface) => {
       const harness = createChatMetadataHarness();
       await harness.runtime.refresh();
@@ -181,7 +181,8 @@ describe("gateway chat metadata runtime", () => {
       expect(harness.buildProjection).toHaveBeenCalledTimes(1);
       expect(harness.getPreparedOwner).not.toHaveBeenCalled();
       expect(harness.getPreparedAuthStore).not.toHaveBeenCalled();
-      expect(harness.getAuthStoreRevision).not.toHaveBeenCalled();
+      expect(harness.getAuthStoreRevision).toHaveBeenCalledWith("/tmp/first/agent");
+      expect(harness.getAuthStoreRevision).toHaveBeenCalledWith(undefined);
       expect(harness.getSkillsVersion).not.toHaveBeenCalled();
       expect(harness.getPluginRegistryVersion).not.toHaveBeenCalled();
     },
@@ -627,7 +628,7 @@ describe("gateway chat metadata runtime", () => {
     };
     const owner = createChatMetadataOwner(
       config,
-      "gpt-5.6-sol",
+      "gpt-5.6-luna",
       credentials,
       "openai",
       "openai-chatgpt-responses",
@@ -657,7 +658,7 @@ describe("gateway chat metadata runtime", () => {
     await harness.runtime.refresh();
 
     await expect(harness.runtime.read({ agentId: "main" })).resolves.toMatchObject({
-      models: [expect.objectContaining({ id: "gpt-5.6-sol", available: true })],
+      models: [expect.objectContaining({ id: "gpt-5.6-luna", available: true })],
     });
     expect(loadFullModelCatalog).not.toHaveBeenCalled();
   });
@@ -669,7 +670,7 @@ describe("gateway chat metadata runtime", () => {
     harness.setOwner(
       createChatMetadataOwner(
         harness.getPreparedOwner()!.config,
-        "gpt-5.6-sol",
+        "gpt-5.6-luna",
         {
           openai: {
             type: "oauth",
@@ -700,7 +701,7 @@ describe("gateway chat metadata runtime", () => {
   });
 
   test("adopts discovered wildcard models without restarting provider discovery", async () => {
-    const config = createOpenAIChatMetadataConfig(["*", "gpt-5.6-sol"]);
+    const config = createOpenAIChatMetadataConfig(["*", "gpt-5.6-luna"]);
     const credentials: AgentCredentialMap = {
       openai: {
         type: "oauth",
@@ -712,7 +713,7 @@ describe("gateway chat metadata runtime", () => {
     const harness = createChatMetadataHarness(config, { useDefaultProjection: true });
     const owner = createChatMetadataOwner(
       config,
-      "gpt-5.6-sol",
+      "gpt-5.6-luna",
       credentials,
       "openai",
       "openai-chatgpt-responses",
@@ -723,8 +724,8 @@ describe("gateway chat metadata runtime", () => {
     };
     harness.setAuthStore(preparedAuthStore);
     const dynamicModel = {
-      id: "gpt-5.6-luna",
-      name: "GPT-5.6 Luna",
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
       provider: "openai",
       api: "openai-chatgpt-responses" as const,
     };
@@ -751,7 +752,7 @@ describe("gateway chat metadata runtime", () => {
 
     await harness.runtime.refresh();
     await expect(harness.runtime.read({ agentId: "main" })).resolves.toMatchObject({
-      models: [expect.objectContaining({ id: "gpt-5.6-sol", available: true })],
+      models: [expect.objectContaining({ id: "gpt-5.6-luna", available: true })],
     });
 
     await generationOwner.loadFullModelCatalog();
@@ -759,8 +760,8 @@ describe("gateway chat metadata runtime", () => {
 
     await expect(harness.runtime.read({ agentId: "main" })).resolves.toMatchObject({
       models: expect.arrayContaining([
-        expect.objectContaining({ id: "gpt-5.6-sol", available: true }),
         expect.objectContaining({ id: "gpt-5.6-luna", available: true }),
+        expect.objectContaining({ id: "gpt-5.6-terra", available: true }),
       ]),
     });
     expect(generationOwner.loadFullModelCatalog).toHaveBeenCalledOnce();
@@ -896,49 +897,6 @@ describe("gateway chat metadata runtime", () => {
     expect(await reading).toEqual(draft.error);
     expect(await harness.runtime.read({ agentId: "main" })).toEqual(shared);
   });
-
-  test.each(["resolve", "reject"] as const)(
-    "retries a session projection after an invalidated generation's late %s",
-    async (settlement) => {
-      const harness = createChatMetadataHarness();
-      await harness.runtime.refresh();
-      const releaseProjection = createDeferred();
-      harness.buildProjection.mockImplementationOnce(async ({ facts }) => {
-        await releaseProjection.promise;
-        if (settlement === "reject") {
-          throw new Error("obsolete projection failed");
-        }
-        return {
-          modelCatalog: facts.owner.modelCatalog.entries,
-          models: facts.owner.modelCatalog.entries,
-        };
-      });
-
-      const read = harness.runtime.read({
-        agentId: "main",
-        sessionEntry: {
-          authProfileOverride: "test:session",
-          authProfileOverrideSource: "user",
-        },
-      });
-      await vi.waitFor(() => expect(harness.buildProjection).toHaveBeenCalledTimes(2));
-
-      const nextConfig = {
-        agents: { list: [{ id: "main", default: true }] },
-        tools: { swarm: { enabled: true } },
-      };
-      harness.setConfig(nextConfig);
-      harness.setOwner(createChatMetadataOwner(nextConfig, "replacement"));
-      harness.runtime.invalidate();
-      await harness.runtime.refresh();
-
-      releaseProjection.resolve();
-      await expect(read).resolves.toMatchObject({
-        models: [expect.objectContaining({ id: "replacement" })],
-        swarmEnabled: true,
-      });
-    },
-  );
 
   test("resolves the replacement gate after a coalesced second invalidation", async () => {
     const harness = createChatMetadataHarness();

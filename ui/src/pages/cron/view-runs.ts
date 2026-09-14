@@ -13,17 +13,19 @@ import { icon } from "../../components/icons.ts";
 import "../../components/web-awesome.ts";
 import { toSanitizedMarkdownHtml } from "../../components/markdown.ts";
 import { i18n, t } from "../../i18n/index.ts";
+import { registerCronEnglish } from "../../i18n/locales/en-cron.ts";
+import { formatDurationCompact, formatDurationHuman } from "../../lib/format-duration.ts";
 import { formatUiExternalText } from "../../lib/format-error.ts";
 import {
-  formatDurationCompact,
-  formatDurationHuman,
   formatRelativeTimestamp,
-  formatMs,
+  createMsFormatter,
   formatCompactTokenCount,
 } from "../../lib/format.ts";
 import { shouldHandleNavigationClick } from "../../lib/navigation-click.ts";
 import { sessionNavigationTarget } from "../../lib/sessions/route-navigation.ts";
 import { cronRunEntryMatchesLink } from "./route-model.ts";
+
+registerCronEnglish();
 
 // Leaf contract: the slice of the cron view props this module needs. Keeping
 // it local (instead of importing CronProps from view.ts) avoids a module
@@ -208,6 +210,7 @@ function renderFilterDropdown(params: {
 }
 
 export function renderRunsSection(props: CronRunsSectionProps) {
+  const formatTimestamp = createMsFormatter();
   const runs = props.runs.toSorted((a, b) =>
     props.runsSortDir === "asc" ? a.ts - b.ts : b.ts - a.ts,
   );
@@ -339,6 +342,7 @@ export function renderRunsSection(props: CronRunsSectionProps) {
                     entry,
                     props.agentId,
                     props.basePath,
+                    formatTimestamp,
                     props.highlightedRunId,
                     props.onNavigateToChat,
                   ),
@@ -398,6 +402,7 @@ function renderRun(
   entry: CronRunLogEntry,
   fallbackAgentId: string,
   basePath: string,
+  formatTimestamp: ReturnType<typeof createMsFormatter>,
   highlightedRunId?: string | null,
   onNavigateToChat?: (sessionKey: string) => void,
 ) {
@@ -444,11 +449,11 @@ function renderRun(
           <div class="cron-run-entry__facts muted">${facts.join(" · ")}</div>
         </div>
         <div class="cron-run-entry__meta">
-          <div>${formatMs(entry.ts)}</div>
+          <div>${formatTimestamp(entry.ts)}</div>
           ${
             typeof entry.runAtMs === "number"
               ? html`<div class="muted">
-                  ${t("cron.runEntry.runAt")} ${formatMs(entry.runAtMs)}
+                  ${t("cron.runEntry.runAt")} ${formatTimestamp(entry.runAtMs)}
                 </div>`
               : nothing
           }

@@ -3,12 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { NODE_WORKER_CAPACITY_EXHAUSTED_ERROR_CODE } from "../infra/node-commands.js";
 import { NODE_WORKER_CAPACITY_MAX } from "../infra/node-runner-inventory.js";
 import * as secretRegistry from "../logging/secret-redaction-registry.js";
 import { resetSecretRedactionRegistryForTest } from "../logging/secret-redaction-registry.test-support.js";
 import * as processTree from "../process/kill-tree.js";
+import * as childAdapter from "../process/supervisor/adapters/child.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
@@ -466,6 +468,9 @@ describe("node worker supervisor", () => {
       HOME: path.join(root, "worker-home"),
       LANG: "en_US.UTF-8",
       LC_TIME: "de_DE.UTF-8",
+      DISPLAY: ":99",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/fixture/bus",
+      XDG_RUNTIME_DIR: path.join(root, "desktop-runtime"),
       NODE_COMPILE_CACHE: path.join(root, "host-compile-cache"),
       NODE_DISABLE_COMPILE_CACHE: "1",
       NODE_EXTRA_CA_CERTS: path.join(root, "private-ca.pem"),
@@ -493,6 +498,9 @@ describe("node worker supervisor", () => {
           HOME: suppliedEnv.HOME,
           LANG: suppliedEnv.LANG,
           LC_TIME: suppliedEnv.LC_TIME,
+          DISPLAY: suppliedEnv.DISPLAY,
+          DBUS_SESSION_BUS_ADDRESS: suppliedEnv.DBUS_SESSION_BUS_ADDRESS,
+          XDG_RUNTIME_DIR: suppliedEnv.XDG_RUNTIME_DIR,
           NODE_EXTRA_CA_CERTS: suppliedEnv.NODE_EXTRA_CA_CERTS,
           NODE_USE_SYSTEM_CA: suppliedEnv.NODE_USE_SYSTEM_CA,
           NODE_COMPILE_CACHE: expect.stringContaining("node-worker-compile-cache"),
@@ -525,15 +533,22 @@ describe("node worker supervisor", () => {
         expect(workerEnv).not.toHaveProperty("HTTPS_PROXY");
         expect(workerEnv).not.toHaveProperty("SUPPLIED_SECRET");
         expect(JSON.stringify(workerEnv)).not.toContain(TEST_WORKER_CREDENTIAL);
-        const platformInjectedKeys =
-          process.platform === "darwin" ? ["__CF_USER_TEXT_ENCODING"] : [];
-        expect(Object.keys(workerEnv).toSorted()).toEqual(
-          [...Object.keys(expectedWorkerEnv), ...platformInjectedKeys]
-            .filter(
-              (key) => expectedWorkerEnv[key] !== undefined || platformInjectedKeys.includes(key),
-            )
+        const platformInjectedKeys = new Set(
+          process.platform === "darwin" ? ["__CF_USER_TEXT_ENCODING"] : [],
+        );
+        expect(
+          Object.keys(workerEnv)
+            .filter((key) => !platformInjectedKeys.has(key))
+            .toSorted(),
+        ).toEqual(
+          Object.keys(expectedWorkerEnv)
+            .filter((key) => expectedWorkerEnv[key] !== undefined)
             .toSorted(),
         );
+        if (workerEnv["__CF_USER_TEXT_ENCODING"] !== undefined) {
+          expect(process.platform).toBe("darwin");
+          expect(workerEnv["__CF_USER_TEXT_ENCODING"]).toBeTypeOf("string");
+        }
         await supervisor.close();
       },
     );
@@ -697,28 +712,80 @@ describe("node worker supervisor", () => {
     }
   });
 
-  it("records a gated child that exits before journal readiness as terminal", async () => {
-    const { bundleRoot, supervisor, workspaceDir } = fixture();
-    const input = launchInput(workspaceDir, "prestart-exit-launch");
-    const exitedPath = path.join(workspaceDir, "prestart-exited");
-    fs.writeFileSync(
-      path.join(
-        bundleRoot,
-        input.gatewayNamespace,
-        "bundles",
-        input.expectedBundleHash,
-        "worker.mjs",
-      ),
-      `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(exitedPath)}, "exited"); process.exit(23);`,
-    );
+  it.each([
+    { operation: "none", state: "failed", errorText: "node worker failed with exit code 23" },
+    { operation: "cancel", state: "cancelled", errorText: "node worker launch cancelled" },
+    {
+      operation: "close",
+      state: "interrupted",
+      errorText: "node worker launch interrupted during node-host shutdown",
+    },
+  ] as const)(
+    "records $state when a child exits before descriptor delivery ($operation)",
+    async ({ operation, state, errorText }) => {
+      const { bundleRoot, supervisor, workspaceDir, env } = fixture();
+      const input = launchInput(workspaceDir, "prestart-exit-launch");
+      const exitedPath = path.join(workspaceDir, "prestart-exited");
+      fs.writeFileSync(
+        path.join(
+          bundleRoot,
+          input.gatewayNamespace,
+          "bundles",
+          input.expectedBundleHash,
+          "worker.mjs",
+        ),
+        `import fs from "node:fs"; process.once("message", () => { fs.writeFileSync(${JSON.stringify(exitedPath)}, "exited"); process.exit(23); });`,
+      );
+      const observationReleased = createDeferred();
+      const controller = new AbortController();
+      let closing: Promise<void> | undefined;
+      let childExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+      const createAdapter = childAdapter.createChildAdapter;
+      vi.spyOn(childAdapter, "createChildAdapter").mockImplementationOnce(async (options) => {
+        const adapter = await createAdapter(options);
+        const exited = adapter.wait();
+        return {
+          ...adapter,
+          // Reach the closed real pipe before its exit can settle the launch journal.
+          openStartGate: async () => {
+            await adapter.openStartGate?.();
+            childExit = await exited;
+            if (operation === "cancel") {
+              controller.abort(new Error("cancel during startup"));
+            } else if (operation === "close") {
+              closing = supervisor.close();
+            }
+          },
+          wait: async () => {
+            const exit = await exited;
+            await observationReleased.promise;
+            return exit;
+          },
+          kill: (signal) => {
+            adapter.kill(signal);
+            observationReleased.resolve();
+          },
+        };
+      });
 
-    await supervisor.launch(input, TEST_WORKER_ENDPOINT);
-    const terminal = await waitForTerminal(supervisor, input.launchId);
+      try {
+        await supervisor.launch(input, TEST_WORKER_ENDPOINT, controller.signal);
+        const terminal = await waitForTerminal(supervisor, input.launchId);
 
-    expect(fs.existsSync(exitedPath)).toBe(true);
-    expect(terminal.state).toBe("failed");
-    await supervisor.close();
-  });
+        expect(fs.existsSync(exitedPath)).toBe(true);
+        expect(childExit).toEqual({ code: 23, signal: null });
+        expect(terminal).toMatchObject({ state, errorText });
+        expect(new NodeWorkerLaunchStore({ env }).get(input.launchId)).toMatchObject({
+          state,
+          errorText,
+        });
+      } finally {
+        observationReleased.resolve();
+        await closing;
+        await supervisor.close();
+      }
+    },
+  );
 
   it("bounds a blocked cancellation write and stops only its physical owner", async () => {
     const capacities: Array<{ total: number; available: number }> = [];

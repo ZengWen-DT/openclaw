@@ -130,13 +130,9 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
     return speaker.session.beginSpeakerTurn(context, userId, recordingInput);
   }
 
-  handleBargeIn(reason = "barge-in"): void {
-    this.player.handleBargeIn(reason);
-  }
-
-  isBargeInEnabled(): boolean {
+  canReceiveDuringPlayback(): boolean {
     const session = this.warmSession ?? this.sessions.values().next().value?.session;
-    return session?.isBargeInEnabled() ?? false;
+    return session?.canReceiveDuringPlayback() ?? false;
   }
 
   private createSession(): DiscordRealtimeSpeakerSession {

@@ -2,10 +2,30 @@
 const currentModuleUrl = import.meta.url;
 
 export const updateExecutorNativeEntrypoints = {
+  commandRun: {
+    currentModuleUrl,
+    sourceWorkerName: "update-command-run",
+    distWorkerPath: "cli/update-cli/update-command-run.js",
+  },
+  retainedRecovery: {
+    currentModuleUrl,
+    sourceWorkerName: "../../infra/update-retained-recovery.test-support",
+    distWorkerPath: "infra/update-retained-recovery.test-support.js",
+  },
   executor: {
     currentModuleUrl,
     sourceWorkerName: "update-command-executor",
     distWorkerPath: "cli/update-cli/update-command-executor.js",
+  },
+  migratedFinalize: {
+    currentModuleUrl,
+    sourceWorkerName: "../../infra/update-migrated-finalize.worker",
+    distWorkerPath: "infra/update-migrated-finalize.worker.js",
+  },
+  doctorResult: {
+    currentModuleUrl,
+    sourceWorkerName: "../../infra/update-doctor-result",
+    distWorkerPath: "infra/update-doctor-result.js",
   },
   processExec: {
     currentModuleUrl,

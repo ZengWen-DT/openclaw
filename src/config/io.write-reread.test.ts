@@ -76,9 +76,9 @@ describe("writeConfigFile canonical reread", () => {
       // new config into place, every subsequent sync read sees corrupt content,
       // so the canonical reread parses invalid.
       let corrupted = false;
-      const realRename = fsNode.promises.rename.bind(fsNode.promises);
-      vi.spyOn(fsNode.promises, "rename").mockImplementation(async (from, to) => {
-        await realRename(from, to);
+      const realRename = fsNode.renameSync;
+      vi.spyOn(fsNode, "renameSync").mockImplementation((from, to) => {
+        realRename(from, to);
         if (to === configPath) {
           corrupted = true;
         }
@@ -231,7 +231,7 @@ describe("writeConfigFile canonical reread", () => {
     { writer: "runtime", authority: "explicit" },
     { writer: "runtime", authority: "ambient" },
   ] as const)(
-    "preserves the compensation fallback policy for $writer writes with $authority authority",
+    "restores through guarded copy fallback for $writer writes with $authority authority",
     async ({ writer, authority }) => {
       await withTempHome(async (home) => {
         const configPath = path.join(home, ".openclaw", "openclaw.json");
@@ -247,13 +247,13 @@ describe("writeConfigFile canonical reread", () => {
             : undefined;
         let committed = false;
         let compensationDenied = false;
-        const rename = fsNode.promises.rename.bind(fsNode.promises);
-        vi.spyOn(fsNode.promises, "rename").mockImplementation(async (source, destination) => {
+        const renameSync = fsNode.renameSync;
+        vi.spyOn(fsNode, "renameSync").mockImplementation((source, destination) => {
           if (destination === configPath && committed) {
             compensationDenied = true;
             throw Object.assign(new Error("compensation rename denied"), { code: "EPERM" });
           }
-          await rename(source, destination);
+          renameSync(source, destination);
           if (destination === configPath) {
             committed = true;
             if (writer === "direct") {
@@ -289,7 +289,7 @@ describe("writeConfigFile canonical reread", () => {
           expect(failure).toMatchObject({
             name: "ConfigWritePostCommitError",
             configPath,
-            rollbackStatus: authority === "ordinary" ? "restored" : "unknown",
+            rollbackStatus: "restored",
           });
           expect(failure).toHaveProperty(
             "message",
@@ -323,11 +323,7 @@ describe("writeConfigFile canonical reread", () => {
           });
         }
         expect(compensationDenied).toBe(true);
-        if (authority === "ordinary") {
-          expect(await fs.readFile(configPath, "utf8")).toBe(original);
-        } else {
-          expect(JSON.parse(await fs.readFile(configPath, "utf8")).gateway.port).toBe(19001);
-        }
+        expect(await fs.readFile(configPath, "utf8")).toBe(original);
       });
     },
   );

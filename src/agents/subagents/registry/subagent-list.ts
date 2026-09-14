@@ -17,14 +17,21 @@ import {
   truncateLine,
 } from "../../../shared/subagents-format.js";
 import { resolveModelDisplayName, resolveModelDisplayRef } from "../../model-selection-display.js";
+import {
+  observeSubagentExecution,
+  type SubagentExecutionObservation,
+} from "./subagent-execution-observation.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
 import { buildSubagentRunReadIndexFromRuns } from "./subagent-registry-queries.js";
 import {
   getSubagentSessionRuntimeMs,
   getSubagentSessionStartedAt,
 } from "./subagent-registry-read.js";
-import { getSubagentRunsSnapshotForRead } from "./subagent-registry-state.js";
-import type { SubagentRunRecord } from "./subagent-registry.types.js";
+import {
+  getSubagentRunsSnapshotForSession,
+  getSubagentSessionListRunsSnapshotForRead,
+} from "./subagent-registry-state.js";
+import type { SubagentRunReadRecord, SubagentRunRecord } from "./subagent-registry.types.js";
 import { shouldKeepSubagentRunChildLink } from "./subagent-run-liveness.js";
 import { buildSubagentRunView } from "./subagent-run-view.js";
 import { resolveSubagentDisplayStatus } from "./subagent-session-metrics.js";
@@ -46,6 +53,9 @@ type SubagentListItem = {
   totalTokens?: number;
   startedAt?: number;
   endedAt?: number;
+  execution: SubagentExecutionObservation;
+  deliveryStatus?: NonNullable<SubagentRunRecord["delivery"]>["status"];
+  resume?: { method: "sessions.send"; sessionKey: string };
 };
 
 type BuiltSubagentList = {
@@ -91,11 +101,15 @@ function resolveSessionEntryForKey(params: {
 
 /** Build child-session indexes from the latest run associated with each child key. */
 function buildLatestSubagentRunIndex(
-  runs: Map<string, SubagentRunRecord>,
+  runs: Map<string, SubagentRunReadRecord>,
   options?: { now?: number },
 ) {
   const now = options?.now ?? Date.now();
-  const readIndex = buildSubagentRunReadIndexFromRuns({ runs, now });
+  const readIndex = buildSubagentRunReadIndexFromRuns({
+    runs,
+    inMemoryRuns: subagentRuns.values(),
+    now,
+  });
 
   const childSessionsByController = new Map<string, string[]>();
   for (const [childSessionKey, entry] of readIndex.latestRunsByChildSessionKey) {
@@ -179,10 +193,11 @@ export function buildSubagentList(params: {
   runs: SubagentRunRecord[];
   recentMinutes: number;
   taskMaxChars?: number;
+  readSnapshot?: Map<string, SubagentRunReadRecord>;
 }): BuiltSubagentList {
   const now = Date.now();
   const cache = new Map<string, Record<string, SessionEntry>>();
-  const snapshot = getSubagentRunsSnapshotForRead(subagentRuns);
+  const snapshot = params.readSnapshot ?? getSubagentSessionListRunsSnapshotForRead(subagentRuns);
   const { childSessionsByController, readIndex } = buildLatestSubagentRunIndex(snapshot);
   const pendingDescendantCount = (sessionKey: string) =>
     readIndex.countPendingDescendantRuns(sessionKey);
@@ -202,7 +217,16 @@ export function buildSubagentList(params: {
     const totalTokens = resolveTotalTokens(sessionEntry);
     const usageText = formatTokenUsageDisplay(sessionEntry);
     const pendingDescendants = pendingDescendantCount(entry.childSessionKey);
-    const status = resolveSubagentDisplayStatus(entry, pendingDescendants);
+    const execution = observeSubagentExecution(
+      entry,
+      entry.pauseReason === "sessions_yield"
+        ? getSubagentRunsSnapshotForSession(subagentRuns, entry.childSessionKey).values()
+        : [],
+    );
+    const status = resolveSubagentDisplayStatus(
+      entry,
+      execution.state === "waiting" ? (execution.wait?.pendingCount ?? 0) : pendingDescendants,
+    );
     const childSessions = childSessionsByController.get(entry.childSessionKey) ?? [];
     const runtime = formatDurationCompact(runtimeMs) ?? "n/a";
     const label = truncateLine(resolveSubagentLabel(entry), 48);
@@ -219,6 +243,11 @@ export function buildSubagentList(params: {
       label,
       task,
       status,
+      execution,
+      ...(execution.wait?.kind === "external"
+        ? { resume: { method: "sessions.send" as const, sessionKey: entry.childSessionKey } }
+        : {}),
+      ...(entry.delivery ? { deliveryStatus: entry.delivery.status } : {}),
       pendingDescendants,
       runtime,
       runtimeMs,

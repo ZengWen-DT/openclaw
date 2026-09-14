@@ -27,6 +27,8 @@ import {
   withExistingOpenClawStateDatabaseArtifactPreservingReadOnlyAsync,
   withExistingOpenClawStateDatabaseReadOnly,
   withArtifactPreservingStateReads,
+  withDisposableOpenClawStateReads,
+  withOpenClawStateDatabaseReadSnapshot,
 } from "./openclaw-state-db-readonly.js";
 import {
   closeOpenClawStateDatabaseForTest,
@@ -53,7 +55,7 @@ it("keeps fresh synchronous read callbacks from returning asynchronous work", as
     expect(() =>
       withExistingOpenClawStateDatabaseReadOnly(() => Promise.resolve(1), options),
     ).toThrow("SQLite source read must remain synchronous");
-    const exclusion = acquireOpenClawStateDatabaseFileExclusion(options.path);
+    const exclusion = await acquireOpenClawStateDatabaseFileExclusion(options.path);
     exclusion.release();
   });
 });
@@ -128,14 +130,14 @@ it("retains stream handle custody when native close fails until explicit close s
       expect((await rows.next()).value).toBe(1);
       await expect(rows.return()).rejects.toBe(failure);
       expect(reader?.isOpen).toBe(true);
-      expect(() => acquireOpenClawStateDatabaseFileExclusion(source.path)).toThrow(
+      await expect(acquireOpenClawStateDatabaseFileExclusion(source.path)).rejects.toThrow(
         "reader close failed",
       );
       expect(reader?.isOpen).toBe(true);
       refuseClose = false;
       closeOpenClawStateDatabaseForTest();
       expect(reader?.isOpen).toBe(false);
-      const exclusion = acquireOpenClawStateDatabaseFileExclusion(source.path);
+      const exclusion = await acquireOpenClawStateDatabaseFileExclusion(source.path);
       exclusion.release();
     } finally {
       refuseClose = false;
@@ -241,6 +243,47 @@ describe.each(["admission", "explicit", "async"] as const)("%s read-only state r
       : mode === "admission"
         ? admittedRead
         : withExistingOpenClawStateDatabaseArtifactPreservingReadOnly;
+  it("reads only active disposable scopes directly and revokes inherited async access", async () => {
+    await withTempDir("openclaw-state-disposable-", async (root) => {
+      const outer = createOptions(path.join(root, "outer"));
+      const inner = createOptions(path.join(root, "inner"));
+      const source = createOptions(path.join(root, "source"));
+      const paths = [outer, inner, source];
+      for (const options of paths) {
+        fs.mkdirSync(path.dirname(options.path), { recursive: true });
+        const db = new DatabaseSync(options.path);
+        db.exec(
+          "PRAGMA journal_mode = WAL; CREATE TABLE held(value TEXT); INSERT INTO held VALUES ('committed')",
+        );
+        db.close();
+      }
+      const read = (options: ReturnType<typeof createOptions>) =>
+        readState(({ db }) => {
+          expect(db.prepare("SELECT value FROM held").get()).toEqual({ value: "committed" });
+          expect(() => db.exec("INSERT INTO held VALUES ('unexpected')")).toThrow(/readonly/);
+          return db.location();
+        }, options);
+      const sourceBefore = fs.readFileSync(source.path);
+      const released = createDeferredCore();
+      let descendant: Promise<unknown> | undefined;
+      await withDisposableOpenClawStateReads(outer.path, async () => {
+        expect(await read(outer)).toBe(outer.path);
+        await withDisposableOpenClawStateReads(inner.path, async () => {
+          expect(await read(outer)).toBe(outer.path);
+          expect(await read(inner)).toBe(inner.path);
+          expect(await read(source)).not.toBe(source.path);
+          descendant = released.promise.then(() => read(inner));
+        });
+        expect(await read(inner)).not.toBe(inner.path);
+        expect(await read(outer)).toBe(outer.path);
+        released.resolve();
+        expect(await descendant).not.toBe(inner.path);
+      });
+      expect(await read(outer)).not.toBe(outer.path);
+      expect(fs.readFileSync(source.path)).toEqual(sourceBefore);
+      expect(fs.readdirSync(path.dirname(source.path))).toEqual(["openclaw.sqlite"]);
+    });
+  });
   it("reads a consolidated WAL database without creating source sidecars", async () => {
     await withTempDir("openclaw-state-readonly-sidecars-", async (stateDir) => {
       const options = createOptions(stateDir);
@@ -360,9 +403,16 @@ describe.each(["admission", "explicit", "async"] as const)("%s read-only state r
   });
 });
 
-it.each(["latch", "quarantine", "callback"] as const)(
-  "cleans the async snapshot after %s rejection",
-  async (failure) => {
+it.each([
+  { failure: "latch", composite: false },
+  { failure: "quarantine", composite: false },
+  { failure: "callback", composite: false },
+  { failure: "latch", composite: true },
+  { failure: "quarantine", composite: true },
+  { failure: "callback", composite: true },
+] as const)(
+  "cleans the async snapshot after $failure rejection (composite: $composite)",
+  async ({ failure, composite }) => {
     await withTempDir("openclaw-state-readonly-admission-", async (stateDir) => {
       const options = createOptions(stateDir);
       openOpenClawStateDatabase(options);
@@ -392,10 +442,14 @@ it.each(["latch", "quarantine", "callback"] as const)(
         throw refused;
       });
       try {
-        const result = withExistingOpenClawStateDatabaseArtifactPreservingReadOnlyAsync(
-          operation,
-          options,
-        );
+        const result = composite
+          ? withArtifactPreservingStateReads(() =>
+              withOpenClawStateDatabaseReadSnapshot(
+                async () => withExistingOpenClawStateDatabaseReadOnly(operation, options),
+                options,
+              ),
+            )
+          : withExistingOpenClawStateDatabaseArtifactPreservingReadOnlyAsync(operation, options);
         if (failure !== "quarantine") {
           await expect(result).rejects.toBe(refused);
         } else {
@@ -441,7 +495,7 @@ it("reads under its live mutation owner but refuses an unrelated caller", async 
     const initial = openOpenClawStateDatabase(options);
     initial.db.exec("CREATE TABLE held(value TEXT); INSERT INTO held VALUES ('original')");
     const pathname = initial.path;
-    const owner = acquireOpenClawStateDatabaseFileExclusion(pathname);
+    const owner = await acquireOpenClawStateDatabaseFileExclusion(pathname);
     const entered = createDeferredCore();
     const resume = createDeferredCore();
     const read = () =>

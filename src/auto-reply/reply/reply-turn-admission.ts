@@ -16,7 +16,7 @@ import {
   SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE,
   SessionRestartRecoveryTombstoneError,
 } from "../../config/sessions/lifecycle.js";
-import { loadSessionEntryWithDatabase } from "../../config/sessions/session-accessor.sqlite-entry.js";
+import { loadSessionEntryForAdmission } from "../../config/sessions/session-accessor.sqlite-entry.js";
 import type { InternalSessionEntry, SessionEntry } from "../../config/sessions/types.js";
 import type { GatewayContextResolver } from "../../gateway/server-methods/types.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
@@ -216,6 +216,8 @@ export async function admitReplyTurn(
       ? params.resolveGatewayContext
       : getPluginRuntimeGatewayRequestScope()?.resolveGatewayContext;
   let expectedSessionId = params.expectedSessionId;
+  const lifecycleGeneration = getAgentEventLifecycleGeneration();
+  let recoveryDispatchAttempted = false;
   const waitedRotations = new Map<ReplyRotationSource["databaseIdentity"], ReplyRotationSource>();
   // Barrier snapshots retain their source lane after rekeying; active owners do not.
   const isRotationSourceCurrent = (source: ReplyRotationSource) =>
@@ -256,7 +258,7 @@ export async function admitReplyTurn(
     if (
       admittedDatabaseClaim &&
       (!admittedDatabaseClaim.isCurrent() ||
-        (nextClaim && nextClaim.database.db !== admittedDatabaseClaim.database.db))
+        (nextClaim && nextClaim.incarnation !== admittedDatabaseClaim.incarnation))
     ) {
       nextClaim?.release();
       rejectLifecycleInvalidatedWork({
@@ -322,7 +324,7 @@ export async function admitReplyTurn(
               },
               assertAllowed: () => {
                 assertDatabaseOwnerCurrent();
-                const current = loadSessionEntryWithDatabase({
+                const current = loadSessionEntryForAdmission({
                   agentId: params.agentId,
                   storePath,
                   sessionKey: params.sessionKey,
@@ -393,6 +395,10 @@ export async function admitReplyTurn(
                   },
                 );
                 if (archivedSessionError) {
+                  const tombstone = currentEntry?.mainRestartRecovery?.tombstone;
+                  if (params.kind === "visible" && tombstone) {
+                    log.warn(`${archivedSessionError} Recovery reason: ${tombstone.reason}`);
+                  }
                   rejectLifecycleInvalidatedWork({
                     kind: params.kind,
                     message: archivedSessionError,
@@ -427,6 +433,64 @@ export async function admitReplyTurn(
                   admittedSessionEntry.restartRecoveryRuns !== undefined))) ||
               admittedSessionEntry.mainRestartRecovery?.tombstone !== undefined) &&
             isMainRestartRecoveryCandidate(admittedSessionEntry, params.sessionKey);
+          const gatewayContext = resolveGatewayContext?.();
+          const recoveryRuntime = gatewayContext?.recoveryRuntime;
+          if (
+            shouldClaimRecoveryOwner &&
+            recoveryOwnerRelease === undefined &&
+            admittedSessionEntry?.abortedLastRun === true &&
+            !admittedSessionEntry.mainRestartRecovery?.tombstone &&
+            params.kind !== "heartbeat" &&
+            gatewayContext &&
+            recoveryRuntime
+          ) {
+            // The interrupted turn owns its delivery claim. Resume it before the
+            // new input enters ordinary queue selection; a foreground claim would
+            // instead block recovery while this input rejects the old delivery claim.
+            admission?.release();
+            if (recoveryDispatchAttempted) {
+              if (params.kind === "queued_followup") {
+                return { status: "skipped", reason: "active-run" };
+              }
+              rejectLifecycleInvalidatedWork({
+                kind: params.kind,
+                message: `Session "${params.sessionKey}" is still waiting for restart recovery. Retry when recovery starts.`,
+                transientSessionChange: true,
+              });
+            }
+            recoveryDispatchAttempted = true;
+            const assertRecoveryOwnerCurrent = () => {
+              assertDatabaseOwnerCurrent();
+              if (
+                lifecycleGeneration !== getAgentEventLifecycleGeneration() ||
+                resolveGatewayContext?.()?.recoveryRuntime !== recoveryRuntime
+              ) {
+                rejectLifecycleInvalidatedWork({
+                  kind: params.kind,
+                  message: `Session "${params.sessionKey}" changed while starting recovery. Retry.`,
+                  transientSessionChange: true,
+                });
+              }
+            };
+            const { retryRestartAbortedMainSessionRecovery } =
+              await import("../../agents/main-session-recovery/main-session-restart-recovery.js");
+            assertRecoveryOwnerCurrent();
+            params.upstreamAbortSignal?.throwIfAborted();
+            await retryRestartAbortedMainSessionRecovery({
+              agentId: params.agentId,
+              cfg: gatewayContext.getRuntimeConfig(),
+              expectedSessionId: sessionId,
+              expectedRecoveryRunId: admittedSessionEntry.restartRecoveryDeliveryRunId,
+              expectedRecoverySourceRunId: admittedSessionEntry.restartRecoveryDeliverySourceRunId,
+              gatewayRuntime: recoveryRuntime,
+              sessionKey: params.sessionKey,
+              storePath,
+            });
+            assertRecoveryOwnerCurrent();
+            // Recovery may have completed or another owner may have won. Reload
+            // the exact session and its live owner instead of using this snapshot.
+            continue;
+          }
           if (shouldClaimRecoveryOwner && recoveryOwnerRelease === undefined) {
             const ownerClaim = await claimMainSessionRecoveryOwner({
               lifecycleGeneration: getAgentEventLifecycleGeneration(),

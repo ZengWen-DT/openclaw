@@ -9,22 +9,37 @@ describe("toPublicCronJob", () => {
       state: {
         nextRunAtMs: 2_000,
         queuedAtMs: 1_900,
+        runningReceiptId: "pending-receipt",
         startupCatchupAtMs: 2_000,
         pacedNextRunAtMs: 2_000,
         forcePreservedNextRunAtMs: 2_000,
+        runningScheduleChangeId: "pending-run-edit",
+        failureAlertIncident: { signature: "internal-incident", scope: "run" },
+        lastFailureNotificationId: "internal-notification",
       },
     });
 
     const publicJob = toPublicCronJob(job);
 
     expect(publicJob.state.queuedAtMs).toBeUndefined();
+    expect(publicJob.state.runningReceiptId).toBeUndefined();
     expect(publicJob.state.startupCatchupAtMs).toBeUndefined();
     expect(publicJob.state.pacedNextRunAtMs).toBeUndefined();
     expect(publicJob.state.forcePreservedNextRunAtMs).toBeUndefined();
+    expect(publicJob.state).not.toHaveProperty("runningScheduleChangeId");
+    expect(publicJob.state).not.toHaveProperty("failureAlertIncident");
+    expect(publicJob.state).not.toHaveProperty("lastFailureNotificationId");
     expect(job.state.queuedAtMs).toBe(1_900);
+    expect(job.state.runningReceiptId).toBe("pending-receipt");
     expect(job.state.startupCatchupAtMs).toBe(2_000);
     expect(job.state.pacedNextRunAtMs).toBe(2_000);
     expect(job.state.forcePreservedNextRunAtMs).toBe(2_000);
+    expect(job.state.runningScheduleChangeId).toBe("pending-run-edit");
+    expect(job.state.failureAlertIncident).toEqual({
+      signature: "internal-incident",
+      scope: "run",
+    });
+    expect(job.state.lastFailureNotificationId).toBe("internal-notification");
   });
 
   it("projects script payload fields without exposing scheduler-only state", () => {

@@ -29,11 +29,13 @@ import {
 import { createManagedServiceBoundaryCleanup } from "./update-managed-service-handoff-process.test-support.js";
 import {
   managedRepairUpdaterScript,
-  prepareManagedRepairSpawnEnv,
   readManagedRepairEffects,
   releaseManagedRepairInference,
 } from "./update-managed-service-handoff-repair.test-support.js";
-import { prepareManagedServiceRuntimeFixture } from "./update-managed-service-handoff-runtime.test-support.js";
+import {
+  prepareManagedServiceRuntimeFixture,
+  prepareManagedServiceSpawn,
+} from "./update-managed-service-handoff-runtime.test-support.js";
 import {
   managedServiceStateUpdateScript,
   readRestartSentinelPayload,
@@ -196,6 +198,7 @@ export function createManagedServiceManagerBoundary({
         runId: run?.runId,
         ...(options?.beforeParkNotice ? { beforePark: async () => {} } : {}),
         root,
+        timeoutMs: options?.recoveryTimeoutMs,
         restartDrainTimeoutMs: 300_000,
         parentPid,
         invocationCwd,
@@ -353,9 +356,8 @@ export function createManagedServiceManagerBoundary({
           outputPath: String(generated.triageContextPath),
         });
       }
-      let helperEnv = options?.repair
-        ? await prepareManagedRepairSpawnEnv(root, childEnv)
-        : childEnv;
+      const spawnFixture = await prepareManagedServiceSpawn(root, scriptPath, childEnv, options);
+      let helperEnv = spawnFixture.env;
       const triageDeadlinePath = path.join(root, "triage-deadline.json");
       if (options?.triageHang) {
         helperEnv = await prepareManagedServiceTriageClockPreload(
@@ -524,6 +526,8 @@ export function createManagedServiceManagerBoundary({
                 runningHelper.stdin?.write(
                   options.beforeParkNotice === "rejected" ? "notice-failed\n" : "noticed\n",
                 );
+              } else {
+                await spawnFixture.releaseNoticeDeadline(parent.signalCode);
               }
             }
             if (options.cancelAtActivation) {

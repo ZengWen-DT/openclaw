@@ -1,5 +1,8 @@
+import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
 import {
+  projectSessionResultRows,
   readSessionChangedEvent,
   reconcileSessionChanged,
   reconcileSessionChangedRow,
@@ -146,17 +149,20 @@ export function createSessionReconciliation(host: Host) {
         if (!result) {
           return result;
         }
-        const sessions = result.sessions.map((row) => reconcileRow(row, agentId));
-        return sessions.some((row, index) => row !== result.sessions[index])
-          ? { ...result, sessions }
-          : result;
+        return projectSessionResultRows(
+          result,
+          result.sessions.map((row) => reconcileRow(row, agentId)),
+        );
       };
       const state = host.readState();
       const result = reconcileResult(state.result, state.agentId);
       const staged = host.roster.stageManagedResults(
         scope,
         (entry) => reconcileResult(entry.snapshot.result, entry.snapshot.agentId),
-        (entry) => ({ row: entry.row ? reconcileRow(entry.row, entry.target.agentId) : null }),
+        (entry) => ({
+          row: entry.row ? reconcileRow(entry.row, entry.target.agentId) : null,
+          observationRevision: captured.revision,
+        }),
       );
       if (!current()) {
         return;
@@ -170,7 +176,7 @@ export function createSessionReconciliation(host: Host) {
   const reconcile = (
     row: GatewaySessionRow | undefined,
     defaults?: SessionsListResult["defaults"],
-    options?: SessionReconcileOptions & { sourceCanonicalListRevision?: number },
+    options?: Parameters<SessionCapability["reconcile"]>[2],
     observation?: ReturnType<Host["roster"]["captureReconciliation"]>,
   ): boolean => {
     const state = host.readState();
@@ -203,7 +209,7 @@ export function createSessionReconciliation(host: Host) {
     ) {
       return false;
     }
-    const { sourceCanonicalListRevision, ...historyOptions } = options ?? {};
+    const sourceCanonicalListRevision = options?.sourceCanonicalListRevision;
     const preserveCanonicalRow =
       !rowIsCurrent ||
       (!observation &&
@@ -214,7 +220,7 @@ export function createSessionReconciliation(host: Host) {
       state.result,
       row,
       defaults,
-      historyOptions,
+      options,
       preserveCanonicalRow,
       row
         ? {
@@ -261,18 +267,23 @@ export function createSessionReconciliation(host: Host) {
     }
     notify?.();
     if (row && rowIsCurrent && rowsChanged) {
-      host.roster.invalidateManagedLists(parseAgentSessionKey(row.key)?.agentId ?? historyAgentId);
+      host.roster.invalidateManagedLists(
+        parseAgentSessionKey(row.key)?.agentId ?? historyAgentId,
+        accepted || row,
+        options?.sourceListScope,
+      );
     }
     return rowIsCurrent;
   };
 
-  const observeRow: SessionCapability["observeRow"] = (target, listener) => {
+  const observeRow: SessionCapability["observeRow"] = (target, listener, options) => {
     const { roster, deletions } = host;
     if (!target.key.trim() || !target.agentId.trim()) {
       throw new Error("A session row observation requires a session key and explicit agent.");
     }
     const owned = { key: target.key.trim(), agentId: normalizeAgentId(target.agentId) };
     const registration = roster.registerRow(owned, listener, {
+      onInvalidate: options?.onInvalidate,
       isValid: (sessionId) => deletions.acceptsGeneration(owned.key, sessionId, owned.agentId),
       decorate: (row) =>
         deletions.deletionState(row.key, owned.agentId, row.sessionId)
@@ -394,6 +405,7 @@ export function createSessionReconciliation(host: Host) {
     }
     const previous = state.result;
     const eventInfo = readSessionChangedEvent(payload);
+    const invalidationReason = normalizeOptionalString(asNullableRecord(payload)?.reason);
     if (
       eventInfo &&
       !deletions.acceptsGeneration(
@@ -455,11 +467,7 @@ export function createSessionReconciliation(host: Host) {
       ownerOptions: SessionReconcileOptions | undefined,
       ownerAgentId: string | null,
     ) => {
-      const rows = roster.projectRows(held?.sessions ?? []);
-      const current =
-        held && rows.some((row, index) => row !== held.sessions[index])
-          ? { ...held, sessions: rows }
-          : held;
+      const current = projectSessionResultRows(held, roster.projectRows(held?.sessions ?? []));
       const result = reconcileSessionChanged(
         current,
         payload,
@@ -503,6 +511,9 @@ export function createSessionReconciliation(host: Host) {
         return result.result;
       },
       (entry) => {
+        if (!eventInfo && invalidationReason === "runner-availability") {
+          return { row: entry.row, invalidateRevision: eventObservation.revision };
+        }
         const eventAgentId = eventInfo?.agentId ?? parseAgentSessionKey(eventInfo?.key)?.agentId;
         if (
           !eventInfo ||
@@ -533,7 +544,11 @@ export function createSessionReconciliation(host: Host) {
         if (reduced.admittedRow || reduced.deletedKey) {
           acceptedResult ??= reduced;
         }
-        return { row: reduced.row ?? null };
+        return {
+          row: reduced.row ?? null,
+          observationRevision: eventObservation.revision,
+          ...(!reduced.deletedKey ? { invalidateRevision: eventObservation.revision } : {}),
+        };
       },
       false,
       managedAdmissions,
@@ -543,6 +558,7 @@ export function createSessionReconciliation(host: Host) {
         primaryPublished && reconciled.admittedRow
           ? [{ row: reconciled.admittedRow, revision: eventObservation.revision }]
           : [],
+        invalidationReason,
       );
     const claimChanged = thinkingClaims.observeEvent(
       eventInfo?.reason === "delete" ? reconciled : (acceptedResult ?? reconciled),

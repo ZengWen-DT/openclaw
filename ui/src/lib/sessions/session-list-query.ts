@@ -1,3 +1,4 @@
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import type { SessionsListResult } from "../../api/types.ts";
 import type { createSessionEventRefreshCoordinator } from "./event-refresh-coordinator.ts";
 import type {
@@ -7,12 +8,17 @@ import type {
   SessionListSnapshot,
   SessionRefreshOptions,
 } from "./session-capability.ts";
-import { normalizeAgentId } from "./session-key.ts";
+import {
+  normalizeAgentId,
+  areUiSessionKeysEquivalent,
+  parseAgentSessionKey,
+} from "./session-key.ts";
 import {
   buildSessionListParams,
   DEFAULT_SESSION_LIST_QUERY,
   normalizeManagedSessionListQuery,
 } from "./session-requests.ts";
+import { parseSessionChangedEvent } from "./session-row-reconcile.ts";
 
 export function isForegroundReplacement(options: SessionRefreshOptions): boolean {
   return options.append !== true && options.backgroundHydrate !== true;
@@ -24,18 +30,90 @@ export function sessionListAgentMatcher(agentId?: string | null) {
     !normalized || !queryAgentId?.trim() || normalizeAgentId(queryAgentId) === normalized;
 }
 
+/** Capture membership before event reconciliation can remove or move a known child. */
+export function sessionListEventMatcher(payload: unknown) {
+  const parsed = parseSessionChangedEvent(payload);
+  const info = parsed?.[0];
+  const event = parsed?.[1] ?? asOptionalRecord(payload);
+  const source = parsed?.[2];
+  const agentId =
+    info?.agentId ??
+    parseAgentSessionKey(info?.key)?.agentId ??
+    (typeof event?.agentId === "string" ? event.agentId : undefined);
+  const matchesAgent = sessionListAgentMatcher(agentId);
+  const owners = [
+    source?.controlOwnerSessionKey,
+    source?.spawnedBy,
+    source?.parentSessionKey,
+    event?.parentSessionKey,
+  ];
+  return (entry: ManagedSessionList): boolean => {
+    const parent = entry.scope.spawnedBy;
+    if (parent && info && areUiSessionKeysEquivalent(info.key, parent)) {
+      return true;
+    }
+    if (!matchesAgent(sessionListQueryAgentId(entry.query))) {
+      return false;
+    }
+    if (!parent || !info) {
+      return true;
+    }
+    if (
+      entry.snapshot.result?.sessions.some((row) =>
+        areUiSessionKeysEquivalent(row.key, info.key),
+      ) ||
+      owners.some((owner) => typeof owner === "string" && areUiSessionKeysEquivalent(owner, parent))
+    ) {
+      return true;
+    }
+    // An incomplete window cannot rule out a former child beyond its loaded page,
+    // even when a move event names its new parent explicitly.
+    const result = entry.snapshot.result;
+    return (
+      !result ||
+      result.hasMore === true ||
+      (result.totalCount ?? result.sessions.length) > result.sessions.length
+    );
+  };
+}
+
 export type QueuedSessionRefresh = {
   options: SessionRefreshOptions;
+  intent: "explicit" | "automatic" | (() => string | null);
+  bootstrap?: boolean;
+  isErrorCurrent?: () => boolean;
   completions: Array<{
     options: SessionRefreshOptions;
     complete: (refresh: Promise<SessionsListResult | null> | null) => void;
   }>;
 };
 
+export function coalesceSessionRefresh(
+  current: QueuedSessionRefresh | null,
+  next: QueuedSessionRefresh,
+): QueuedSessionRefresh {
+  if (!current) {
+    return next;
+  }
+  // Explicit intent remains authoritative over automatic hydration and weaker queries.
+  if (
+    (next.intent !== "automatic" || current.intent === "automatic") &&
+    (isForegroundReplacement(next.options) || !isForegroundReplacement(current.options))
+  ) {
+    current.options = next.options;
+    current.intent = next.intent;
+    current.bootstrap = next.bootstrap;
+    current.isErrorCurrent = next.isErrorCurrent;
+  }
+  current.completions.push(...next.completions);
+  return current;
+}
+
 export type ManagedSessionListRefresh = {
   append: boolean;
   offset?: number;
   invalidated?: true;
+  background?: true;
 };
 
 export type ObservedSessionList = {

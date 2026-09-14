@@ -4,6 +4,7 @@
 import type { SpawnSyncOptions } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import prettyMilliseconds from "pretty-ms";
+import { resolveNodeRuntimeExecutable } from "../src/infra/node-runtime-executable.ts";
 import {
   finalizeBuildStepCache,
   resolveBuildStepCacheState,
@@ -35,7 +36,7 @@ import {
   type MemoryLimitParams,
 } from "./tsdown-build.mts";
 
-const nodeBin = process.execPath;
+const nodeBin = resolveNodeRuntimeExecutable() ?? process.execPath;
 
 export type BuildAllStep = BuildCacheStep &
   (
@@ -133,7 +134,7 @@ export const BUILD_ALL_STEPS: BuildAllStep[] = [
     kind: "pnpm",
     pnpmArgs: ["plugins:assets:copy"],
   },
-  nodeStep("runtime-postbuild", ["scripts/runtime-postbuild.mjs"]),
+  tsxStep("runtime-postbuild", "scripts/runtime-postbuild.mts"),
   tsxStep("build-stamp", "scripts/build-stamp.mts"),
   tsxStep("runtime-postbuild-stamp", "scripts/runtime-postbuild-stamp.mts"),
   {
@@ -549,7 +550,8 @@ export async function runBuildAllSteps(
           args:
             script === "scripts/tsdown-build.mts" ||
             script === "scripts/write-unified-entry-dts.ts" ||
-            script === "scripts/write-plugin-sdk-entry-dts.ts"
+            script === "scripts/write-plugin-sdk-entry-dts.ts" ||
+            script === "scripts/runtime-postbuild.mts"
               ? distArtifactEntryArgs(script, invocation.args.slice(3))
               : invocation.args,
           ...invocation.options,

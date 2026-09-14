@@ -121,6 +121,7 @@
   --accent-2-subtle: rgba(20, 184, 166, 0.1);
 
   /* Theme-invariant presentation colors. */
+  --task-suggestion-action-fg: #fafafa;
   --button-icon-bg: #ffffff;
   --brand-logo-chip-bg: #ffffff;
   --qr-bg: #ffffff;
@@ -397,6 +398,7 @@
   .sidebar-recent-session.sidebar-recent-session,
   .settings-sidebar__item.settings-sidebar__item,
   .btn.btn,
+  .agent-select__trigger.agent-select__trigger,
   .settings-input.settings-input,
   .field.field :is(input, textarea, select) {
     border-radius: calc(10px * var(--openclaw-corner-radius-scale));

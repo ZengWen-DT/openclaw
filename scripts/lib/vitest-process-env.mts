@@ -46,6 +46,47 @@ export function resolveVitestProcessEnv(env: NodeJS.ProcessEnv = process.env): N
   };
 }
 
+/** Intersects resolved group budgets without changing any group's environment. */
+export function resolveSharedVitestCompilerEnv(
+  environments: NodeJS.ProcessEnv[],
+): NodeJS.ProcessEnv {
+  const resolved = environments.map((env) => resolveVitestProcessEnv(env));
+  const shared = { ...resolved[0] };
+  const testOnlyKeys = new Set([
+    "OPENCLAW_VITEST_MAX_WORKERS",
+    "OPENCLAW_TEST_WORKERS",
+    "OPENCLAW_VITEST_SHARD_NAME",
+    "OPENCLAW_NODE_TEST_VITEST_ARGS_JSON",
+    "OPENCLAW_VITEST_NO_OUTPUT_TIMEOUT_MS",
+    "OPENCLAW_VITEST_NO_OUTPUT_HEARTBEAT_MS",
+  ]);
+  // Compilation has one owner before any group requests it. Only scheduling
+  // facts may differ; loaders, Node flags and source-build inputs must agree.
+  for (const key of new Set(resolved.flatMap((env) => Object.keys(env)))) {
+    const values = resolved.map((env) => env[key]);
+    if (values.every((value) => value === shared[key])) {
+      continue;
+    }
+    if (testOnlyKeys.has(key)) {
+      delete shared[key];
+      continue;
+    }
+    if (key === "RAYON_NUM_THREADS" || key === "TOKIO_WORKER_THREADS") {
+      const limits = values.filter((value) => value?.trim()).map(parsePositiveInt);
+      if (limits.every((limit) => limit !== null)) {
+        if (limits.length > 0) {
+          shared[key] = String(Math.min(...limits));
+        } else {
+          delete shared[key];
+        }
+        continue;
+      }
+    }
+    throw new Error(`CI groups cannot share a compiler with differing ${key}`);
+  }
+  return shared;
+}
+
 /** Default watchdog timeout for Vitest runs that stop producing output. */
 const DEFAULT_VITEST_NO_OUTPUT_TIMEOUT_MS = 120_000;
 /** Default heartbeat interval while waiting on silent Vitest output. */
@@ -76,6 +117,12 @@ export const VITEST_CONFIG_NO_OUTPUT_TIMEOUT_MS = new Map([
     "test/vitest/vitest.full-core-contracts.config.ts",
     DEFAULT_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
   ],
+  // The package-acceptance high-cardinality admission test can remain silent
+  // for ~165s under Bun while staying inside its declared 420s test budget.
+  [
+    "test/vitest/vitest.full-core-tooling.config.ts",
+    DEFAULT_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
+  ],
   [
     "test/vitest/vitest.contracts-plugin.config.ts",
     DEFAULT_EXTRA_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
@@ -101,6 +148,10 @@ export const VITEST_CONFIG_NO_OUTPUT_TIMEOUT_MS = new Map([
   ],
   [
     "test/vitest/vitest.gateway-server.config.ts",
+    DEFAULT_EXTRA_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
+  ],
+  [
+    "test/vitest/vitest.gateway-database-workers.config.ts",
     DEFAULT_EXTRA_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
   ],
 ]);

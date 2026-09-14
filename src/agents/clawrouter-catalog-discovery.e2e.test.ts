@@ -9,6 +9,10 @@ import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
+import {
+  createApiKeyCredential,
+  createAuthProfileStoreFixture,
+} from "./auth-profiles/credential-fixtures.test-support.js";
 import { createPreparedModelCatalogWorkerInput } from "./prepared-model-catalog-worker.js";
 import { runPreparedModelCatalogWorkerRequest } from "./prepared-model-catalog.worker.js";
 import { prepareWorkspaceBuildGroup } from "./prepared-model-runtime.facts.js";
@@ -151,16 +155,9 @@ describe("ClawRouter cold prepared catalog", () => {
       // without a configured model preloading its provider into the startup scope.
       expect(value.providerIds).not.toContain("clawrouter");
       await state.writeAuthProfiles(
-        {
-          version: 1,
-          profiles: {
-            "clawrouter:default": {
-              type: "api_key",
-              provider: "clawrouter",
-              key: "catalog-test-key",
-            },
-          },
-        },
+        createAuthProfileStoreFixture({
+          "clawrouter:default": createApiKeyCredential("clawrouter", "catalog-test-key"),
+        }),
         agentId,
       );
     }

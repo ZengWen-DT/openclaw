@@ -273,37 +273,50 @@ describe("server-runtime-services", () => {
     if (!deliveryLog || !sessionDeliveryLog) {
       throw new Error("Expected delivery recovery log children");
     }
-    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledWith({
-      deliver: expect.any(Function),
-      cfg: {},
-      log: deliveryLog,
-      shouldContinue: expect.any(Function),
-    });
+    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledWith(
+      {
+        deliver: expect.any(Function),
+        cfg: {},
+        log: deliveryLog,
+        shouldContinue: expect.any(Function),
+      },
+      expect.any(Function),
+    );
+    const runtimeParams = hoisted.startSessionDeliveryRuntime.mock.calls[0]?.[0];
+    if (!runtimeParams) {
+      throw new Error("Expected the session delivery runtime to start");
+    }
     expect(hoisted.recoverPendingRestartContinuationDeliveries).toHaveBeenCalledWith({
       deps: {},
       maxEnqueuedAt: 123,
+      queueContext: runtimeParams.queueContext,
       log: sessionDeliveryLog,
       resolveGatewayContext,
     });
-    const runtimeParams = hoisted.startSessionDeliveryRuntime.mock.calls[0]?.[0] as
-      | {
-          onSettled?: (
-            entry: { id: string; sessionKey: string },
-            outcome: "recovered",
-          ) => Promise<void>;
-        }
-      | undefined;
     expect(runtimeParams?.onSettled).toBe(hoisted.settleQueuedSessionDelivery);
     await runtimeParams?.onSettled?.(
       {
         id: "settled-delivery-1",
+        kind: "systemEvent",
         sessionKey: "agent:main:cron:job:run:run-1",
+        text: "settled delivery",
+        enqueuedAt: 1,
+        retryCount: 0,
       },
       "recovered",
+      runtimeParams.queueContext,
     );
     expect(hoisted.settleQueuedSessionDelivery).toHaveBeenCalledWith(
-      { id: "settled-delivery-1", sessionKey: "agent:main:cron:job:run:run-1" },
+      {
+        id: "settled-delivery-1",
+        kind: "systemEvent",
+        sessionKey: "agent:main:cron:job:run:run-1",
+        text: "settled delivery",
+        enqueuedAt: 1,
+        retryCount: 0,
+      },
       "recovered",
+      runtimeParams.queueContext,
     );
     expect(hoisted.schedulePendingSessionDeliveries).toHaveBeenCalledTimes(1);
   });
@@ -760,11 +773,11 @@ describe("server-runtime-services", () => {
 
     expect(hoisted.assertQueuedConversationDeliveryAttemptAuthorized).toHaveBeenCalledWith(
       expect.objectContaining({
-        agentId: "main",
+        readCurrentConfig: expect.any(Function),
         operationId: "operation-recovery",
-        storePath: "/tmp/agent.sqlite",
         routeFingerprint: "route-recovery",
       }),
+      expect.objectContaining({ agentId: "main", storePath: "/tmp/agent.sqlite" }),
     );
     services.heartbeatRunner.stop();
   });
@@ -786,6 +799,7 @@ describe("server-runtime-services", () => {
 
       expect(hoisted.drainPendingDeliveries).toHaveBeenCalledWith(
         expect.objectContaining({ cfg: reloadedConfig }),
+        expect.any(Function),
       );
       expect(runtimeConfig).toHaveBeenCalledOnce();
     } finally {

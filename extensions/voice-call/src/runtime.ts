@@ -329,7 +329,7 @@ export async function createVoiceCallRuntime(params: {
   if (stateRuntime) {
     setVoiceCallStateRuntime({ state: stateRuntime });
   }
-  const manager = new CallManager(config, undefined, cfg.session);
+  const manager = new CallManager(config, undefined, cfg.session, stateRuntime);
   const realtimeVoiceRuntime = config.realtime.enabled ? await loadRealtimeVoiceRuntime() : null;
   const webhookServer = new VoiceCallWebhookServer(
     config,
@@ -360,11 +360,14 @@ export async function createVoiceCallRuntime(params: {
         providerConfigs: effectiveConfig.realtime.providers,
         cfg,
         agentId,
+        surface: "gateway-relay",
+        useProviderDefaultModel: true,
       });
       return {
         agentId,
         provider: resolved.provider,
         providerConfig: resolved.providerConfig,
+        capabilities: resolved.capabilities,
         instructions: resolveRealtimeInstructions(call),
       };
     };

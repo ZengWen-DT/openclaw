@@ -8,9 +8,11 @@ on:
 
 permissions: {}
 
+# Serial admission lets later requests reuse the first completed publication.
 concurrency:
-  group: linux-app-release-${{ github.event.workflow_run.id }}
+  group: linux-app-release-build
   cancel-in-progress: false
+  queue: max
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -28,7 +30,7 @@ jobs:
       github.repository == 'openclaw/openclaw' &&
       github.event.workflow_run.repository.full_name == 'openclaw/openclaw' &&
       github.event.workflow_run.event == 'workflow_dispatch' &&
-      github.event.workflow_run.name == 'Linux App Release Request' &&
+      github.event.workflow_run.path == '.github/workflows/linux-app-release-request.yml' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-22.04
@@ -42,6 +44,7 @@ jobs:
       release_tag: ${{ steps.request.outputs.release_tag }}
       tag_sha: ${{ steps.ancestry.outputs.tag_sha }}
       updater_pubkey: ${{ steps.updater_trust.outputs.updater_pubkey }}
+      already_published: ${{ steps.completion.outputs.already_published }}
     steps:
       - name: Validate trusted release request
         id: request
@@ -86,6 +89,8 @@ jobs:
             apps/linux/src-tauri/tauri.conf.json
             scripts/lib/record-shared.mjs
             scripts/release-tooling-identity.mjs
+            scripts/linux-updater-manifest.mjs
+            scripts/lib/release-version.mjs
           sparse-checkout-cone-mode: false
 
       - name: Verify trusted release tooling identity
@@ -195,9 +200,35 @@ jobs:
           RELEASE_TAG: ${{ steps.request.outputs.release_tag }}
         run: gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName
 
+      - name: Reuse previously published Linux bundles
+        id: completion
+        if: ${{ steps.request.outputs.desktop_test_bundles != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.request.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          publication_state="$(node .release-tooling/scripts/linux-updater-manifest.mjs status \
+            --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" \
+            --output "$RUNNER_TEMP/linux-release-completion")"
+          already_published="$(jq -r '.state == "published"' <<< "$publication_state")"
+          echo "already_published=$already_published" >> "$GITHUB_OUTPUT"
+          if [[ "$already_published" == true ]]; then
+            echo "- Linux: existing same-tag bundles and signed updater metadata verified; no rebuild needed. Current updater publication follows." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Retain Linux completion evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-release-completion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-release-completion
+          if-no-files-found: ignore
+
   build_linux:
     name: Build Linux companion bundles
     needs: validate_release
+    if: ${{ needs.validate_release.outputs.already_published != 'true' }}
     # Oldest supported build base: bundles link against this glibc, so newer
     # runners would silently drop Ubuntu 22.04/Debian 12 users.
     runs-on: ubuntu-22.04
@@ -766,8 +797,9 @@ jobs:
     if: >-
       ${{
         always() &&
-        needs.build_linux.result == 'success' &&
-        needs.sign_linux.result == 'success' &&
+        (needs.validate_release.outputs.already_published == 'true' ||
+          (needs.build_linux.result == 'success' &&
+            needs.sign_linux.result == 'success')) &&
         (needs.validate_release.outputs.desktop_test_bundles != 'true' ||
           (needs.build_macos.result == 'success' &&
             needs.build_windows.result == 'success' &&
@@ -780,22 +812,39 @@ jobs:
       - build_macos
       - build_windows
       - sign_desktop
-    # One shared desktop-test channel asset must not race across release tags.
+    # Core activation and Linux updates share this short publication queue.
     concurrency:
       group: linux-app-release-publish
       cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: write
     steps:
+      - name: Checkout trusted Linux updater publication tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/linux-updater-manifest.mjs
+            scripts/release-tooling-identity.mjs
+            scripts/lib/record-shared.mjs
+            scripts/lib/release-version.mjs
+          sparse-checkout-cone-mode: false
+
       - name: Download Debian bundle
+        if: ${{ needs.validate_release.outputs.already_published != 'true' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           artifact-ids: ${{ needs.build_linux.outputs.deb_artifact_id }}
           path: dist/input/linux/release
 
       - name: Download signed AppImage
+        if: ${{ needs.validate_release.outputs.already_published != 'true' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           artifact-ids: ${{ needs.sign_linux.outputs.signed_appimage_artifact_id }}
@@ -816,6 +865,7 @@ jobs:
           path: dist/input
 
       - name: Assemble release assets and updater manifest
+        if: ${{ needs.validate_release.outputs.already_published != 'true' }}
         env:
           DESKTOP_TEST_BUNDLES: ${{ needs.validate_release.outputs.desktop_test_bundles }}
           GH_TOKEN: ${{ github.token }}
@@ -870,15 +920,63 @@ jobs:
           fi
 
       - name: Attach bundles to the release
+        if: ${{ needs.validate_release.outputs.already_published != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.validate_release.outputs.release_tag }}
+          DESKTOP_TEST_BUNDLES: ${{ needs.validate_release.outputs.desktop_test_bundles }}
+          TAG_SHA: ${{ needs.validate_release.outputs.tag_sha }}
         run: |
           set -euo pipefail
+          publication_state="$(node scripts/linux-updater-manifest.mjs status \
+            --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" \
+            --output "$RUNNER_TEMP/linux-release-before-upload")"
+          if [[ "$(jq -er '.state' <<< "$publication_state")" == published ]]; then
+            if [[ "$DESKTOP_TEST_BUNDLES" == true ]]; then
+              echo "Linux bundles already exist; refusing to replace published bytes. Recover only the missing desktop assets." >&2
+              exit 1
+            fi
+            echo "- Linux: a complete same-tag release appeared during the build; reusing its published bytes." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          elif [[ "$(jq -er '.state' <<< "$publication_state")" != pending ]]; then
+            echo "Linux publication state does not permit a new upload." >&2
+            exit 1
+          fi
+          actual_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)"
+          if [[ "$actual_sha" != "$TAG_SHA" ]]; then
+            echo "Release tag moved after the Linux build; refusing publication." >&2
+            exit 1
+          fi
+          node scripts/release-tooling-identity.mjs verify \
+            --repository "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REF_NAME" \
+            --workflow-full-ref "$GITHUB_REF" --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --writer-run-id "$GITHUB_RUN_ID" --writer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --writer-workflow-path .github/workflows/linux-app-release.yml \
+            --writer-workflow-event workflow_run
           gh release upload "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber \
             dist/release/*
+
+      - name: Update the current stable Linux updater
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate_release.outputs.release_tag }}
+          TAG_SHA: ${{ needs.validate_release.outputs.tag_sha }}
+        run: |
+          node scripts/linux-updater-manifest.mjs publish \
+            --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$TAG_SHA" --output "$RUNNER_TEMP/linux-updater-publication"
+
+      - name: Retain Linux updater publication evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-updater-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/linux-updater-publication
+            ${{ runner.temp }}/linux-release-before-upload
+          if-no-files-found: ignore
 
       - name: Publish desktop test update channel
         if: ${{ needs.validate_release.outputs.desktop_test_bundles == 'true' }}

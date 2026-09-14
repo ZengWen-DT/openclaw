@@ -1,5 +1,7 @@
+import { buildSessionContext as buildCoreSessionContext } from "../../../packages/agent-core/src/harness/session/session.js";
 import {
   readActiveTranscriptEntryAnchor,
+  readTranscriptEventAtSeqSync,
   readTranscriptMutationAtSync,
   validatePreparedAssistantAppendSync,
   type TranscriptEntryAnchor,
@@ -8,10 +10,8 @@ import { resolveSessionTranscriptReadFence } from "../../config/sessions/session
 import { applyAssistantDeliveryDirectives } from "../../config/sessions/transcript-assistant-delivery.js";
 import { isSessionTranscriptSideAppendEntry } from "../../config/sessions/transcript-tree.js";
 import type { ImageContent, Message, TextContent } from "../../llm/types.js";
-import {
-  buildSessionContext as buildCoreSessionContext,
-  type SessionTreeEntry as CoreSessionTreeEntry,
-} from "../runtime/index.js";
+import { copyPreparedModelVisibleToolText } from "../../logging/redact-internal.js";
+import type { SessionTreeEntry as CoreSessionTreeEntry } from "../runtime/index.js";
 import {
   copyCodeModeSourceAppend,
   getCodeModeSourceAppend,
@@ -63,6 +63,20 @@ export class SessionManagerEntries extends SessionManagerPersistence {
       throw new Error(`Invalid session transcript entry: ${entry.type}`);
     }
     if (entry.type === "message" && canonicalEntry.type === "message") {
+      if (
+        entry.message.role === "toolResult" &&
+        canonicalEntry.message.role === "toolResult" &&
+        Array.isArray(entry.message.content) &&
+        Array.isArray(canonicalEntry.message.content)
+      ) {
+        const canonicalContent = canonicalEntry.message.content;
+        entry.message.content.forEach((block, index) => {
+          const canonicalBlock = canonicalContent[index];
+          if (block?.type === "text" && canonicalBlock?.type === "text") {
+            copyPreparedModelVisibleToolText(block, canonicalBlock);
+          }
+        });
+      }
       copyCodeModeSourceAppend(
         entry.message,
         canonicalEntry.message,
@@ -226,16 +240,25 @@ export class SessionManagerEntries extends SessionManagerPersistence {
     return error;
   }
 
-  resolveCurrentTurnEntryId(isInterruptedTail?: (entry: SessionEntry) => boolean): string | null {
+  resolveCurrentTurnEntryId(
+    isInterruptedTail?: (entry: SessionEntry) => boolean,
+    options?: { includeOmittedCustomMessages?: boolean },
+  ): string | null {
+    const includeOmitted = options?.includeOmittedCustomMessages === true;
     let parentId = this.appendParentId;
-    let remainingAncestors = this.byId.size;
+    let remainingAncestors = includeOmitted
+      ? (this.boundedContextLimits?.maxEvents ?? this.byId.size + this.opaqueParentsById.size)
+      : this.byId.size;
     // Compaction rewrites context without consuming the current user turn.
     // Walk physical parents: opaque/context-excluded users still close older
-    // turns. Replay may recognize its interrupted tail, never skip missing rows.
+    // turns. Replay may read its omitted activity, never skip unidentified rows.
     while (parentId && remainingAncestors-- > 0) {
-      const parent = this.byId.get(parentId);
+      const parent =
+        this.byId.get(parentId) ??
+        (includeOmitted ? this.readOmittedCustomMessage(parentId) : undefined);
       if (
         !parent ||
+        parent.id !== parentId ||
         (!isSessionContextMetadataEntry(parent) &&
           parent.type !== "compaction" &&
           !isInterruptedTail?.(parent))
@@ -245,6 +268,24 @@ export class SessionManagerEntries extends SessionManagerPersistence {
       parentId = parent.parentId;
     }
     return parentId;
+  }
+
+  private readOmittedCustomMessage(entryId: string): SessionMessageEntry | undefined {
+    if (!this.persistenceTarget) {
+      return undefined;
+    }
+    const anchor = readActiveTranscriptEntryAnchor({ ...this.persistenceTarget, entryId });
+    if (!anchor) {
+      return undefined;
+    }
+    const event = readTranscriptEventAtSeqSync(this.persistenceTarget, anchor.rawSeq)?.event;
+    return isIndexedSessionEntry(event) &&
+      event.type === "message" &&
+      event.message.role === "custom" &&
+      event.id === anchor.entryId &&
+      event.parentId === anchor.effectiveParentId
+      ? event
+      : undefined;
   }
 
   appendMessage(

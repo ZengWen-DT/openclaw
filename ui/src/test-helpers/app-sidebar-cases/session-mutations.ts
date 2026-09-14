@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ControlUiAction } from "../../../../src/plugin-sdk/control-ui.js";
+import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { GatewaySessionRow } from "../../api/types.ts";
 import { publishSidebarSessionList } from "../../components/session-data-controller-events.ts";
@@ -11,7 +12,6 @@ import {
   createGatewayHarness,
   createSessionState,
   createSessionsHarness,
-  deferred,
   mountSidebar,
   type SidebarLifecycleState,
   successfulSessionPatch,
@@ -591,6 +591,19 @@ describe("AppSidebar session mutation feedback", () => {
 
   it("does not truncate a pending batch when another mutation starts", async () => {
     const { harness, sidebar } = await mountMutationHarness();
+    const toast = await mountToastHost();
+    toast.querySelector<HTMLButtonElement>(".app-toast__dismiss")?.click();
+    await toast.updateComplete;
+    harness.publishList({
+      result: createSessionState("main", [
+        "agent:main:main",
+        "agent:main:a",
+        "agent:main:b",
+        "agent:main:c",
+        "agent:main:d",
+      ]).result,
+    });
+    await sidebar.updateComplete;
     const archive = deferred<Awaited<ReturnType<typeof harness.patchMany>>>();
     harness.patchMany.mockImplementationOnce(() => archive.promise);
     selectSession(sidebar, "agent:main:a");
@@ -605,10 +618,10 @@ describe("AppSidebar session mutation feedback", () => {
     menu?.querySelector<HTMLButtonElement>('[data-shortcut="a"]')?.click();
     await waitForFast(() => expect(harness.patchMany).toHaveBeenCalledOnce());
 
-    row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    selectSession(sidebar, "agent:main:c");
+    selectSession(sidebar, "agent:main:d");
     await sidebar.updateComplete;
-    menu = sidebar.querySelector<TestSessionMenu>("openclaw-session-menu");
-    await menu?.updateComplete;
+    menu = await openSessionMenu(sidebar, "agent:main:d");
     menu?.querySelector<HTMLButtonElement>('[data-shortcut="u"]')?.click();
     await waitForFast(() => expect(harness.patchMany).toHaveBeenCalledTimes(2));
 
@@ -619,7 +632,14 @@ describe("AppSidebar session mutation feedback", () => {
       ],
     });
     await archive.promise;
+    await waitForFast(() =>
+      expect(toast.querySelector(".app-toast__message")?.textContent).toBe("Archived 2 sessions"),
+    );
     expect(harness.patchMany).toHaveBeenCalledTimes(2);
+    expect(harness.patchMany.mock.calls[1]?.[0].map((target) => target.key)).toEqual([
+      "agent:main:c",
+      "agent:main:d",
+    ]);
     expect(harness.patchMany.mock.calls[1]?.[1]).toEqual({ unread: true });
     expect(harness.patch).not.toHaveBeenCalled();
   });

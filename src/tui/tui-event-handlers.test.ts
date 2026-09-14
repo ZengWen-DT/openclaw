@@ -2230,7 +2230,9 @@ describe("tui-event-handlers: handleAgentEvent", () => {
       },
     });
 
-    expect(chatLog.finalizeAssistant).toHaveBeenCalledWith("Attached image", "run-external-image");
+    expect(chatLog.finalizeAssistant).toHaveBeenCalledWith("Attached image", "run-external-image", [
+      { source: "file:///Users/operator/private/image.png" },
+    ]);
     expect(chatLog.dropAssistant).not.toHaveBeenCalled();
     expect(loadHistory).not.toHaveBeenCalled();
   });
@@ -2539,7 +2541,7 @@ describe("tui-event-handlers: handleAgentEvent", () => {
       handleChatEvent({ runId: "run-stale", seq: 1, message: { content: "complete reply" } });
       handleChatEvent({ runId: "run-terminal", seq: 2, state: terminal });
 
-      handleSessionsChangedEvent({ reason: "chat.run.settled", activeRunIds: [] });
+      handleSessionsChangedEvent({ reason: "agent.input.settled", activeRunIds: [] });
 
       expect(state.activeChatRunId).toBeNull();
       expect(state.activityStatus).toBe("idle");
@@ -2563,7 +2565,7 @@ describe("tui-event-handlers: handleAgentEvent", () => {
         state: { activeChatRunId: "run-restored", activityStatus: "streaming" },
       });
 
-      handleSessionsChangedEvent({ reason: "chat.run.settled", ...event });
+      handleSessionsChangedEvent({ reason: "agent.input.settled", ...event });
 
       expect(state.activeChatRunId).toBe("run-restored");
       expect(state.activityStatus).toBe("streaming");
@@ -2581,7 +2583,7 @@ describe("tui-event-handlers: handleAgentEvent", () => {
     });
 
     handleSessionsChangedEvent({
-      reason: "chat.run.settled",
+      reason: "agent.input.settled",
       sessionId: "session-old",
       activeRunIds: [],
     });
@@ -2612,7 +2614,7 @@ describe("tui-event-handlers: handleAgentEvent", () => {
       handleSessionsChangedEvent({
         sessionKey: "main",
         ...(eventAgentId ? { agentId: eventAgentId } : {}),
-        reason: "chat.run.settled",
+        reason: "agent.input.settled",
         activeRunIds: [],
       });
 
@@ -2634,7 +2636,7 @@ describe("tui-event-handlers: handleAgentEvent", () => {
     Object.assign(state, pending);
     setActivityStatus.mockClear();
 
-    handleSessionsChangedEvent({ reason: "chat.run.settled", activeRunIds: [] });
+    handleSessionsChangedEvent({ reason: "agent.input.settled", activeRunIds: [] });
 
     expect(state.activeChatRunId).toBeNull();
     expect(state.pendingSubmit).toEqual(pending.pendingSubmit);
@@ -4090,7 +4092,7 @@ describe("tui-event-handlers: streaming watchdog", () => {
 
     handlers.handleSessionsChangedEvent({
       sessionKey: state.currentSessionKey,
-      reason: "chat.run.settled",
+      reason: "agent.input.settled",
       activeRunIds: [],
     });
 

@@ -24,7 +24,6 @@ import {
   clearConfigRequestVersions,
   createInitialConfigState,
   type AgentConfigEntryTarget,
-  type LoadConfigOptions,
   type RuntimeConfigGateway,
   type RuntimeConfigState,
 } from "./config-state-model.ts";
@@ -38,14 +37,13 @@ export type RuntimeConfigCapability = {
   readonly canOpenFile?: boolean;
   ensureLoaded: () => Promise<void>;
   ensureSchemaLoaded: () => Promise<void>;
-  refresh: (options?: LoadConfigOptions) => Promise<void>;
+  refresh: (options?: { background?: boolean }) => Promise<void>;
   refreshSchema: () => Promise<void>;
   patchForm: (path: Array<string | number>, value: unknown) => void;
   removeFormValue: (path: Array<string | number>) => void;
   setRaw: (value: string) => void;
-  resetDraft: () => void;
-  /** Discards pending edits: reloads from disk when connected, else resets locally. */
-  discardDraft: () => Promise<void>;
+  /** Reloads from disk; offline drafts reset locally unless reloadOnly is requested. */
+  discardDraft: (options?: { reloadOnly?: boolean }) => Promise<void>;
   /** Pauses/resumes all config writes (autosave + manual) while e.g. the app updater runs. */
   setWritesSuspended: (suspended: boolean, refreshAdmission?: () => Promise<void>) => void;
   /** Resolves once no config write is in flight (used as an updater barrier). */
@@ -232,9 +230,6 @@ export function createRuntimeConfigCapability(
     ensureLoaded,
     ensureSchemaLoaded,
     refresh: async (options) => {
-      if (options?.discardPendingChanges) {
-        await writes.prepareDiscard();
-      }
       appliedRefresh.cancel();
       try {
         await trackLoad(
@@ -253,7 +248,6 @@ export function createRuntimeConfigCapability(
     patchForm: writes.patchForm,
     removeFormValue: writes.removeFormValue,
     setRaw: writes.setRaw,
-    resetDraft: writes.resetDraft,
     discardDraft: writes.discardDraft,
     setWritesSuspended: writes.setWritesSuspended,
     waitForPendingWrites: writes.waitForPendingWrites,

@@ -34,6 +34,16 @@ export type WorkboardKeyedStore<T = PersistedWorkboardCard> = {
   entries(): Promise<Array<{ key: string; value: T }>>;
 };
 
+export type WorkboardSubscriptionStore = Omit<
+  WorkboardKeyedStore<PersistedWorkboardNotificationSubscription>,
+  "entries"
+> & {
+  entries(options?: {
+    boardId?: string;
+    cardId?: string;
+  }): Promise<Array<{ key: string; value: PersistedWorkboardNotificationSubscription }>>;
+};
+
 type WorkboardBoardCardAggregate = {
   boardId: string;
   status: WorkboardCard["status"];
@@ -42,9 +52,19 @@ type WorkboardBoardCardAggregate = {
   updatedAt: number;
 };
 
+export type WorkboardCardStatsAggregate = {
+  status: WorkboardCard["status"];
+  agentId: string | undefined;
+  total: number;
+  archived: number;
+  updatedAt: number;
+  oldestReadyAt: number | undefined;
+};
+
 export type WorkboardOwnerClaimResult = "updated" | "conflict" | "owner_busy";
 
-export type WorkboardCardStore = WorkboardKeyedStore & {
+export type WorkboardCardStore = Omit<WorkboardKeyedStore, "entries"> & {
+  entries(boardId?: string): Promise<Array<{ key: string; value: PersistedWorkboardCard }>>;
   registerIfAbsent(key: string, value: PersistedWorkboardCard): Promise<boolean>;
   registerIfUpdatedAt(
     key: string,
@@ -59,5 +79,8 @@ export type WorkboardCardStore = WorkboardKeyedStore & {
     ownerId: string,
     now: number,
   ): Promise<WorkboardOwnerClaimResult>;
+  listCardStatuses(ids: readonly string[]): Promise<Array<{ id: string; status: string }>>;
   listBoardAggregates(): Promise<WorkboardBoardCardAggregate[]>;
+  listStatsAggregates(boardId?: string): Promise<WorkboardCardStatsAggregate[]>;
+  hasCards(boardId: string): Promise<boolean>;
 };

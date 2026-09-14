@@ -682,10 +682,7 @@ describe("gateway server chat", () => {
   };
 
   const mockBlockedChatReply = () => {
-    let releaseBlockedReply: (() => void) | undefined;
-    const blockedReply = new Promise<void>((resolve) => {
-      releaseBlockedReply = resolve;
-    });
+    const { promise: blockedReply, resolve: releaseBlockedReply } = createDeferred();
     mockGetReplyFromConfigOnce(async (_ctx, opts) => {
       await new Promise<void>((resolve) => {
         let settled = false;
@@ -1476,8 +1473,10 @@ describe("gateway server chat", () => {
             (o) =>
               o.type === "event" &&
               o.event === "sessions.changed" &&
-              o.payload?.reason === "chat.dispatch-error" &&
-              o.payload?.sessionKey === "agent:main:main",
+              o.payload?.sessionKey === "agent:main:main" &&
+              o.payload?.status === "failed" &&
+              o.payload?.lastRunId === "idem-dispatch-error-1" &&
+              o.payload?.hasActiveRun === false,
             8_000,
           );
           messagePromises.push(sessionChangedPromise);
@@ -1691,6 +1690,27 @@ describe("gateway server chat", () => {
         { type: "message", content: JSON.stringify({ ok: true, messageId: "content-result" }) },
       ],
       visible: true,
+    },
+    {
+      name: "chat.history hides failed delivery encoded in a result text block",
+      content: [{ type: "text", text: JSON.stringify({ ok: false }) }],
+      visible: false,
+    },
+    {
+      name: "chat.history honors a dry-run result after an earlier success block",
+      content: [
+        { type: "text", text: JSON.stringify({ ok: true }) },
+        { type: "message", content: JSON.stringify({ dryRun: true }) },
+      ],
+      visible: false,
+    },
+    {
+      name: "chat.history honors suppressed delivery after an earlier success block",
+      content: [
+        { type: "text", text: JSON.stringify({ ok: true }) },
+        { type: "message", content: JSON.stringify({ deliveryStatus: "suppressed" }) },
+      ],
+      visible: false,
     },
     {
       name: "chat.history hides suppressed delivery encoded in a result text block",
@@ -2906,10 +2926,7 @@ describe("gateway server chat", () => {
 
   test("agent.wait ignores stale chat dedupe when an agent run with the same runId is in flight", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-gw-"));
-    let resolveAgentRun: (() => void) | undefined;
-    const blockedAgentRun = new Promise<void>((resolve) => {
-      resolveAgentRun = resolve;
-    });
+    const { promise: blockedAgentRun, resolve: resolveAgentRun } = createDeferred();
     const agentSpy = vi.mocked(agentCommandMock);
     agentSpy.mockImplementationOnce(async () => {
       await blockedAgentRun;
@@ -3012,7 +3029,7 @@ describe("gateway server chat", () => {
     await withMainSessionStore(async () => {
       const runId = "idem-wait-chat-active-vs-stale-agent";
       const seedAgentRes = await rpcReq(ws, "agent", {
-        sessionKey: "main",
+        sessionKey: "agent:main:stale-wait-snapshot",
         message: "seed stale agent snapshot",
         idempotencyKey: runId,
       });

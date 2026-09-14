@@ -66,6 +66,88 @@ afterEach(() => {
 });
 
 describe("agent.wait gateway dedupe observations", () => {
+  it.each([undefined, true] as const)(
+    "retires a sticky terminal only for an admitted new attempt: %s",
+    async (startNewAttempt) => {
+      const runId = `private-retry-${startNewAttempt ?? "ordinary"}`;
+      const key = `agent:${runId}`;
+      const dedupe = new Map<string, DedupeEntry>();
+      setGatewayDedupeEntry({
+        dedupe,
+        key,
+        entry: {
+          ts: 100,
+          ok: true,
+          requestIdentity: "original-input-binding",
+          payload: { runId, status: "timeout", stopReason: "restart" },
+        },
+      });
+      setGatewayDedupeEntry({
+        dedupe,
+        key,
+        startNewAttempt: true,
+        entry: { ts: 150, ok: true, payload: { runId, status: "ok" } },
+      });
+      expect(dedupe.get(key)?.payload).toMatchObject({ status: "timeout", stopReason: "restart" });
+      setGatewayDedupeEntry({
+        dedupe,
+        key,
+        startNewAttempt,
+        entry: {
+          ts: 200,
+          ok: true,
+          requestIdentity: "replacement-must-not-change-binding",
+          payload: { runId, status: "accepted", reservationId: "new-admission" },
+        },
+      });
+      expect(dedupe.get(key)?.requestIdentity).toBe("original-input-binding");
+      expect(dedupe.get(key)?.payload).toMatchObject({
+        status: startNewAttempt ? "accepted" : "timeout",
+      });
+      const observed = await waitForAgentJob({ runId, timeoutMs: 0 });
+      if (startNewAttempt) {
+        expect(observed).toBeNull();
+        completeRun(dedupe, runId);
+        expect(await waitForAgentJob({ runId, timeoutMs: 0 })).toMatchObject({ status: "ok" });
+      } else {
+        expect(observed).toMatchObject({ status: "error", stopReason: "restart" });
+      }
+    },
+  );
+
+  it("expires terminal observations from their latest write without extending unrelated runs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const dedupe = new Map<string, DedupeEntry>();
+    completeRun(dedupe, "cache-refreshed");
+    completeRun(dedupe, "cache-original");
+    vi.setSystemTime(1_000_100);
+    completeRun(dedupe, "cache-refreshed");
+    // Wall-clock correction can insert an earlier expiry after newer records.
+    vi.setSystemTime(999_900);
+    completeRun(dedupe, "cache-clock-correction");
+
+    for (const [now, expected] of [
+      [1_599_900, ["ok", "ok", "ok"]],
+      [1_599_901, ["ok", "ok", "timeout"]],
+      [1_600_000, ["ok", "ok", "timeout"]],
+      [1_600_001, ["ok", "timeout", "timeout"]],
+      [1_600_100, ["ok", "timeout", "timeout"]],
+      [1_600_101, ["timeout", "timeout", "timeout"]],
+    ] as const) {
+      vi.setSystemTime(now);
+      const runIds = ["cache-refreshed", "cache-original", "cache-clock-correction"];
+      for (const [index, runId] of runIds.entries()) {
+        const waiter = waitThroughGateway({ runId, timeoutMs: 0 });
+        await waiter.promise;
+        expect(waiter.respond).toHaveBeenCalledWith(
+          true,
+          expect.objectContaining({ runId, status: expected[index] }),
+        );
+      }
+    }
+  });
+
   it("retains chat input identity when terminal writers replace admission metadata", async () => {
     const runId = "run-chat-request-identity";
     const key = `chat:${runId}`;

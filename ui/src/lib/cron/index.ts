@@ -221,6 +221,7 @@ export type CronState = {
   cronJobsSortBy: CronJobsSortBy;
   cronJobsSortDir: CronSortDir;
   cronAgentId: string | null;
+  cronSessionFilter?: { sessionKey: string; sessionAgentId: string };
   cronStatus: CronStatus | null;
   cronScopedTotal: number | null;
   cronScopedNextWakeAtMs: number | null;
@@ -689,7 +690,7 @@ export async function loadCronJobsPage(
   try {
     const offset = append ? Math.max(0, state.cronJobsNextOffset ?? state.cronJobs.length) : 0;
     const res = await state.client.request<CronJobsListResult>("cron.list", {
-      ...(state.cronAgentId ? { agentId: state.cronAgentId } : {}),
+      ...(state.cronSessionFilter ?? (state.cronAgentId ? { agentId: state.cronAgentId } : {})),
       includeDisabled: state.cronJobsEnabledFilter === "all",
       includeDeliveryPreviews: false,
       limit: state.cronJobsLimit,
@@ -1344,11 +1345,11 @@ export async function runCronJob(state: CronState, jobId: string, mode: "force" 
       // Invalid persisted specs create a skipped history entry with diagnostics;
       // true no-op outcomes have no new history to fetch.
       if ("reason" in result && result.reason === "invalid-spec") {
-        await loadCronRuns(state, state.cronRunsScope === "all" ? null : jobId);
+        await loadCronRuns(state);
       }
       return;
     }
-    await loadCronRuns(state, state.cronRunsScope === "all" ? null : jobId);
+    await loadCronRuns(state);
     if ("enqueued" in result && result.enqueued) {
       state.cronError = `Run queued. Run ID: ${result.runId}`;
     }
@@ -1390,7 +1391,8 @@ type CronRunsRequestIdentity = {
   queued?: Deferred<CronRunsLoadStatus>;
 };
 
-// The same state owns overview, per-job, filtered, and paginated requests.
+// The selected state owns overview, per-job, filtered, and paginated requests.
+// Mutation completions refresh this view without supplying another job identity.
 // Only its latest exact request may replace the history, error, or load state.
 const activeCronRunsRequests = new WeakMap<CronState, CronRunsRequestIdentity>();
 
@@ -1429,7 +1431,6 @@ function ownsCronRunsRequest(state: CronState, request: CronRunsRequestIdentity)
 
 export async function loadCronRuns(
   state: CronState,
-  jobId: string | null,
   opts?: { append?: boolean; coalesce?: boolean },
 ): Promise<CronRunsLoadStatus> {
   const client = state.client;
@@ -1437,7 +1438,7 @@ export async function loadCronRuns(
     return "skipped";
   }
   const scope = state.cronRunsScope;
-  const activeJobId = jobId ?? state.cronRunsJobId;
+  const activeJobId = state.cronRunsJobId;
   if (scope === "job" && !activeJobId) {
     clearCronRunsPage(state);
     return "skipped";
@@ -1520,7 +1521,7 @@ export async function loadCronRuns(
     }
     // Publish successful progress even when dirty. The tail belongs to queued
     // callers, so sustained events cannot hold the original mutation open.
-    request.queued?.resolve(reload ? loadCronRuns(state, request.jobId, opts) : "skipped");
+    request.queued?.resolve(reload ? loadCronRuns(state, opts) : "skipped");
   }
 }
 
@@ -1528,7 +1529,7 @@ export async function loadMoreCronRuns(state: CronState) {
   if (state.cronRunsScope === "job" && !state.cronRunsJobId) {
     return;
   }
-  await loadCronRuns(state, state.cronRunsJobId, { append: true });
+  await loadCronRuns(state, { append: true });
 }
 
 export function updateCronRunsFilter(

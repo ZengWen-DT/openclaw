@@ -70,6 +70,71 @@ describe("e2e shell tempfile hygiene", () => {
     expect(offenders).toEqual([]);
   });
 
+  it.each([
+    { name: "persistent failure", succeedsAfter: 0, exitCode: 7, calls: 2 },
+    { name: "immediate success", succeedsAfter: 1, exitCode: 0, calls: 1 },
+    { name: "success after a failed probe", succeedsAfter: 2, exitCode: 0, calls: 2 },
+  ])("preserves config reload RPC status on $name", async (scenario) => {
+    const tempRoot = tempDirs.make("openclaw-config-reload-status-");
+    const script = await readFile("scripts/e2e/config-reload-source-docker.sh", "utf8");
+    const rpcFunction = script.match(/^check_rpc_status\(\) \{[\s\S]*?^\}/m)?.[0];
+    if (!rpcFunction) {
+      throw new Error("Config reload RPC status function was not found");
+    }
+    const callsPath = path.join(tempRoot, "calls.txt");
+    const result = spawnSync(
+      process.platform === "darwin" ? "/bin/bash" : "bash",
+      [
+        "-c",
+        `
+set -euo pipefail
+PORT=18789
+TOKEN=synthetic-token
+CONTAINER_NAME=synthetic-container
+docker_e2e_docker_cmd() {
+  "$BASH" -c "$PROBE_PRELUDE
+$5"
+}
+${rpcFunction}
+check_rpc_status "$OUTPUT_PATH"
+`,
+      ],
+      {
+        encoding: "utf8",
+        timeout: 5_000,
+        env: {
+          ...process.env,
+          OUTPUT_PATH: path.join(tempRoot, "rpc.log"),
+          CALLS_PATH: callsPath,
+          SUCCEEDS_AFTER: String(scenario.succeedsAfter),
+          PROBE_PRELUDE: `
+source() { :; }
+openclaw_e2e_resolve_entrypoint() { printf '%s' synthetic-entry; }
+calls=0
+SECONDS=0
+node() {
+  calls=$((calls + 1))
+  printf '%s' "$calls" > "$CALLS_PATH"
+  if [ "$SUCCEEDS_AFTER" -gt 0 ] && [ "$calls" -ge "$SUCCEEDS_AFTER" ]; then
+    return 0
+  fi
+  printf '%s\\n' 'synthetic RPC failure' >&2
+  return 7
+}
+# Advance the real loop's clock without waiting for its 120-second deadline.
+sleep() { SECONDS=$((SECONDS + 61)); }
+`,
+        },
+      },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(scenario.exitCode);
+    expect(await readFile(callsPath, "utf8")).toBe(String(scenario.calls));
+    if (scenario.exitCode !== 0) {
+      expect(result.stderr).toContain("synthetic RPC failure");
+    }
+  });
+
   it("preserves wizard exit status when reporting failures", async () => {
     const tempRoot = await mkdtemp(path.join(tmpdir(), "openclaw-onboard-status-test-"));
     const fixturePath = path.join(tempRoot, "wizard-status.sh");
@@ -409,10 +474,13 @@ case "\${1:-} \${2:-}" in
         printf '%s\n' 'network connection reset' >&2
         exit 1
       fi
-      printf '%s\n' '╭─ ClawHub Security Audit ─────────────────────────────────────────────╮' >&2
-      printf '%s\n' '│ risky@1.0.0                                                         │' >&2
-      printf '%s\n' '│ Outcome: Blocked                                                    │' >&2
-      printf '%s\n' '╰──────────────────────────────────────────────────────────────────────╯' >&2
+      if [ "\${FAKE_RISK_MODE:-current}" = frozen ]; then
+        printf '%s\n' '╭─ ClawHub Security Audit ─╮' >&2
+        printf '%s\n' '│ Outcome: Blocked        │' >&2
+      else
+        printf '%s\n' 'ClawHub found security risks in risky@1.0.0' >&2
+        printf '%s\n' 'Update cancelled; rerun with --acknowledge-clawhub-risk' >&2
+      fi
       exit 1
     fi
     skill_dir="$HOME/.openclaw/workspace/skills/safe"
@@ -449,6 +517,23 @@ esac
         "Skipping live ClawHub skill with current security findings: risky",
       );
       expect(result.stdout).toContain("E2E_OK installed=safe version=1.0.0");
+      expect((await readFile(attemptsPath, "utf8")).trim().split("\n")).toEqual(["risky", "safe"]);
+
+      await rm(attemptsPath, { force: true });
+      const frozenResult = spawnSync("bash", ["scripts/e2e/lib/skills/clawhub-install-proof.sh"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FAKE_RISK_MODE: "frozen",
+          OPENCLAW_CURRENT_PACKAGE_TGZ: "",
+          OPENCLAW_SKILL_INSTALL_E2E_PREFERRED_SLUG: "risky",
+          OPENCLAW_TEST_STATE_SCRIPT_B64: "",
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          TMPDIR: scratchRoot,
+        },
+      });
+      expect(frozenResult.status, `${frozenResult.stdout}\n${frozenResult.stderr}`).toBe(0);
       expect((await readFile(attemptsPath, "utf8")).trim().split("\n")).toEqual(["risky", "safe"]);
 
       await rm(attemptsPath, { force: true });

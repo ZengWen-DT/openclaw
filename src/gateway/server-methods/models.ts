@@ -8,6 +8,7 @@ import {
 import { tryResolveAmbientOwnerAgentId } from "../../agents/agent-scope-config.js";
 import { ModelAccountConnectAuthorityError } from "../model-account-connect.js";
 import { resolveAgentIdOrRespondError } from "./agent-id-shared.js";
+import type { ChatMetadataReadParams } from "./chat-metadata-contract.js";
 import { resolveChatMetadataReadParams } from "./chat-metadata-handler.js";
 import { projectSessionModelCatalog } from "./chat-metadata-session-projection.js";
 import { buildModelsListResult } from "./models-list-result.js";
@@ -16,16 +17,17 @@ import { resolveAuthenticatedProfileId } from "./users-profile-access.js";
 import { assertValidParams } from "./validation.js";
 export { buildModelsListResult };
 
-// Ordinary reads consume published facts; only an explicit refresh starts discovery.
+// Ordinary reads return saved rows while expired provider inventory refreshes in the background.
 export const modelsHandlers: GatewayRequestHandlers = {
   "models.list": async (options) => {
     const { params, respond, context, client } = options;
     if (!assertValidParams(params, validateModelsListParams, "models.list", respond)) {
       return;
     }
+    let scope: ChatMetadataReadParams | undefined;
     try {
       const scoped = Boolean(params.sessionKey || params.authProfileId);
-      const scope = scoped ? resolveChatMetadataReadParams(options, params) : undefined;
+      scope = scoped ? resolveChatMetadataReadParams(options, params) : undefined;
       if (scoped && !scope) {
         return;
       }
@@ -49,6 +51,7 @@ export const modelsHandlers: GatewayRequestHandlers = {
         ...(scope ? { readScope: scope } : {}),
       });
       scope?.draftAccountSelection?.assertCurrent();
+      scope?.assertCurrent?.();
       respond(
         true,
         scope && params.view !== "provider-config"
@@ -64,6 +67,8 @@ export const modelsHandlers: GatewayRequestHandlers = {
         throw error;
       }
       respond(false, undefined, errorShape(ErrorCodes.FORBIDDEN, error.message));
+    } finally {
+      scope?.release?.();
     }
   },
 };

@@ -24,17 +24,11 @@ import {
   normalizeNativePathSeparators,
   type IgnoreMatcher,
 } from "../../shared/ignore-rules.js";
-import { CONFIG_DIR_NAME } from "../config.js";
+import { CONFIG_DIR_NAME } from "../package-metadata.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
-
-export interface PathMetadata {
-  source: string;
-  scope: SourceScope;
-  origin: "package" | "top-level";
-  baseDir?: string;
-}
+import type { PathMetadata, SourceScope } from "./source-info.js";
 
 export interface ResolvedResource {
   path: string;
@@ -64,8 +58,6 @@ interface PackageManagerOptions {
   agentDir: string;
   settingsManager: SettingsManager;
 }
-
-type SourceScope = "user" | "project" | "temporary";
 
 type NpmSource = {
   type: "npm";

@@ -36,7 +36,6 @@ import {
   DEFAULT_CHANNEL_STALE_EVENT_THRESHOLD_MS,
   resolveChannelHealthState,
 } from "../channel-health-policy.js";
-import { resolveGatewayPluginConfig } from "../runtime-plugin-config.js";
 import type { ChannelAccountStartOutcome } from "../server-channel-runtime.types.js";
 import { formatForLog } from "../ws-log.js";
 import {
@@ -274,7 +273,7 @@ async function startChannelAccount(params: ChannelAccountParams): Promise<Channe
     throw new Error(`Channel ${params.channelId} does not support runtime start`);
   }
   const resolvedAccountId = resolveChannelGatewayAccountId(params, () =>
-    params.context.getRuntimeSnapshot(params.channelId),
+    params.context.getRuntimeSnapshot({ channelId: params.channelId, inspectAccounts: false }),
   );
   const outcomes = await params.context.startChannel(params.channelId, resolvedAccountId, {
     manual: true,
@@ -285,7 +284,10 @@ async function startChannelAccount(params: ChannelAccountParams): Promise<Channe
       `Channel ${params.channelId} did not report a start outcome for ${resolvedAccountId}`,
     );
   }
-  const runtime = params.context.getRuntimeSnapshot(params.channelId);
+  const runtime = params.context.getRuntimeSnapshot({
+    channelId: params.channelId,
+    inspectAccounts: false,
+  });
   const started =
     resolveRuntimeAccountSnapshot({
       runtime,
@@ -309,10 +311,13 @@ async function startChannelAccount(params: ChannelAccountParams): Promise<Channe
 /** Stop one channel account through its owning channel plugin. */
 async function stopChannelAccount(params: ChannelAccountParams): Promise<ChannelStopPayload> {
   const resolvedAccountId = resolveChannelGatewayAccountId(params, () =>
-    params.context.getRuntimeSnapshot(params.channelId),
+    params.context.getRuntimeSnapshot({ channelId: params.channelId, inspectAccounts: false }),
   );
   await params.context.stopChannel(params.channelId, resolvedAccountId);
-  const runtime = params.context.getRuntimeSnapshot(params.channelId);
+  const runtime = params.context.getRuntimeSnapshot({
+    channelId: params.channelId,
+    inspectAccounts: false,
+  });
   const stopped =
     resolveRuntimeAccountSnapshot({
       runtime,
@@ -336,11 +341,7 @@ export const channelsHandlers: GatewayRequestHandlers = {
     const timeoutMsRaw = (params as { timeoutMs?: unknown }).timeoutMs;
     const timeoutMs = resolveChannelsStatusTimeoutMs({ probe, timeoutMsRaw });
     const rawChannel = (params as { channel?: unknown }).channel;
-    const runtimeConfig = context.getRuntimeConfig();
-    const cfg = resolveGatewayPluginConfig({
-      config: runtimeConfig,
-    });
-    const runtime = context.getRuntimeSnapshot();
+    const cfg = context.getRuntimeConfig();
     const plugins = listReadOnlyChannelPluginsForConfig(cfg);
     const requestedChannel =
       typeof rawChannel === "string"
@@ -362,6 +363,7 @@ export const channelsHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    const runtime = context.getRuntimeSnapshot({ channelId: requestedChannel });
     const statusWarnings: string[] = [];
 
     const buildAccountSnapshot = async (
@@ -607,6 +609,7 @@ export const channelsHandlers: GatewayRequestHandlers = {
     payload.statusIssues = collectGatewayChannelStatusIssues({
       payload,
       plugins: statusPlugins,
+      reloadingChannels: runtime.reloadingChannels,
       defaultAccountIds: defaultAccountIdMap,
       context,
       warnings: statusWarnings,
@@ -652,9 +655,7 @@ export const channelsHandlers: GatewayRequestHandlers = {
         startChannelAccount({
           channelId,
           accountId: parsedParams.accountId,
-          cfg: resolveGatewayPluginConfig({
-            config: context.getRuntimeConfig(),
-          }),
+          cfg: context.getRuntimeConfig(),
           context,
           plugin,
         }),

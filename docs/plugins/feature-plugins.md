@@ -70,7 +70,6 @@ npm install
 npm run build
 npm run validate
 openclaw plugins install .
-openclaw gateway restart
 ```
 
 The scaffold includes a draft-analysis operation, an agent tool, a native page,
@@ -78,6 +77,11 @@ and a composer replacement. Open Draft Review from the Control UI sidebar, or
 open **Plugins → Customize UI** and choose Draft composer. Choose Built-in to
 restore a view. Replacement selection belongs to the current browser runtime;
 it is not a persistent configuration setting.
+
+Customization controls live on the Plugins page. There is no floating
+customization button. If a workspace replacement hides navigation, open
+`/plugins` under your Control UI base URL to choose Built-in; the Plugins page
+always uses the built-in workspace.
 
 The project has three public SDK imports:
 
@@ -213,10 +217,13 @@ when the roster changes, and actions check the current row again when invoked.
 Actions can inspect `session.hasActiveRun`; an absent value means activity is
 not yet known.
 `host.components`
-mounts host-owned dialogs, agent pickers, and session dashboards from plain
-props and DOM content. Each component returns `update` and `dispose` methods;
+mounts host-owned dialogs, agent pickers, searchable select pickers, and session
+dashboards from plain props and DOM content. Each component returns `update` and `dispose` methods;
 the host retains permission checks, focus handling, and dashboard provider
-ownership.
+ownership. Use `mountSelectPicker` for a list of `{ value, label, description? }`
+options, a selected `value`, an `accessibleLabel`, and an `onSelect` callback.
+With `searchable: true`, lists longer than eight options show a search field.
+The picker matches option labels, values, and descriptions.
 
 ## Build and reload
 
@@ -285,7 +292,8 @@ Custom element definitions belong to the browser document. If a plugin changes
 an existing custom element class, reload the browser tab as well, or use a new
 versioned tag name.
 
-Backend changes still use the normal plugin update and Gateway restart. Browser
+Backend changes use [plugin update or Reload](/cli/plugins/uninstall-and-update)
+to replace the running plugin without restarting the Gateway. Browser
 reload does not replace backend services or change an already running agent's
 tool catalog.
 
@@ -340,8 +348,11 @@ layouts; adjust those layouts before installation.
 Artifact activation also refuses to replace the plugin backing OpenClaw's active
 inference route. Stop OpenClaw and install that artifact from a trusted shell.
 
-After the Gateway restarts, inspect `plugins.controlUi.status` to see activation
-reports from currently connected Control UI clients. A report names the plugin
+Gateway-hosted artifact activation waits for backend runtime application. Terminal
+or other hosts without a live Gateway lifecycle callback save the install and
+report the writer's follow-up; that result is not a runtime application receipt.
+Once the Gateway has applied the plugin, inspect `plugins.controlUi.status` to see
+activation reports from currently connected Control UI clients. A report names the plugin
 revision and either `activated` or `failed`; it is a browser activation receipt,
 not proof that every feature operation has been exercised. No connected browser
 means no browser activation receipt yet.

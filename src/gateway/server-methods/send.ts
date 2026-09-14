@@ -13,7 +13,6 @@ import {
   validatePollParams,
   validateSendParams,
 } from "../../../packages/gateway-protocol/src/index.js";
-import type { MessageActionParams } from "../../../packages/gateway-protocol/src/index.js";
 import { sendDurableMessageBatchCore } from "../../channels/message/runtime.js";
 import type { ConversationReadInvocationOrigin } from "../../channels/plugins/conversation-read-origin.js";
 import { resolveChannelDefaultAccountId } from "../../channels/plugins/helpers.js";
@@ -83,7 +82,6 @@ import {
   resolveSandboxedSessionCreation,
 } from "../operator-role-policy.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
-import { resolveGatewayPluginConfig } from "../runtime-plugin-config.js";
 import { DEDUPE_MAX, DEDUPE_TTL_MS } from "../server-constants.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
 import { loadSessionEntry } from "../session-utils.js";
@@ -703,9 +701,7 @@ async function resolveRequestedChannel(params: {
     };
   }
   const sourceCfg = params.context.getRuntimeConfig();
-  const cfg = resolveGatewayPluginConfig({
-    config: sourceCfg,
-  });
+  const cfg = sourceCfg;
   let channel = normalizedChannel;
   if (!channel) {
     try {
@@ -793,7 +789,7 @@ function resolveMessageActionRuntimeConfig(params: {
   });
   // Message actions must use the hot runtime snapshot when it matches the caller's source config.
   if (selected === runtimeConfig && selected !== params.cfg) {
-    return resolveGatewayPluginConfig({ config: selected });
+    return selected;
   }
   return params.cfg;
 }
@@ -934,12 +930,10 @@ function scheduleDeliveredSourceReplyTranscriptMirror(params: {
 }
 
 export const sendHandlers: GatewayRequestHandlers = {
-  "message.action": async ({ params, respond, context, client }) => {
-    const p = params;
-    if (!assertValidParams(p, validateMessageActionParams, "message.action", respond)) {
+  "message.action": async ({ params: request, respond, context, client }) => {
+    if (!assertValidParams(request, validateMessageActionParams, "message.action", respond)) {
       return;
     }
-    const request = p as MessageActionParams;
     const trustedContext = resolveTrustedMessageActionToolContext({ client, request });
     if (!trustedContext.ok) {
       respond(false, undefined, trustedContext.error);
@@ -1046,7 +1040,10 @@ export const sendHandlers: GatewayRequestHandlers = {
             canonicalAction &&
             request.action === "send" &&
             !normalizeOptionalString(request.params.target) &&
-            !actionHasTarget("send", request.params, { channel }) &&
+            !actionHasTarget("send", request.params, {
+              channel,
+              aliasSpec: plugin.actions?.messageActionTargetAliases?.send ?? null,
+            }) &&
             !resolveImplicitMessageActionTarget(trustedContext.toolContext)
           ) {
             // Native sends could use account defaults without a target. Resolve that
@@ -1154,10 +1151,10 @@ export const sendHandlers: GatewayRequestHandlers = {
             toolContext: trustedContext.toolContext,
             dryRun: false,
             gatewayClientScopes,
+            assertDirectAdapterHandoff,
             ...(request.action === "send"
               ? {
                   onPlatformSendDispatch,
-                  assertDirectAdapterHandoff,
                   // Recovery cannot retain a live run's closure-bound send authority.
                   skipQueue: client?.internal?.agentRuntimeIdentity !== undefined,
                 }
@@ -1237,32 +1234,10 @@ export const sendHandlers: GatewayRequestHandlers = {
       },
     });
   },
-  send: async ({ params, respond, context, client }) => {
-    const p = params;
-    if (!assertValidParams(p, validateSendParams, "send", respond)) {
+  send: async ({ params: request, respond, context, client }) => {
+    if (!assertValidParams(request, validateSendParams, "send", respond)) {
       return;
     }
-    const request = p as {
-      to: string;
-      message?: string;
-      mediaUrl?: string;
-      mediaUrls?: string[];
-      buffer?: string;
-      filename?: string;
-      contentType?: string;
-      asVoice?: boolean;
-      gifPlayback?: boolean;
-      channel?: string;
-      accountId?: string;
-      agentId?: string;
-      replyToId?: string;
-      threadId?: string;
-      forceDocument?: boolean;
-      silent?: boolean;
-      parseMode?: "HTML";
-      sessionKey?: string;
-      idempotencyKey: string;
-    };
     const to = normalizeOptionalString(request.to) ?? "";
     const message = request.message?.trim() ? request.message : "";
     const mediaUrl = normalizeOptionalString(request.mediaUrl);
@@ -1556,25 +1531,10 @@ export const sendHandlers: GatewayRequestHandlers = {
       },
     });
   },
-  poll: async ({ params, respond, context, client }) => {
-    const p = params;
-    if (!assertValidParams(p, validatePollParams, "poll", respond)) {
+  poll: async ({ params: request, respond, context, client }) => {
+    if (!assertValidParams(request, validatePollParams, "poll", respond)) {
       return;
     }
-    const request = p as {
-      to: string;
-      question: string;
-      options: string[];
-      maxSelections?: number;
-      durationSeconds?: number;
-      durationHours?: number;
-      silent?: boolean;
-      isAnonymous?: boolean;
-      threadId?: string;
-      channel?: string;
-      accountId?: string;
-      idempotencyKey: string;
-    };
     await withMessageOperationRoute({
       context,
       prefix: "poll",

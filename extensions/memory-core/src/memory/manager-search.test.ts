@@ -1,13 +1,16 @@
+import nodePath from "node:path";
 // Memory Core tests cover manager search plugin behavior.
 import type { DatabaseSync } from "node:sqlite";
 import { expectDefined } from "@openclaw/normalization-core";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/memory-core-host-engine-knn";
 import {
   ensureMemoryIndexSchema,
   loadSqliteVecExtension,
   requireNodeSqlite,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
-import { describe, expect, it, vi } from "vitest";
-import { bm25RankToScore, buildFtsQuery } from "./hybrid.js";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { bm25RankToScore, buildFtsQuery } from "./keyword-query.js";
 import { runVectorKnnQuery } from "./manager-search-knn.js";
 import { searchKeyword, searchPathKeyword, searchVector } from "./manager-search.js";
 import { runMemorySearchWithDeadline } from "./search-deadline.js";
@@ -501,6 +504,83 @@ describe("searchKeyword FTS MATCH fallback", () => {
 });
 
 describe("searchPathKeyword", () => {
+  it.each([
+    ["unicode61", "common"],
+    ["unicode61", "README.md"],
+    ["trigram", "common"],
+    ["trigram", "README.md"],
+  ] as const)(
+    "resolves first chunks only within the retained %s window for %s",
+    async (ftsTokenizer, query) => {
+      const { db } = createMemorySearchDb({ ftsTokenizer });
+      try {
+        db.prepare(
+          "INSERT INTO memory_index_sources (path, source, hash, mtime, size) VALUES (?, 'memory', '', 0, 0)",
+        ).run("memory/common/00-empty/README.md");
+        for (let index = 0; index < 64; index++) {
+          for (let chunk = 2; chunk >= 0; chunk--) {
+            insertKeywordFixture(db, {
+              id: `path-${index}-chunk-${chunk}`,
+              path: `memory/common/${String(index).padStart(3, "0")}/README.md`,
+              source: index % 2 === 0 ? "memory" : "sessions",
+              startLine: chunk * 5 + 1,
+              endLine: chunk * 5 + 4,
+              text: `body ${index}/${chunk} ` + "x".repeat(8_000),
+            });
+          }
+        }
+        let examinedChunkLines = 0;
+        db.function("observe_path_chunk_line", (line) => {
+          examinedChunkLines++;
+          return line;
+        });
+        db.exec(`
+          ALTER TABLE memory_index_chunks RENAME TO observed_chunks;
+          CREATE VIEW memory_index_chunks AS
+            SELECT id, path, source, observe_path_chunk_line(start_line) AS start_line,
+                   end_line, text FROM observed_chunks;
+        `);
+
+        let fetchedTextBytes = 0;
+        const prepare = db.prepare.bind(db);
+        const prepareSpy = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+          const statement = prepare(sql);
+          statement.all = new Proxy(statement.all.bind(statement), {
+            apply(all, _receiver, values) {
+              const rows = all(...values);
+              for (const row of rows) {
+                if (typeof row.text === "string") {
+                  fetchedTextBytes += Buffer.byteLength(row.text);
+                }
+              }
+              return rows;
+            },
+          });
+          return statement;
+        });
+        const results = await searchPathKeywordFixture(db, query, {
+          ftsTokenizer,
+          limit: 2,
+          sourceFilter: {
+            sql: " AND memory_index_paths_fts.source IN (?)",
+            params: ["memory"],
+          },
+        });
+
+        prepareSpy.mockRestore();
+        expect(results.map(({ id, snippet }) => ({ id, snippet }))).toEqual([
+          { id: "path-0-chunk-0", snippet: "body 0/0 " + "x".repeat(191) },
+          { id: "path-2-chunk-0", snippet: "body 2/0 " + "x".repeat(191) },
+        ]);
+        expect(examinedChunkLines).toBeGreaterThan(0);
+        expect(examinedChunkLines).toBeLessThanOrEqual(16);
+        expect(fetchedTextBytes).toBeLessThanOrEqual(4 * 200 * 4);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
   it("returns the first scoped chunk and reserves exact precedence for path identifiers", async () => {
     const { db, schema } = createMemorySearchDb();
     try {
@@ -930,6 +1010,73 @@ describe("searchPathKeyword", () => {
   });
 });
 
+describe("searchKeyword ranked limits", () => {
+  it.each(["unicode61", "trigram"] as const)(
+    "stops examining scoped candidates after filling the %s result window",
+    async (ftsTokenizer) => {
+      const { db } = createMemorySearchDb({ ftsTokenizer });
+      try {
+        for (let index = 0; index < 64; index++) {
+          insertKeywordFixture(db, {
+            id: `chunk-${index}`,
+            path: `memory/${index}.md`,
+            text: "common keyword",
+            source: index % 2 === 0 ? "memory" : "sessions",
+          });
+        }
+        let examined = 0;
+        db.function("observe_keyword_candidate", () => {
+          examined++;
+          return 1;
+        });
+        const results = await searchKeywordFixture(db, "common", {
+          ftsTokenizer,
+          limit: 3,
+          sourceFilter: {
+            sql: " AND source IN (?) AND observe_keyword_candidate() = 1",
+            params: ["sessions"],
+          },
+        });
+        expect(results.map((row) => row.id)).toEqual(["chunk-1", "chunk-3", "chunk-5"]);
+        expect(examined).toBeLessThanOrEqual(6);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it("preserves default BM25 scores without changing a configured rank mapping", async () => {
+    const { db } = createMemorySearchDb();
+    try {
+      insertKeywordFixture(db, {
+        id: "weak",
+        path: "memory/weak.md",
+        text: "common " + "unrelated ".repeat(20),
+      });
+      insertKeywordFixture(db, {
+        id: "strong",
+        path: "memory/strong.md",
+        text: "common common common",
+      });
+      const expected = await searchKeywordFixture(db, "common");
+      expect(expected.map((row) => row.id)).toEqual(["strong", "weak"]);
+      db.prepare(
+        "INSERT INTO memory_index_chunks_fts(memory_index_chunks_fts, rank) VALUES ('rank', 'bm25(0.0)')",
+      ).run();
+
+      await expect(searchKeywordFixture(db, "common")).resolves.toEqual(expected);
+      expect(
+        db
+          .prepare("SELECT rank FROM memory_index_chunks_fts WHERE memory_index_chunks_fts MATCH ?")
+          .all("common")
+          .map((row) => row.rank),
+      ).toEqual([-0, -0]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe("searchKeyword cross-model FTS visibility (issue #48300)", () => {
   function supportsFts(): boolean {
     const { db, schema } = createMemorySearchDb();
@@ -1007,6 +1154,7 @@ describe("searchKeyword cross-model FTS visibility (issue #48300)", () => {
 
 describe("searchVector sqlite-vec KNN", () => {
   const { DatabaseSync } = requireNodeSqlite();
+  const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
   it("yields to the event loop during large fallback scans (issue #81172)", async () => {
     // Real Nextcloud-scale corpus where the vec0 fast path is unavailable
@@ -1084,38 +1232,38 @@ describe("searchVector sqlite-vec KNN", () => {
         });
       }
 
-      let scannedBatches = 0;
-      const countedDb = {
-        prepare: (sql: string) => {
-          const statement = db.prepare(sql);
-          if (!sql.includes("SELECT rowid, id, path")) {
-            return statement;
-          }
-          return {
-            all: (...args: Parameters<typeof statement.all>) => {
-              scannedBatches += 1;
-              return statement.all(...args);
-            },
-          };
-        },
-      } as unknown as DatabaseSync;
+      let scannedRows = 0;
+      db.function("observe_embedding", (embedding) => {
+        scannedRows += 1;
+        return embedding;
+      });
+      db.exec(`
+        ALTER TABLE memory_index_chunks RENAME TO observed_chunks;
+        CREATE VIEW memory_index_chunks AS
+          SELECT rowid, id, path, source, start_line, end_line, model, text,
+                 observe_embedding(embedding) AS embedding
+          FROM observed_chunks;
+      `);
       const caller = new AbortController();
       const abortReason = new Error("caller stopped memory search");
       const pending = runMemorySearchWithDeadline({
         timeoutMs: 5_000,
         parentSignal: caller.signal,
-        run: async (signal) => await searchVectorFixture(countedDb, { signal }),
+        run: async (signal) => await searchVectorFixture(db, { signal }),
       });
       setImmediate(() => caller.abort(abortReason));
 
       await expect(pending).rejects.toBe(abortReason);
+      const rowsAtAbort = scannedRows;
+      expect(rowsAtAbort).toBeGreaterThan(0);
+      expect(rowsAtAbort).toBeLessThan(4096);
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
-      expect(scannedBatches).toBe(1);
+      expect(scannedRows).toBe(rowsAtAbort);
 
       const healthyResults = await searchVectorFixture(db, { limit: 1 });
       expect(healthyResults.map((result) => result.id)).toEqual(["chunk-4095"]);
@@ -1349,6 +1497,210 @@ describe("searchVector sqlite-vec KNN", () => {
       db.close();
     }
   });
+
+  it("keeps scored payloads and equal-score ordering when chunks change between batches", async () => {
+    const db = createFallbackDb();
+    try {
+      for (let index = 0; index < 257; index += 1) {
+        insertFallbackChunk(db, {
+          id: `chunk-${index}`,
+          model: "target-model",
+          vector: index < 2 || index === 256 ? [1, 0] : [0, 1],
+        });
+      }
+      db.prepare("UPDATE memory_index_chunks SET text = ? WHERE id = ?").run(
+        "old 😀 text",
+        "chunk-0",
+      );
+      const changed = new Promise<void>((resolve) => {
+        setImmediate(() => {
+          db.prepare("UPDATE memory_index_chunks SET text = ?, embedding = ? WHERE id = ?").run(
+            "replacement",
+            "[0,1]",
+            "chunk-0",
+          );
+          resolve();
+        });
+      });
+
+      const results = await searchVectorFixture(db, { limit: 2, snippetMaxChars: 5 });
+      await changed;
+      expect(results).toEqual([
+        {
+          id: "chunk-0",
+          path: "memory/chunk-0.md",
+          startLine: 1,
+          endLine: 1,
+          score: 1,
+          snippet: "old ",
+          source: "memory",
+        },
+        {
+          id: "chunk-1",
+          path: "memory/chunk-1.md",
+          startLine: 1,
+          endLine: 1,
+          score: 1,
+          snippet: "chunk",
+          source: "memory",
+        },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reads contender payloads from the scored batch snapshot during external writes", async () => {
+    const filename = nodePath.join(tempDirs.make("memory-search-snapshot-"), "memory.sqlite");
+    const db = new DatabaseSync(filename);
+    const writer = new DatabaseSync(filename);
+    try {
+      db.exec("PRAGMA journal_mode = WAL");
+      ensureMemoryIndexSchema({ db, cacheEnabled: false, ftsEnabled: false });
+      insertFallbackChunk(db, { id: "winner", model: "target-model", vector: [1, 0] });
+      db.exec(`
+        ALTER TABLE memory_index_chunks RENAME TO observed_chunks;
+        CREATE VIEW memory_index_chunks AS
+          SELECT rowid, id, path, source, start_line, end_line, model, text,
+                 observe_embedding(embedding) AS embedding
+          FROM observed_chunks;
+      `);
+      let replaced = false;
+      db.function("observe_embedding", (embedding) => {
+        if (!replaced) {
+          writer
+            .prepare("UPDATE observed_chunks SET text = ?, embedding = ? WHERE id = ?")
+            .run("replacement payload", "[0,1]", "winner");
+          replaced = true;
+        }
+        return embedding;
+      });
+
+      const results = await searchVectorFixture(db, { limit: 1 });
+      expect(replaced).toBe(true);
+      expect(results[0]).toMatchObject({ id: "winner", score: 1, snippet: "chunk winner" });
+      expect(writer.prepare("SELECT text FROM observed_chunks").get()?.text).toBe(
+        "replacement payload",
+      );
+    } finally {
+      writer.close();
+      db.close();
+    }
+  });
+
+  it.each(
+    ["UTF-8", "UTF-16le", "UTF-16be"].flatMap((encoding) =>
+      ["KNN", "fallback"].map((mode) => ({ encoding, mode })),
+    ),
+  )(
+    "bounds $mode body fetches while preserving snippets in a $encoding database",
+    async ({ encoding, mode }) => {
+      const db = new DatabaseSync(":memory:", { allowExtension: true });
+      try {
+        db.exec(`PRAGMA encoding = '${encoding}'`);
+        const loaded = await loadSqliteVecExtension({ db });
+        expect(loaded.ok, loaded.error).toBe(true);
+        ensureMemoryIndexSchema({ db, cacheEnabled: false, ftsEnabled: false });
+        db.exec(`CREATE VIRTUAL TABLE memory_index_chunks_vec USING vec0(
+          id TEXT PRIMARY KEY, embedding FLOAT[2]
+        )`);
+        const texts = [
+          "",
+          "brief",
+          "\0before and after\0",
+          "abc😀de",
+          "😀😀😀😀",
+          "中文é\u0301\u2003memory",
+          "\ud800unpaired\udfff",
+          "a".repeat(2_799) + "😀" + "tail".repeat(4_000),
+          "a".repeat(699) + "\0" + "tail".repeat(4_000),
+          "文".repeat(16_000),
+        ];
+        for (const [index, text] of texts.entries()) {
+          const id = `snippet-${index}`;
+          insertFallbackChunk(db, { id, model: "target-model", vector: [1, index / 10] });
+          db.prepare("UPDATE memory_index_chunks SET text = ? WHERE id = ?").run(text, id);
+          db.prepare("INSERT INTO memory_index_chunks_vec (id, embedding) VALUES (?, ?)").run(
+            id,
+            vectorToBlob([1, index / 10]),
+          );
+        }
+        // Read stored text first: the SQLite binding normalizes unpaired surrogates.
+        const stored = db.prepare("SELECT id, text FROM memory_index_chunks ORDER BY rowid").all();
+        let fetchedBytes = 0;
+        const prepare = db.prepare.bind(db);
+        const prepareSpy = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+          const statement = prepare(sql);
+          statement.get = new Proxy(statement.get.bind(statement), {
+            apply(get, _receiver, values) {
+              const row = get(...values);
+              if (typeof row?.text === "string") {
+                fetchedBytes += Buffer.byteLength(row.text);
+              }
+              return row;
+            },
+          });
+          statement.all = new Proxy(statement.all.bind(statement), {
+            apply(all, _receiver, values) {
+              const rows = all(...values);
+              for (const row of rows) {
+                if (typeof row.text === "string") {
+                  fetchedBytes += Buffer.byteLength(row.text);
+                }
+              }
+              return rows;
+            },
+          });
+          return statement;
+        });
+        try {
+          const snippetLimits = [1, 2, 3, 4, 7, 700];
+          for (const snippetMaxChars of snippetLimits) {
+            const results = await searchVectorFixture(db, {
+              limit: texts.length,
+              snippetMaxChars,
+              ensureVectorReady: async () => mode === "KNN",
+            });
+            expect(results.map(({ id, snippet }) => ({ id, snippet }))).toEqual(
+              stored.map(({ id, text }) => ({
+                id,
+                snippet: truncateUtf16Safe(String(text), snippetMaxChars),
+              })),
+            );
+          }
+          // Allow encoding expansion without materializing complete chunk bodies.
+          const totalSnippetLimit = snippetLimits.reduce((sum, limit) => sum + limit, 0);
+          expect(fetchedBytes).toBeLessThanOrEqual(texts.length * totalSnippetLimit * 8);
+          if (mode === "fallback") {
+            for (const snippetMaxChars of [
+              0,
+              -1,
+              1.5,
+              Number.NaN,
+              Infinity,
+              Number.MAX_SAFE_INTEGER,
+              Number.MAX_SAFE_INTEGER + 1,
+            ]) {
+              const results = await searchVectorFixture(db, {
+                limit: texts.length,
+                snippetMaxChars,
+              });
+              expect(results.map(({ id, snippet }) => ({ id, snippet }))).toEqual(
+                stored.map(({ id, text }) => ({
+                  id,
+                  snippet: truncateUtf16Safe(String(text), snippetMaxChars),
+                })),
+              );
+            }
+          }
+        } finally {
+          prepareSpy.mockRestore();
+        }
+      } finally {
+        db.close();
+      }
+    },
+  );
 
   it("falls back when filters hide matches beyond sqlite-vec's KNN cap", async () => {
     const db = new DatabaseSync(":memory:", { allowExtension: true });

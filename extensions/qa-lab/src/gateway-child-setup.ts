@@ -435,44 +435,47 @@ export async function prepareQaGatewayChild(
           }
           packagedMockAuthStaged = true;
         }
-        if (usesPackagedCandidate && gatewayCommand) {
-          // Live auth staging opens parent-owned agent stores. Release this
-          // fixture's leases before the child Doctor takes maintenance ownership.
-          await closeQaRuntimeStores(tempRoot);
-          const command = {
-            lifetime,
-            executablePath: gatewayCommand.executablePath,
-            argsPrefix: gatewayCommand.argsPrefix ?? [],
-            cwd: gatewayCwd,
-            env,
-          };
-          // The separate onboarding smoke cannot prepare this child's state.
-          // Converge every freshly written config; a new-port retry can otherwise
-          // restore plugin entries the candidate removed before verify-only startup.
-          // Published candidates such as 2026.7.1-2 predate capability consent.
-          const help = await runQaPackagedBootstrap(
-            "installed package plugin setup failed (update repair --help)",
-            () => runQaGatewayCliCommand({ ...command, args: ["update", "repair", "--help"] }),
-          );
-          const consentArgs = help.includes("--accept-capabilities")
-            ? ["--accept-capabilities"]
-            : [];
-          await runQaPackagedBootstrap(
-            "installed package plugin setup failed (update repair)",
-            () =>
-              runQaGatewayCliCommand({
-                ...command,
-                args: ["update", "repair", ...consentArgs, "--yes", "--no-restart", "--json"],
-              }),
-          );
-        }
       }
       if (!env) {
         throw new Error("qa gateway runtime env not initialized");
       }
+      // Child-owned CLI commands must resolve the same ephemeral Gateway as the
+      // fixture process. Otherwise commands without their own connection flags
+      // can silently fall back to the operator's ambient local Gateway.
+      env.OPENCLAW_GATEWAY_PORT = String(gatewayPort);
 
+      // Packaged repair must inspect the configured port without our placeholder listener.
       await lifetime.portReservation?.release();
       lifetime.portReservation = null;
+      lifetime.assertOpen();
+
+      if (!reuseStartupLaunchState && usesPackagedCandidate && gatewayCommand) {
+        // Live auth staging opens parent-owned agent stores. Release this
+        // fixture's leases before the child Doctor takes maintenance ownership.
+        await closeQaRuntimeStores(tempRoot);
+        const command = {
+          lifetime,
+          executablePath: gatewayCommand.executablePath,
+          argsPrefix: gatewayCommand.argsPrefix ?? [],
+          cwd: gatewayCwd,
+          env,
+        };
+        // The separate onboarding smoke cannot prepare this child's state.
+        // Converge every freshly written config; a new-port retry can otherwise
+        // restore plugin entries the candidate removed before verify-only startup.
+        // Published candidates such as 2026.7.1-2 predate capability consent.
+        const help = await runQaPackagedBootstrap(
+          "installed package plugin setup failed (update repair --help)",
+          () => runQaGatewayCliCommand({ ...command, args: ["update", "repair", "--help"] }),
+        );
+        const consentArgs = help.includes("--accept-capabilities") ? ["--accept-capabilities"] : [];
+        await runQaPackagedBootstrap("installed package plugin setup failed (update repair)", () =>
+          runQaGatewayCliCommand({
+            ...command,
+            args: ["update", "repair", ...consentArgs, "--yes", "--no-restart", "--json"],
+          }),
+        );
+      }
       lifetime.assertOpen();
       return { cfg, env, gatewayPort, baseUrl, wsUrl };
     },

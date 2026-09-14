@@ -588,11 +588,10 @@ const WORKSPACE_PACKAGE_ALIAS_ENTRIES: WorkspacePackageAliasEntry[] =
       distFile: `${subpath || "index"}.mjs`,
     })),
   );
+const WORKSPACE_PACKAGE_EXPORT_DIRS = ["media-core", "normalization-core", "acp-core", "llm-core"];
 const WORKSPACE_PACKAGE_ALIAS_NAMES = new Set([
   ...WORKSPACE_PACKAGE_ALIAS_SUBPATHS.map(([name]) => `@openclaw/${name}`),
-  "@openclaw/media-core",
-  "@openclaw/normalization-core",
-  "@openclaw/acp-core",
+  ...WORKSPACE_PACKAGE_EXPORT_DIRS.map((name) => `@openclaw/${name}`),
 ]);
 const ROOT_PACKAGED_WORKSPACE_PACKAGE_DIRS = new Set([
   "acp-core",
@@ -937,7 +936,7 @@ function resolveWorkspacePackageAliasMap(
   const aliasMap: Record<string, string> = {};
   const workspacePackageAliasEntries = [
     ...WORKSPACE_PACKAGE_ALIAS_ENTRIES,
-    ...["media-core", "normalization-core", "acp-core"].flatMap((packageDir) =>
+    ...WORKSPACE_PACKAGE_EXPORT_DIRS.flatMap((packageDir) =>
       listWorkspacePackageExportAliasEntries({
         packageRoot,
         packageName: `@openclaw/${packageDir}`,
@@ -1202,7 +1201,7 @@ function createPluginSdkScopedAliases(context: PluginLoaderAliasContext) {
         const target = resolveSubpath(subpath);
         if (target) {
           for (const packageName of PLUGIN_SDK_PACKAGE_NAMES) {
-            aliasMap[`${packageName}/${subpath}`] = target;
+            aliasMap[`${packageName}/${subpath}`] = normalizeJitiAliasTargetPath(target);
           }
         }
       }
@@ -1214,47 +1213,6 @@ function createPluginSdkScopedAliases(context: PluginLoaderAliasContext) {
 const JITI_NORMALIZED_ALIAS_SYMBOL = Symbol.for("pathe:normalizedAlias");
 const JITI_ALIAS_ROOT_SENTINELS = new Set<string | undefined>(["/", "\\", undefined]);
 const JITI_CONCRETE_ALIAS_TARGET_PATTERN = /^(?:[A-Za-z]:[/\\]|[/\\])/;
-
-function normalizeAliasTargets(aliasMap: Record<string, string>): Record<string, string> {
-  if (process.platform !== "win32") {
-    return aliasMap;
-  }
-  const facts = sdkAliasFacts(aliasMap);
-  const cached = facts.normalizedTargets;
-  if (cached) {
-    return cached;
-  }
-  const normalized = Object.fromEntries(
-    Object.entries(aliasMap).map(([key, value]) => [key, normalizeJitiAliasTargetPath(value)]),
-  );
-  facts.normalizedTargets = normalized;
-  return normalized;
-}
-
-function mergeAliasMaps(
-  bundled: Record<string, string>,
-  workspace: Record<string, string>,
-  pluginSdk: Record<string, string>,
-): Record<string, string> {
-  const mergedAliasMapsByComponent = getPluginCache().sdk.mergedAliases;
-  let byWorkspace = mergedAliasMapsByComponent.get(bundled);
-  if (!byWorkspace) {
-    byWorkspace = new WeakMap();
-    mergedAliasMapsByComponent.set(bundled, byWorkspace);
-  }
-  let byPluginSdk = byWorkspace.get(workspace);
-  if (!byPluginSdk) {
-    byPluginSdk = new WeakMap();
-    byWorkspace.set(workspace, byPluginSdk);
-  }
-  const cached = byPluginSdk.get(pluginSdk);
-  if (cached) {
-    return cached;
-  }
-  const merged = { ...bundled, ...workspace, ...pluginSdk };
-  byPluginSdk.set(pluginSdk, merged);
-  return merged;
-}
 
 function hasJitiNormalizedAliasMarker(aliasMap: Record<string, string>) {
   return Boolean((aliasMap as Record<symbol, unknown>)[JITI_NORMALIZED_ALIAS_SYMBOL]);
@@ -1390,18 +1348,27 @@ export function preparePluginLoaderAliases(
   if (cached) {
     return cached;
   }
+  let sourceTransformAliasMap: Record<string, string> | undefined;
   let aliasMap: Record<string, string> | undefined;
   let sdkAliases: ReturnType<typeof createPluginSdkScopedAliases> | undefined;
   const getSdkAliases = () => (sdkAliases ??= createPluginSdkScopedAliases(context));
+  const getSourceTransformAliasMap = () =>
+    withPluginCache(
+      cache,
+      () =>
+        (sourceTransformAliasMap ??= {
+          ...resolveBundledPluginPackagePublicSurfaceAliasMap(context),
+          ...resolveWorkspacePackageAliasMap(context),
+        }),
+    );
   const getAliasMap = () =>
     withPluginCache(
       cache,
       () =>
-        (aliasMap ??= mergeAliasMaps(
-          resolveBundledPluginPackagePublicSurfaceAliasMap(context),
-          resolveWorkspacePackageAliasMap(context),
-          normalizeAliasTargets(getSdkAliases().getAliasMap()),
-        )),
+        (aliasMap ??= {
+          ...getSourceTransformAliasMap(),
+          ...getSdkAliases().getAliasMap(),
+        }),
     );
   const prepared = {
     packageRoot,
@@ -1412,6 +1379,7 @@ export function preparePluginLoaderAliases(
       ? context.orderedKinds.map((kind) => path.join(packageRoot, kind, "plugin-sdk"))
       : [],
     getAliasMap,
+    getSourceTransformAliasMap,
     resolveAlias: (specifier: string): string | undefined => {
       if (!isPluginLoaderAliasSpecifier(specifier)) {
         return undefined;
@@ -1574,19 +1542,11 @@ export function buildPluginLoaderJitiOptions(
   };
 }
 
-function supportsNativeModuleRuntime(): boolean {
-  const versions = process.versions as { bun?: string };
-  return typeof versions.bun !== "string";
-}
-
 function isBundledPluginDistModulePath(modulePath: string): boolean {
   return modulePath.replace(/\\/g, "/").includes("/dist/extensions/");
 }
 
 function shouldPreferNativeModuleLoad(modulePath: string): boolean {
-  if (!supportsNativeModuleRuntime()) {
-    return false;
-  }
   switch (normalizeLowercaseStringOrEmpty(path.extname(modulePath))) {
     case ".js":
     case ".mjs":
@@ -1609,9 +1569,7 @@ export function resolvePluginLoaderTryNative(
   }
   return (
     shouldPreferNativeModuleLoad(modulePath) ||
-    (supportsNativeModuleRuntime() &&
-      options?.preferBuiltDist === true &&
-      modulePath.includes(`${path.sep}dist${path.sep}`))
+    (options?.preferBuiltDist === true && modulePath.includes(`${path.sep}dist${path.sep}`))
   );
 }
 

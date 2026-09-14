@@ -1,6 +1,11 @@
 export * from "./error-details.js";
 export * from "./github-publication-api.js";
 export * from "./session-agent-status.js";
+export type {
+  ModelCatalogScope,
+  ModelCatalogTarget,
+  ModelsSnapshotEvent,
+} from "./model-catalog-publication.js";
 export * from "./terminal-validators.js";
 export {
   validateApprovalGetResult,
@@ -11,6 +16,7 @@ export { formatValidationErrors, type ValidationError } from "./validation-error
 export type { ProtocolValidator } from "./protocol-validator.js";
 export * from "./schema/worker-inference.js";
 export * from "./schema/worker-computer.js";
+export * from "./schema/computer.js";
 export * from "./schema/skill-history.js";
 export * from "./schema/skill-library.js";
 export * from "./schema/ui-command.js";
@@ -35,6 +41,7 @@ export {
 export * from "./schema/session-classification.js";
 export * from "./schema/session-participant.js";
 export * from "./schema/sessions-suggestions.js";
+export * from "./schema/sessions-activity-summary.js";
 export * from "./schema/sessions-delete.js";
 export * from "./schema/sessions-goal.js";
 export {

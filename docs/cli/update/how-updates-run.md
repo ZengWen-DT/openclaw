@@ -33,9 +33,13 @@ the selected channel or installation method, or the Git target SHA equals
 explicit `--channel` or installation-method change finishes successfully.
 Changed plugins restart a running managed Gateway unless `--no-restart` is set; retained exact pins produce the same advisories as a core update without requiring a restart.
 
-Explicit package artifacts, such as tarball paths and URLs, still pass through
-validation and installation when their version matches the installed version.
-A matching version alone does not establish artifact equality.
+Explicit package artifacts, such as tarball paths and URLs, compare known build
+IDs before a same-version no-op. Matching known identity remains nonmutating;
+different or missing identity continues through normal candidate validation and
+installation because a matching version alone does not establish artifact
+equality. Registry requests retain their version-based same-version no-op.
+Installation-method switches and fresh-profile initialization still retain and
+validate the candidate even when its build identity matches.
 
 Updates continue with recorded warnings when disposable validation-copy cleanup,
 retired derived-cache cleanup, or Git upstream tracking setup fails. Resolve the
@@ -44,12 +48,19 @@ reported cause, then run the warning's exact cleanup command or
 that cannot boot or pass readiness still block completion. See
 [Status and history](/cli/update/status-and-history) to inspect recorded warnings.
 
+Linux service checks treat an implicit systemd unit name and its explicit
+installed name as the same selection, including names with or without the
+`.service` suffix. The updater still rechecks service ownership before stopping
+the Gateway.
+
 The baseline package fingerprint is best effort. If its bounded scan times out,
 the update records a warning and continues with the retained package copy.
 Rollback then verifies the restored directory identity, package version, and
 affected launchers, and records that full fingerprint verification was unavailable.
-A timeout alone does not fail the update or rollback; detected changes to the
-retained copy still refuse restoration.
+A baseline scan timeout alone does not fail the update or rollback; detected
+changes to the retained copy still refuse restoration. Once a complete baseline
+fingerprint is available, recovery checks must match it. These checks use the
+caller's per-step allowance without a separate thirty-second scan cap.
 
 Interrupting a fresh local update before activation records a failed,
 `interrupted` history entry while its installation owner is still held.
@@ -65,8 +76,21 @@ boots a canary with copied configuration and verified SQLite snapshots in an
 isolated temporary state directory. The copied database registry points to the
 copied agent databases. Installed plugin payloads and their dependencies are also
 copied; the rehearsal install records point to those copies, and their OpenClaw
-host links target the staged candidate. Path aliases that resolve to a running
-package's bundled plugin use the staged bundled plugin with the same ID when
+host links target the staged candidate. Literal imports, `require()` calls, and
+literal dynamic imports to shared source modules include those modules and their
+package metadata in the private copy. Unrelated repository files remain outside
+the snapshot.
+
+When a published updater omitted shared modules from an external plugin copy,
+candidate Doctor can complete the private copy before loading plugin repair
+hooks. Recovery requires the original path retained by that updater and matching
+source/manifest bytes; it never replaces existing private files or changes the
+serving plugin. Complete snapshots do not require the original source to remain
+available. Some older managed-state or cross-volume projections do not retain a
+recoverable original path, which Doctor reports in the update diagnostics.
+
+Path aliases that resolve to a running package's bundled plugin use the staged
+bundled plugin with the same ID when
 available, preserving bundled trust. External path installs keep their existing
 classification. The live plugin files and host links stay unchanged. Channels,
 cron, automatic updates, background task maintenance, and other side services are
@@ -77,33 +101,88 @@ Candidate build and rehearsal processes resolve source-linked plugin SDKs from
 the candidate root, even when the serving source launcher passed its own checkout
 root. This keeps candidate assets and validation independent of the old checkout.
 
+Warning-severity Doctor findings do not block candidate or post-plugin readiness.
+The updater retains them in the run report shown by `openclaw update status`,
+including when an intentional open channel policy requires no configuration change.
+Error findings and failed check execution still refuse the update.
+
 The candidate answers the updater's native service capability probe before
 loading configuration or initializing debug capture. Probing capability does not
 open or migrate shared state, so the old Gateway can keep serving while its
 database schema is older than the candidate's. The installed updater runs first;
 this repair takes effect when the candidate it probes contains the fix.
 
+The invoking updater supplies the capability probe's per-step time budget. The
+probe does not impose a separate startup deadline.
+
 Snapshot preparation budgets time for the SQLite database and journal bytes,
 including copying and verification passes, with a five-minute startup floor.
 It uses the larger of that allowance and the configured per-step timeout.
 The deadline extends while private files continue changing. A stalled snapshot
 reports its size and applied budget. Snapshot time does not consume the separate
-runtime validation budget, which also honors the configured per-step timeout.
+runtime validation budget. By default, that budget scales with measured database
+and plugin bytes, allowing each validation process to inspect the private state.
+An explicit per-step timeout replaces that derived runtime allowance.
+Automatic and chat updates leave that runtime allowance derived from state.
+Their request and recovery watchdogs do not become candidate validation deadlines.
+Startup and readiness responses share that validation deadline, including reading
+the response body.
 
-Before copying databases, the updater estimates space for the SQLite snapshot
-set, temporary copies, and the candidate Doctor backup. If the system temporary
-filesystem is too small, it uses an OpenClaw-owned directory under the selected
-state directory's `tmp` folder. If neither filesystem has enough space, it
-refuses with the required size and the available space at both locations.
-Capacity estimates cannot reserve space against other processes writing to the
-same filesystem.
+Before copying, the updater measures the shared and agent SQLite database
+families and the installed plugin payloads and dependency trees that the
+rehearsal needs. Admission includes space for temporary copies and the candidate
+Doctor backup. Active plugin payloads remain in the snapshot so configuration
+and startup validation can load them; unreferenced plugin generations are not
+copied.
+
+The updater selects the first usable destination with enough measured free space:
+
+1. An explicit `TMPDIR`, when set.
+2. A private directory under `<state-dir>.update-captures/`, beside the selected
+   state directory on its filesystem.
+3. The system temporary directory.
+
+The update report records the measured SQLite and plugin sizes, the total
+required space, the checked destinations and their available space, and the
+selected location and reason. If none fits, snapshot preparation refuses before
+copying with `snapshot-capacity-insufficient` and explains how to free space or
+set `TMPDIR`. A path that cannot be allocated is recorded and skipped; if all
+fitting paths are unusable, `snapshot-location-unavailable` names their path or
+permission errors. Capacity checks do not reserve space against concurrent writes.
+The copy worker uses the inventoried plugin plan. If an install record, plugin
+owner, or database registration changes before its copy, preparation refuses
+that unmeasured state so the next update can inventory it again.
+These copies remain disposable validation state; rollback does not restore them.
+If even the initial SQLite inspection copy cannot fit, the refusal reports that
+required lower bound and marks plugin size as not yet inspected.
+
+Snapshot placement belongs to the updater already running. The published
+2026.9.3 and 2026.9.4 updaters prepare their snapshot before candidate code runs,
+so updating to this fix cannot change that first hop. If their system temporary
+filesystem is too small, select another filesystem with sufficient space:
+
+```bash
+TMPDIR=/var/tmp openclaw update --yes
+```
+
+Subsequent updates use the new updater's measured destination selection.
 
 Schema checks also use private SQLite copies so inspection does not create or
-modify WAL sidecars beside live databases. Each schema inspection has a
-30-second deadline; if compatibility cannot be verified, rollback is refused.
+modify WAL sidecars beside live databases. Inspection budgets include database
+and journal sizes, cold startup, and repeated IO passes for every discovered
+store. Metadata checks remain cancellable. Copy progress renews the watchdog,
+and larger caller allowances are preserved. Workers stop before their private
+staging is removed; cleanup failures preserve the original error. If compatibility
+cannot be verified, rollback is refused.
+
+Before stopping the previous Gateway, the updater waits for affirmative readiness.
+Its observation window uses the canary's measured startup time with headroom for
+slow hardware, or the explicit per-step timeout. A transient readiness miss does
+not discard the previous generation's rollback eligibility. Native service and
+Gateway boot identities must still match through the final observation.
 
 The canary binds a free loopback port and must report `/startupz` as `started`,
-then `/readyz` as ready within the configured per-step timeout. Plugin-resolution
+then `/readyz` as ready within the runtime validation allowance. Plugin-resolution
 errors attributed to a named plugin are recorded without rejecting the candidate.
 An invalid plugin inventory, an unattributed registry error, or failure to meet
 the required core startup or readiness checks still fails validation. Failure
@@ -123,6 +202,11 @@ or state, invalid or unattributed plugin-registry results, and failed core start
 or readiness checks. The updater reruns the failed check after each attempt and
 activates only after it passes. Failed or unavailable repair discards the
 candidate and leaves the serving Gateway untouched.
+Successful repair of a private rehearsal does not mean the update was applied:
+the updater validates a fresh candidate again before activation. If that check
+fails, the report retains the failed update and the command exits nonzero even
+when the previous Gateway remains healthy. Successful updates with warnings
+exit zero.
 Pre-activation repair uses disposable rehearsal state and configuration, then
 independently validates surviving candidate changes before activation, and
 `repair-requires-config-change` reports changed top-level keys that require
@@ -222,6 +306,11 @@ If schema state cannot be verified, rollback is refused with
 `rollback-state-unverified`; unknown state never counts as schema-neutral.
 
 ### Restart handoff
+
+Service-manager commands and helper acknowledgements share the activation or
+recovery allowance. Slow inspection or teardown does not impose a separate
+five- or thirty-second command cutoff. Service installation also forwards one
+caller budget through staging, sealing, and load; the parent owns cancellation.
 
 When an agent runs `openclaw update` inside a systemd user service or macOS
 LaunchAgent Gateway, the CLI hands the update to the same managed-service helper
@@ -402,7 +491,7 @@ the sentinel.
   <Step title="Build a candidate">
     Stable, beta, and dev updates install dependencies and build in a temporary worktree while the old Gateway serves. Dev rebases the candidate first so local commits are preserved and the build validates the exact source that will be activated. On POSIX, staging uses a private directory in the checkout's existing ignored `.artifacts` area. By default, the full workspace stays on the checkout filesystem, not a potentially small system temporary filesystem. An existing `.artifacts` redirect is honored as an operator storage choice, just like the build cache. Existing checkout, parent, and artifact directory permissions are not changed. Windows keeps its short system-drive staging path. Only dev updates walk back through earlier commits; stable and beta updates validate their selected target.
 
-    The updater prepares the built runtime on the destination filesystem and removes the temporary Git worktree registration before changing the live checkout. Cleanup failures remain visible in the update result. If an interruption leaves staging behind, artifact-area staging does not dirty the checkout or block the next update's clean check.
+    The updater prepares the built runtime (`dist`, `dist-runtime`, and dependencies, including nested workspace outputs) on the destination filesystem and removes the temporary Git worktree registration before changing the live checkout. Cleanup failures remain visible in the update result. If an interruption leaves staging behind, artifact-area staging does not dirty the checkout or block the next update's clean check.
 
     Dev can walk back up to 10 commits to find the newest buildable candidate. Confirmed ENOSPC storage failures stop immediately with `preflight-insufficient-space`; free space on the preflight staging and package-manager store filesystems before retrying. Shared package-manager stores are not deleted. Update builds skip TypeScript declaration generation by default. Set `OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=0` to explicitly request declarations. Set `OPENCLAW_UPDATE_PREFLIGHT_LINT=1` to also run source lint during this preflight; lint runs in constrained serial mode because user update hosts are often smaller than CI runners.
 
@@ -422,6 +511,9 @@ the sentinel.
   </Step>
   <Step title="Sync plugins">
     Against the installed target, syncs plugins to the active channel before restarting the managed service. Dev uses bundled plugins; stable and beta use npm or ClawHub while preserving recorded source choices. A changed plugin snapshot runs fresh Doctor migrations; unchanged plugins do not run another full Doctor pass. The updater then revalidates the service owner, starts the Gateway, and verifies the final snapshot.
+
+    Source targets that support runtime completion also check their generated plugin runtime overlay and SDK aliases before loading plugin configuration. This completes artifacts omitted by an older updater on the first update to such a target; `update repair` performs the same check before Doctor. Exact artifacts remain untouched, including while a Gateway is running. Replacing missing or stale artifacts requires proof that the affected runtime is offline. A Gateway serving a physically separate runtime does not block completion. If service ownership or offline status cannot be verified, completion fails with recovery guidance instead of reporting a successful update. Older targets retain their existing generation behavior. Clean-source and candidate-build validation still apply.
+
   </Step>
 </Steps>
 

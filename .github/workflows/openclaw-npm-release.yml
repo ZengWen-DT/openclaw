@@ -411,6 +411,8 @@ jobs:
       - name: Verify full release validation evidence
         if: ${{ inputs.release_evidence_mode == 'full-release-validation' && inputs.full_release_validation_run_id != '' }}
         env:
+          PUBLICATION_CONSUMER: core-npm
+          RELEASE_NPM_DIST_TAG: ${{ inputs.npm_dist_tag }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
           FULL_RELEASE_VALIDATION_RUN_ID: ${{ inputs.full_release_validation_run_id }}
@@ -442,15 +444,6 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${FULL_RELEASE_VALIDATION_RUN_ID}/attempts/${FULL_RELEASE_VALIDATION_RUN_ATTEMPT}" | \
             TRUSTED_MAIN_REF="${trusted_main_ref}" \
             node trusted-workflow/scripts/validate-full-release-validation-evidence.mjs
-          node "$STRICT_VALIDATOR_FILE" \
-            --validate-run "$FULL_RELEASE_VALIDATION_RUN_ID" \
-            --trusted-workflow-ref "$TRUSTED_WORKFLOW_REF" \
-            --trusted-workflow-full-ref "$TRUSTED_WORKFLOW_FULL_REF" \
-            --trusted-workflow-sha "$TRUSTED_WORKFLOW_SHA" \
-            --json \
-            --verifier-source-sha "$WORKFLOW_SHA" \
-            --verifier-source-file "$STRICT_VALIDATOR_FILE" >/dev/null
-
       - name: Verify preflight run metadata
         id: preflight_run
         env:

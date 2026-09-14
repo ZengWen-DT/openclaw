@@ -22,8 +22,13 @@ export type ChatMetadataSessionEntry = Partial<
 export type ChatMetadataReadParams = {
   agentId: string;
   sessionKey?: string;
+  storePath?: string;
   requesterProfileId?: string;
   sessionEntry?: ChatMetadataSessionEntry;
+  /** Saved reads retain their selected row and physical store until response settlement. */
+  isCurrent?: () => boolean;
+  assertCurrent?: () => void;
+  release?: () => void;
   draftAccountSelection?: UserModelAccountSelection;
 };
 

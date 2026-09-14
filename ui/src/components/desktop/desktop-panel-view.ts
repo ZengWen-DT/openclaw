@@ -151,13 +151,9 @@ export function renderDesktopPicker(options: {
 }) {
   if (options.automatic) {
     return html`<div class="desktop-status" role="status">
-      ${
-        options.loading
-          ? t("desktop.connecting")
-          : html`<button class="desktop-button" type="button" @click=${options.onRefresh}>
-              ${t("common.retry")}
-            </button>`
-      }
+      <button class="desktop-button" type="button" @click=${options.onRefresh}>
+        ${t("common.retry")}
+      </button>
     </div>`;
   }
   return html`
@@ -273,6 +269,7 @@ export function renderDesktopConnection(options: {
   launchingApp: WorkerDesktopAppId | null;
   showApps: boolean;
   sizing: DesktopSizingOptions;
+  pictureInPictureControl: TemplateResult;
   onDisconnect: () => void;
   onLaunch: (app: WorkerDesktopAppId) => void;
   onTakeControl: () => void;
@@ -309,7 +306,7 @@ export function renderDesktopConnection(options: {
           : nothing
       }
       <span class="desktop-toolbar__spacer"></span>
-      ${renderDesktopSizing(options.sizing)}
+      ${renderDesktopSizing(options.sizing)} ${options.pictureInPictureControl}
       <button
         class="desktop-toolbar-action"
         type="button"

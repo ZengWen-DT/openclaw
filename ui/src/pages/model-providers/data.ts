@@ -33,7 +33,7 @@ type ModelProviderAuthSummary = {
 type ModelProviderLocalCost = {
   totalCost: number;
   totalTokens: number;
-  sessionCount: number;
+  messageCount: number;
 };
 
 export type ModelProviderLogoutTarget = {
@@ -80,6 +80,7 @@ export type ModelProviderCard = {
   modelCount: number;
   availableModelCount: number;
   catalogStatus?: ModelCatalogProviderOutcome["status"];
+  checkingModels?: boolean;
   /** Live provider-reported usage (quota windows, billing, cost history). */
   usage?: ProviderUsageSnapshot;
   /** Locally-computed session spend for the requested window. */
@@ -90,6 +91,7 @@ type ModelProviderCardsInput = {
   authStatus: ModelAuthStatusResult | null;
   models: ModelCatalogEntry[] | null;
   providerOutcomes?: ModelCatalogProviderOutcome[];
+  pendingProviders?: readonly string[];
   configProviderIds?: string[] | null;
   configApiKeyProviderIds?: string[] | null;
   configProviderAuthModes?: Record<string, string> | null;
@@ -375,14 +377,14 @@ export function buildModelProviderCards(input: ModelProviderCardsInput): ModelPr
     const addition: ModelProviderLocalCost = {
       totalCost: entry.totals.totalCost,
       totalTokens: entry.totals.totalTokens,
-      sessionCount: entry.count,
+      messageCount: entry.count,
     };
     const current = draft.card.localCost;
     draft.card.localCost = current
       ? {
           totalCost: current.totalCost + addition.totalCost,
           totalTokens: current.totalTokens + addition.totalTokens,
-          sessionCount: current.sessionCount + addition.sessionCount,
+          messageCount: current.messageCount + addition.messageCount,
         }
       : addition;
   }
@@ -402,6 +404,11 @@ export function buildModelProviderCards(input: ModelProviderCardsInput): ModelPr
       return Object.assign(
         {},
         draft.card,
+        {
+          checkingModels: input.pendingProviders?.some(
+            (id) => canonicalProviderId(id) === draft.card.id,
+          ),
+        },
         draft.catalogOutcome ? { catalogStatus: draft.catalogOutcome.status } : {},
         apiKeySupported === undefined ? {} : { apiKeySupported },
       );

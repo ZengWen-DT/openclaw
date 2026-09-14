@@ -8,20 +8,25 @@ import { formatErrorMessage } from "../infra/errors.js";
 import { findDeliveryIntentOwner } from "../infra/outbound/delivery-queue-storage.js";
 import { recordUpdateRunStep, recordUpdateRunVerification } from "../infra/update-run-ledger.js";
 import type { UpdateRunRecord } from "../infra/update-run-record.js";
+import { readUpdateRunReportHealth } from "../infra/update-run-report-health.js";
 import { renderUpdateRunNotice, type UpdateRunNoticeKind } from "../infra/update-run-report.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { sendGatewayLifecycleNotice } from "./server-restart-sentinel-notice.js";
-import { resolveUpdateRunNoticeTarget } from "./update-run-notice-target.js";
+import {
+  authorizeUpdateRunNoticeTarget,
+  recordUpdateRunNoticeSkipped,
+  resolveUpdateRunNoticeTarget,
+} from "./update-run-notice-target.js";
 
 const log = createSubsystemLogger("gateway/update-run");
 
 /** Prepare routing before an update can replace lazily loaded channel modules. */
 export function createUpdateRunNotifier(
   initial: UpdateRunRecord,
-  cfg: OpenClawConfig = getRuntimeConfig(),
+  getConfig: () => OpenClawConfig = getRuntimeConfig,
   deps: CliDeps = createDefaultDeps(),
   target = resolveUpdateRunNoticeTarget({
-    cfg,
+    cfg: getConfig(),
     sessionKey: initial.origin.sessionKey,
     explicitDeliveryContext: initial.origin.deliveryContext,
     threadId: initial.origin.deliveryContext?.threadId,
@@ -31,7 +36,6 @@ export function createUpdateRunNotifier(
   // Update delivery belongs to the host and can outlive the requesting attempt.
   return (run: UpdateRunRecord, kind: UpdateRunNoticeKind) =>
     runWithoutOwnedSessionTranscriptWrites(async () => {
-      const message = renderUpdateRunNotice(run, kind);
       // Pre-park and later activation share one durable notice, never a fifth milestone.
       const milestone = kind === "parking" ? "activating" : kind;
       const recorded =
@@ -40,24 +44,40 @@ export function createUpdateRunNotifier(
           : run.steps.some(
               (step) => step.step === `notice:${milestone}` && step.status === "completed",
             );
-      if (!message || recorded) {
+      if (recorded) {
         return { delivered: false, owned: recorded };
+      }
+      const message = renderUpdateRunNotice(
+        run,
+        kind,
+        kind === "finished" && run.status === "failed"
+          ? { currentHealth: await readUpdateRunReportHealth(run.verification) }
+          : {},
+      );
+      if (!message) {
+        return { delivered: false, owned: false };
+      }
+      const cfg = getConfig();
+      const currentTarget = authorizeUpdateRunNoticeTarget(cfg, target);
+      if (currentTarget.kind === "none") {
+        recordUpdateRunNoticeSkipped(run.runId, currentTarget.reason);
+        return { delivered: false, owned: false };
       }
       // Admission, the watcher, and successor startup share permanent delivery
       // ownership. A repeated phase or sentinel revision cannot send a fifth message.
       const deliveryIntentId = `update-run-${milestone}:${run.runId}`;
-      let delivered = false;
-      if (target.kind === "route") {
+      let delivered: boolean;
+      if (currentTarget.kind === "route") {
         delivered = await sendGatewayLifecycleNotice({
-          ...target.route,
+          ...currentTarget.route,
           cfg,
           deps,
           sessionKey,
           message,
           deliveryIntentId,
         });
-      } else if (target.kind === "internal") {
-        const internal = target.session;
+      } else {
+        const internal = currentTarget.session;
         const notice = await appendAssistantMessageToSessionTranscript({
           agentId: internal.agentId,
           sessionKey: internal.canonicalKey,
@@ -75,7 +95,8 @@ export function createUpdateRunNotifier(
       if (delivered && kind === "finished") {
         recordUpdateRunVerification(run.runId, { noticeDelivered: true });
       }
-      const custody = target.kind === "route" ? findDeliveryIntentOwner(deliveryIntentId) : null;
+      const custody =
+        currentTarget.kind === "route" ? findDeliveryIntentOwner(deliveryIntentId) : null;
       const owned = delivered || custody?.status === "pending" || custody?.status === "completed";
       if (owned && kind !== "finished") {
         recordUpdateRunStep(run.runId, {

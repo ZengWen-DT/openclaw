@@ -166,6 +166,10 @@ export function waitForQueuedChatHistory(
   const connectionIsCurrent = captureChatConnectionOwner(host);
   const sessions = host.sessions;
   const history = getChatHistoryLoadState(host);
+  // Background outbox wakeups cannot take over the transcript's visible Retry action.
+  if (history.phase === "failed") {
+    return Promise.resolve(null);
+  }
   // The outbox already owns the draft. Join startup before reusing cached
   // session/branch identity, without issuing a competing history request.
   const loading =
@@ -238,7 +242,7 @@ export function finishChatDeliveryAdmission(
       routeVisible(current.agentId) &&
       (isChatBusy(host) || hasDirectSessionRun(host)))
   ) {
-    const parked = setState(host.connected && host.client ? "waiting-idle" : "waiting-reconnect");
+    const parked = setState(reconnectSafeQueuedSendState(host));
     if (!parked) {
       setChatError(host, OFFLINE_QUEUE_STORAGE_ERROR);
       return "failed";

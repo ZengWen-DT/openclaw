@@ -1,6 +1,7 @@
 /* @vitest-environment jsdom */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError } from "../../api/gateway.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import { showConfirmDialog } from "../../components/confirm-dialog.ts";
@@ -17,7 +18,6 @@ import {
   createPluginsRouteData,
   createPluginsRouteLocation,
   createResult,
-  deferred,
   mountPage,
   resetPluginsPageTestState,
   type RuntimeConfigTestState,
@@ -248,7 +248,7 @@ describe("PluginsPage", () => {
   });
 
   it.each(["install", "enable", "uninstall"] as const)(
-    "flushes a pending config draft before plugin %s and refreshes afterward",
+    "config.set flushes a pending config draft before plugin %s and refreshes afterward",
     async (action) => {
       vi.useFakeTimers();
       const method =
@@ -292,7 +292,7 @@ describe("PluginsPage", () => {
           order.push(requestMethod);
           config = JSON.parse((params as { raw: string }).raw) as Record<string, unknown>;
           hash = "hash-2";
-          return { hash };
+          return { config, hash };
         }
         if (requestMethod === method) {
           order.push(requestMethod);

@@ -24,16 +24,10 @@ type StatusOverviewRow = {
   Value: string;
 };
 
-type StatusUpdateLike = UpdateCheckResult;
-
 type StatusGatewayConnection = {
   url: string;
   urlSource?: string;
 };
-
-function resolveStatusGatewayDisplayUrl(connection: StatusGatewayConnection): string {
-  return projectGatewayUrlForDiagnostics(connection.url);
-}
 
 type StatusGatewayProbe = {
   connectLatencyMs?: number | null;
@@ -92,7 +86,7 @@ export function resolveStatusUpdateChannelInfo(params: {
 /** Builds the update row fields reused by the overview table and status-all report. */
 export function buildStatusUpdateSurface(params: {
   updateConfigChannel?: string | null;
-  update: StatusUpdateLike;
+  update: UpdateCheckResult;
 }) {
   const channelInfo = resolveStatusUpdateChannelInfo({
     updateConfigChannel: params.updateConfigChannel,
@@ -107,19 +101,11 @@ export function buildStatusUpdateSurface(params: {
   };
 }
 
-/** Formats missing dashboard URLs as disabled instead of leaking empty/null into status rows. */
-function formatStatusDashboardValue(value: string | null | undefined): string {
-  const trimmed = normalizeOptionalString(value);
-  return trimmed && trimmed.length > 0 ? trimmed : "disabled";
-}
-
 /** Formats Tailscale exposure in a compact, warning-aware status row value. */
 function formatStatusTailscaleValue(params: {
   tailscaleMode: string;
   dnsName?: string | null;
   httpsUrl?: string | null;
-  backendState?: string | null;
-  includeBackendStateWhenOff?: boolean;
   includeBackendStateWhenOn?: boolean;
   includeDnsNameWhenOff?: boolean;
   decorateOff?: (value: string) => string;
@@ -128,21 +114,14 @@ function formatStatusTailscaleValue(params: {
   const decorateOff = params.decorateOff ?? ((value: string) => value);
   const decorateWarn = params.decorateWarn ?? ((value: string) => value);
   if (params.tailscaleMode === "off") {
-    // Off mode can still show daemon/DNS context when the caller wants diagnostic detail.
-    const suffix = [
-      params.includeBackendStateWhenOff && params.backendState
-        ? `daemon ${params.backendState}`
-        : null,
-      params.includeDnsNameWhenOff && params.dnsName ? params.dnsName : null,
-    ]
-      .filter(Boolean)
-      .join(" · ");
+    // Off mode can still show DNS context when the caller wants diagnostic detail.
+    const suffix = params.includeDnsNameWhenOff ? params.dnsName : null;
     return decorateOff(suffix ? `off · ${suffix}` : "off");
   }
   if (params.dnsName && params.httpsUrl) {
     const parts = [
       params.tailscaleMode,
-      params.includeBackendStateWhenOn ? (params.backendState ?? "unknown") : null,
+      params.includeBackendStateWhenOn ? "unknown" : null,
       params.dnsName,
       params.httpsUrl,
     ].filter(Boolean);
@@ -150,7 +129,7 @@ function formatStatusTailscaleValue(params: {
   }
   const parts = [
     params.tailscaleMode,
-    params.includeBackendStateWhenOn ? (params.backendState ?? "unknown") : null,
+    params.includeBackendStateWhenOn ? "unknown" : null,
     "magicdns unknown",
   ].filter(Boolean);
   return decorateWarn(parts.join(" · "));
@@ -253,13 +232,11 @@ function buildStatusOverviewRows(params: {
 /** Builds overview rows directly from raw scan/update/gateway inputs. */
 export function buildStatusOverviewSurfaceRows(params: {
   cfg: Pick<OpenClawConfig, "update" | "gateway" | "telemetry">;
-  update: StatusUpdateLike;
+  update: UpdateCheckResult;
   tailscaleMode: string;
   tailscaleDns?: string | null;
   tailscaleHttpsUrl?: string | null;
   advertisedControlUiLinks?: { httpUrl: string; wsUrl: string };
-  tailscaleBackendState?: string | null;
-  includeBackendStateWhenOff?: boolean;
   includeBackendStateWhenOn?: boolean;
   includeDnsNameWhenOff?: boolean;
   decorateTailscaleOff?: (value: string) => string;
@@ -312,13 +289,11 @@ export function buildStatusOverviewSurfaceRows(params: {
     });
   return buildStatusOverviewRows({
     prefixRows: params.prefixRows,
-    dashboardValue: formatStatusDashboardValue(dashboardUrl),
+    dashboardValue: normalizeOptionalString(dashboardUrl) ?? "disabled",
     tailscaleValue: formatStatusTailscaleValue({
       tailscaleMode: params.tailscaleMode,
       dnsName: params.tailscaleDns,
       httpsUrl: params.tailscaleHttpsUrl,
-      backendState: params.tailscaleBackendState,
-      includeBackendStateWhenOff: params.includeBackendStateWhenOff,
       includeBackendStateWhenOn: params.includeBackendStateWhenOn,
       includeDnsNameWhenOff: params.includeDnsNameWhenOff,
       decorateOff: params.decorateTailscaleOff,
@@ -343,10 +318,7 @@ export function buildStatusOverviewSurfaceRows(params: {
 
 /** Returns which gateway auth material was actually used for the probe. */
 function formatGatewayAuthUsed(
-  auth: {
-    token?: string;
-    password?: string;
-  } | null,
+  auth: StatusGatewayProbeAuth,
 ): "token" | "password" | "token+password" | "none" {
   const hasToken = Boolean(auth?.token?.trim());
   const hasPassword = Boolean(auth?.password?.trim());
@@ -391,7 +363,7 @@ function buildGatewayStatusSummaryParts(params: {
   authText: string;
   modeLabel: string;
 } {
-  const displayUrl = resolveStatusGatewayDisplayUrl(params.gatewayConnection);
+  const displayUrl = projectGatewayUrlForDiagnostics(params.gatewayConnection.url);
   const targetText = params.remoteUrlMissing ? `fallback ${displayUrl}` : displayUrl;
   const targetTextWithSource = params.gatewayConnection.urlSource
     ? `${targetText} (${params.gatewayConnection.urlSource})`
@@ -437,14 +409,7 @@ function buildStatusGatewaySurfaceValues(params: {
 }) {
   const decorateOk = params.decorateOk ?? ((value: string) => value);
   const decorateWarn = params.decorateWarn ?? ((value: string) => value);
-  const gatewaySummary = buildGatewayStatusSummaryParts({
-    gatewayMode: params.gatewayMode,
-    remoteUrlMissing: params.remoteUrlMissing,
-    gatewayConnection: params.gatewayConnection,
-    gatewayReachable: params.gatewayReachable,
-    gatewayProbe: params.gatewayProbe,
-    gatewayProbeAuth: params.gatewayProbeAuth,
-  });
+  const gatewaySummary = buildGatewayStatusSummaryParts(params);
   const gatewaySelfValue = formatGatewaySelfSummary(params.gatewaySelf);
   const gatewayValue =
     params.nodeOnlyGateway?.gatewayValue ??
@@ -455,10 +420,7 @@ function buildStatusGatewaySurfaceValues(params: {
           ? decorateOk(gatewaySummary.reachText)
           : decorateWarn(gatewaySummary.reachText)
     }${
-      params.gatewayReachable &&
-      !params.remoteUrlMissing &&
-      gatewaySummary.authText &&
-      gatewaySummary.authText.length > 0
+      params.gatewayReachable && !params.remoteUrlMissing && gatewaySummary.authText
         ? ` · ${gatewaySummary.authText}`
         : ""
     }${gatewaySelfValue ? ` · ${gatewaySelfValue}` : ""}`;
@@ -475,10 +437,7 @@ function buildStatusGatewaySurfaceValues(params: {
 /** Builds the stable gateway object used by `openclaw status --json`. */
 export function buildGatewayStatusJsonPayload(params: {
   gatewayMode: "local" | "remote";
-  gatewayConnection: {
-    url: string;
-    urlSource?: string;
-  };
+  gatewayConnection: StatusGatewayConnection;
   remoteUrlMissing: boolean;
   gatewayReachable: boolean;
   gatewayProbe:
@@ -489,20 +448,12 @@ export function buildGatewayStatusJsonPayload(params: {
       }
     | null
     | undefined;
-  gatewaySelf:
-    | {
-        host?: string | null;
-        ip?: string | null;
-        version?: string | null;
-        platform?: string | null;
-      }
-    | null
-    | undefined;
+  gatewaySelf: StatusGatewaySelf;
   gatewayProbeAuthWarning?: string | null;
 }) {
   return {
     mode: params.gatewayMode,
-    url: resolveStatusGatewayDisplayUrl(params.gatewayConnection),
+    url: projectGatewayUrlForDiagnostics(params.gatewayConnection.url),
     urlSource: params.gatewayConnection.urlSource,
     misconfigured: params.remoteUrlMissing,
     reachable: params.gatewayReachable,

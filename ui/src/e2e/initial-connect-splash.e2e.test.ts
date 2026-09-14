@@ -254,6 +254,28 @@ describeControlUiE2e("Control UI initial connect splash E2E", () => {
         skeleton.locator(".loading-skeleton__composer"),
       ]);
 
+      for (const size of [viewport, { width: 1440, height: 1440 }, { width: 390, height: 844 }]) {
+        await page.setViewportSize(size);
+        const content = await page.locator(".content--chat").boundingBox();
+        const header = await skeleton.locator(".loading-skeleton__header").boundingBox();
+        const composer = await skeleton.locator(".loading-skeleton__composer").boundingBox();
+        expect(content).not.toBeNull();
+        expect(header).not.toBeNull();
+        expect(composer).not.toBeNull();
+        expect(header!.y - content!.y, "loading header stays at the top").toBeGreaterThanOrEqual(0);
+        expect(header!.y - content!.y, "loading header stays at the top").toBeLessThan(48);
+        const bottomGap = content!.y + content!.height - composer!.y - composer!.height;
+        expect(bottomGap, "loading composer stays inside the content area").toBeGreaterThanOrEqual(
+          0,
+        );
+        expect(bottomGap, "loading composer stays near the bottom").toBeLessThan(64);
+        await captureProof(page, `03-pending-chat-${size.width}x${size.height}`, [
+          skeleton.locator(".loading-skeleton__header"),
+          skeleton.locator(".loading-skeleton__composer"),
+        ]);
+      }
+      await page.setViewportSize(viewport);
+
       releaseChatModule();
       await page.locator("openclaw-chat-page").waitFor();
       expect(await loadingState.count()).toBe(0);
@@ -292,7 +314,8 @@ describeControlUiE2e("Control UI initial connect splash E2E", () => {
     const workspaceModules = new Set([
       "/src/components/app-sidebar.ts",
       "/src/components/browser/browser-panel.ts",
-      "/src/components/assistant-panel.ts",
+      "/src/components/assistant-panel-content.ts",
+      "/src/pages/debug/debug-overlay-content.ts",
       "/src/components/desktop/desktop-panel.ts",
       "/src/components/terminal/terminal-panel-registration.ts",
       "/src/pages/chat/chat-page.ts",

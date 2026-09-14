@@ -3,6 +3,7 @@ import { html, type PropertyValues } from "lit";
 import { property, state } from "lit/decorators.js";
 import type { AgentsListResult, CronJob, CronScratchGetResult } from "../../api/types.ts";
 import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
+import { pathForRoute } from "../../app-route-paths.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
 import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
 import { renderAgentScopeControl } from "../../components/agent-scope-control.ts";
@@ -10,6 +11,7 @@ import { showConfirmDialog } from "../../components/confirm-dialog.ts";
 import { renderSettingsPageHeader } from "../../components/settings-ui.ts";
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import { t } from "../../i18n/index.ts";
+import { registerCronEnglish } from "../../i18n/locales/en-cron.ts";
 import { watchAgentScope } from "../../lib/agents/index.ts";
 import {
   addCronJob,
@@ -35,6 +37,7 @@ import {
 } from "../../lib/cron/index.ts";
 import { formatUiError } from "../../lib/format-error.ts";
 import { loadModelCatalog, modelCatalogRefreshError } from "../../lib/model-catalog-store.ts";
+import { shouldHandleNavigationClick } from "../../lib/navigation-click.ts";
 import {
   resolveSessionNavigationAgentId,
   sessionNavigationTarget,
@@ -45,6 +48,8 @@ import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 import { buildCronSuggestions, THINKING_SUGGESTIONS } from "./form-suggestions.ts";
 import { resolveCronRouteData } from "./route-model.ts";
 import { renderCron, type CronDetailTab, type CronListTab } from "./view.ts";
+
+registerCronEnglish();
 
 class CronPage extends OpenClawLightDomElement {
   @consume({ context: applicationContext, subscribe: true })
@@ -156,6 +161,8 @@ class CronPage extends OpenClawLightDomElement {
     });
     cron.canRefresh = () => this.canRefreshCron(cron);
     this.cron = cron;
+    const routeData = resolveCronRouteData(this.routeSearch);
+    cron.cronSessionFilter = routeData.session;
     this.routeJobRequested = false;
     this.pageHidden = document.visibilityState === "hidden";
     this.cron.cronAgentId = this.context.agentSelection.state.scopeId;
@@ -183,7 +190,7 @@ class CronPage extends OpenClawLightDomElement {
     if (forceRefresh || (!this.cron.cronStatus && !this.cron.cronLoading)) {
       void this.refreshCron({ tableFilters: true, coalesce: true });
     } else if (!this.cron.cronRuns.length && !this.cron.cronRunsLoadingMore) {
-      void this.loadRuns(this.cron.cronRunsScope === "all" ? null : this.cron.cronRunsJobId);
+      void this.loadRuns();
     }
     if (this.modelSuggestionsRequest?.state !== this.cron) {
       void this.loadModelSuggestions(this.cron);
@@ -202,7 +209,14 @@ class CronPage extends OpenClawLightDomElement {
     if (changed.has("routeSearch")) {
       this.cron.cronError = null;
       const routeData = resolveCronRouteData(this.routeSearch);
-      this.pendingRouteData = routeData.jobId ? routeData : null;
+      // A route filter owns a new inventory snapshot; late responses keep the retired state.
+      if (JSON.stringify(this.cron.cronSessionFilter) !== JSON.stringify(routeData.session)) {
+        this.resetGatewayState(this.context.gateway.snapshot);
+        this.ensureInitialData();
+      }
+      this.listTab = "tasks";
+      this.detailTab = "settings";
+      this.pendingRouteData = routeData.jobId || routeData.session ? routeData : null;
       this.routeJobRequested = false;
       this.highlightedRunId = null;
       this.pendingRunScroll = false;
@@ -225,7 +239,14 @@ class CronPage extends OpenClawLightDomElement {
     }
     const routeData = this.pendingRouteData;
     const client = this.cron.client;
-    if (routeData && client && this.cron.connected && !this.routeJobRequested) {
+    if (routeData?.session && this.cron.cronJobsSnapshotRevision && !this.cron.cronLoading) {
+      this.pendingRouteData = null;
+      const [job] = this.cron.cronJobs;
+      if (this.cron.cronJobsTotal === 1 && job) {
+        this.selectJob(job);
+      }
+    }
+    if (routeData?.jobId && client && this.cron.connected && !this.routeJobRequested) {
       this.routeJobRequested = true;
       void this.runCronTask(async (current) => {
         const isCurrent = () =>
@@ -258,8 +279,7 @@ class CronPage extends OpenClawLightDomElement {
     if (!this.canRefreshCron(cronState) || !cronState.connected || !cronState.client) {
       return;
     }
-    const activeCronJobId = cronState.cronRunsScope === "job" ? cronState.cronRunsJobId : null;
-    void this.loadRuns(activeCronJobId, options.coalesce);
+    void this.loadRuns(options.coalesce);
     void this.context.channels.refresh(false);
     await Promise.all([
       this.runCronTask((current) => loadCronStatus(current, options)),
@@ -269,8 +289,8 @@ class CronPage extends OpenClawLightDomElement {
     ]);
   }
 
-  private loadRuns(jobId: string | null, coalesce = false) {
-    return this.runCronTask((cronState) => loadCronRuns(cronState, jobId, { coalesce }));
+  private loadRuns(coalesce = false) {
+    return this.runCronTask((cronState) => loadCronRuns(cronState, { coalesce }));
   }
 
   private async loadModelSuggestions(cronState: CronState) {
@@ -349,7 +369,7 @@ class CronPage extends OpenClawLightDomElement {
       // job no longer matches, so a slower earlier selection cannot overwrite
       // this task's history.
       cronState.cronRunsJobId = job.id;
-      await loadCronRuns(cronState, job.id);
+      await loadCronRuns(cronState);
     });
   }
 
@@ -462,7 +482,7 @@ class CronPage extends OpenClawLightDomElement {
       // the runs scope must follow or recent activity stays empty.
       if (current.cronRunsScope === "job" && current.cronRunsJobId === null) {
         updateCronRunsFilter(current, { cronRunsScope: "all" });
-        await loadCronRuns(current, null);
+        await loadCronRuns(current);
       }
     });
   }
@@ -476,7 +496,7 @@ class CronPage extends OpenClawLightDomElement {
     void this.runCronTask(async (cronState) => {
       updateCronRunsFilter(cronState, { cronRunsScope: "all" });
       cronState.cronRunsJobId = null;
-      await loadCronRuns(cronState, null);
+      await loadCronRuns(cronState);
     });
   }
 
@@ -500,7 +520,7 @@ class CronPage extends OpenClawLightDomElement {
       if (cronState.cronRunsScope === "job") {
         updateCronRunsFilter(cronState, { cronRunsScope: "all" });
         cronState.cronRunsJobId = null;
-        await loadCronRuns(cronState, null);
+        await loadCronRuns(cronState);
       }
     });
   }
@@ -519,11 +539,25 @@ class CronPage extends OpenClawLightDomElement {
     return html`
       ${renderSettingsPageHeader({
         title: titleForRoute("cron"),
-        subtitle: subtitleForRoute("cron"),
-        actions: renderAgentScopeControl({
-          agents: this.agentsList?.agents ?? [],
-          selection: this.context.agentSelection,
-        }),
+        subtitle: this.cron.cronSessionFilter
+          ? t("cron.list.sessionFilter")
+          : subtitleForRoute("cron"),
+        actions: this.cron.cronSessionFilter
+          ? html`<a
+              class="btn"
+              href=${pathForRoute("cron", this.context.basePath)}
+              @click=${(event: MouseEvent) => {
+                if (shouldHandleNavigationClick(event)) {
+                  event.preventDefault();
+                  this.context.navigate("cron", { search: "" });
+                }
+              }}
+              >${t("cron.list.showAll")}</a
+            >`
+          : renderAgentScopeControl({
+              agents: this.agentsList?.agents ?? [],
+              selection: this.context.agentSelection,
+            }),
       })}
       ${renderSettingsWorkspace(
         renderCron({
@@ -618,10 +652,7 @@ class CronPage extends OpenClawLightDomElement {
           onRunsFiltersChange: (patch) =>
             void this.runCronTask(async (cronState) => {
               updateCronRunsFilter(cronState, patch);
-              await loadCronRuns(
-                cronState,
-                cronState.cronRunsScope === "all" ? null : cronState.cronRunsJobId,
-              );
+              await loadCronRuns(cronState);
             }),
           onNavigateToChat: (sessionKey) =>
             this.context.navigate(

@@ -49,13 +49,9 @@ type NewSessionMetadataClient = NonNullable<ApplicationContext["gateway"]["snaps
 type GatewayAgentRuntime = NonNullable<GatewayAgentRow["agentRuntime"]> & {
   cloudPlacementSupported?: boolean;
 };
-type NewSessionMetadataStatus = ChatModelCatalogState["status"];
-type NewSessionMetadataState = {
+type NewSessionMetadataState = ChatModelCatalogState & {
   catalog: ModelCatalogEntry[];
   accountSelection?: ChatAccountSelection;
-  refreshFailed?: boolean;
-  hasSnapshot: boolean;
-  status: NewSessionMetadataStatus;
 };
 type NewSessionMetadataLoadOptions = {
   agent?: GatewayAgentRow;
@@ -149,16 +145,20 @@ export class NewSessionModelControl {
     const gateway = this.pendingContext?.gateway;
     this.metadataGateway = gateway;
     this.metadataUnsubscribe = gateway
-      ? subscribeModelCatalogChanges(gateway, () => {
-          if (!this.ownsMetadata(client, scope)) {
-            this.restoringPreference = false;
-            this.draftAccount = undefined;
-            this.clearMetadataSubscription();
-            this.updateMetadataState({ catalog: [], hasSnapshot: false, status: "offline" });
-            return;
-          }
-          void this.startMetadataRequest(client, scope);
-        })
+      ? subscribeModelCatalogChanges(
+          gateway,
+          () => {
+            if (!this.ownsMetadata(client, scope)) {
+              this.restoringPreference = false;
+              this.draftAccount = undefined;
+              this.clearMetadataSubscription();
+              this.updateMetadataState({ catalog: [], hasSnapshot: false, status: "offline" });
+              return;
+            }
+            void this.startMetadataRequest(client, scope);
+          },
+          scope,
+        )
       : undefined;
     return scope;
   }
@@ -629,6 +629,7 @@ export class NewSessionModelControl {
         // ready catalog until the selected agent can supply its concrete defaults.
         hasSnapshot: agentDefaultsAvailable && this.metadataState.hasSnapshot,
         refreshFailed: this.metadataState.refreshFailed,
+        pendingProviders: this.metadataState.pendingProviders,
         status:
           !agentDefaultsAvailable && this.metadataState.status !== "error"
             ? "loading"

@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
+import { channel } from "node:diagnostics_channel";
+import fs from "node:fs";
+import { availableParallelism } from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { WorkerTaskPool } from "./worker-task-pool.js";
 import type { PoolFixtureInput, PoolFixtureResult } from "./worker-task-pool.test-support.js";
@@ -12,6 +17,12 @@ import type { PoolFixtureInput, PoolFixtureResult } from "./worker-task-pool.tes
 const workerUrl = new URL("./worker-task-pool.test-support.ts", import.meta.url);
 const pools: WorkerTaskPool<PoolFixtureInput, PoolFixtureResult>[] = [];
 const workers = vi.hoisted(() => [] as Worker[]);
+const directories = createTempDirTracker();
+
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
+  availableParallelism: () => 4,
+}));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:worker_threads")>();
@@ -45,9 +56,299 @@ afterEach(async () => {
   for (const worker of workers.splice(0)) {
     expect(worker.threadId).toBe(-1);
   }
+  directories.cleanup();
 });
 
 describe("worker task pool", () => {
+  it.each(["factory", "options", "constructor"] as const)(
+    "joins cancellation during worker %s preparation before removing scratch",
+    async (phase) => {
+      const directory = directories.make("worker-reentrant-preparation-");
+      const controller = new AbortController();
+      const reason = new Error("canceled during worker preparation");
+      const createdBefore = workers.length;
+      const workerChannel = channel("worker_threads");
+      const cancel = () => controller.abort(reason);
+      if (phase === "constructor") {
+        workerChannel.subscribe(cancel);
+      }
+      const pool = createPool({
+        workerUrl,
+        workerOptions: {
+          get workerData() {
+            if (phase === "options") {
+              cancel();
+            }
+            return { prepared: true };
+          },
+        },
+        prepareWorker: () => {
+          if (phase === "factory") {
+            cancel();
+          }
+          return { options: {}, temporaryDirectory: directory };
+        },
+      });
+      try {
+        await expect(pool.run({ label: "canceled" }, { signal: controller.signal })).rejects.toBe(
+          reason,
+        );
+        await pool.close();
+        const created = workers.slice(createdBefore);
+        expect(created).toHaveLength(phase === "constructor" ? 1 : 0);
+        expect(created.map((worker) => worker.threadId)).toEqual(
+          phase === "constructor" ? [-1] : [],
+        );
+        expect(fs.existsSync(directory)).toBe(false);
+      } finally {
+        workerChannel.unsubscribe(cancel);
+        // A failed regression must still join any Worker created after cancellation.
+        await Promise.all(workers.slice(createdBefore).map((worker) => worker.terminate()));
+        await pool.close();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "preserves static Worker options with prepared overrides: %s",
+    async (prepared) => {
+      const pool = createPool({
+        workerUrl,
+        workerOptions: {
+          argv: ["shared-argument"],
+          workerData: { source: "static", retained: true },
+        },
+        ...(prepared
+          ? { prepareWorker: () => ({ options: { workerData: { source: "prepared" } } }) }
+          : {}),
+      });
+      const result = await pool.run({ label: "options", readStartupOptions: true }, {});
+      expect(result.startupOptions).toEqual({
+        argv: ["shared-argument"],
+        data: prepared ? { source: "prepared" } : { source: "static", retained: true },
+      });
+    },
+  );
+
+  it.each(["close", "abort", "exit", "startup-error", "clone-error"] as const)(
+    "reclaims only its exited worker's scratch after %s",
+    async (ending) => {
+      const directory = directories.make("worker-owned-scratch-");
+      const unrelated = directories.make("worker-unrelated-scratch-");
+      fs.writeFileSync(path.join(directory, "captured-module.js"), "synthetic capture");
+      fs.writeFileSync(path.join(unrelated, "retained-module.js"), "unrelated capture");
+      const controller = new AbortController();
+      const pool = createPool({
+        workerUrl:
+          ending === "startup-error" ? new URL("./missing-worker.mjs", import.meta.url) : workerUrl,
+        restartOnError: false,
+        prepareWorker: () => ({
+          temporaryDirectory: directory,
+          options: ending === "clone-error" ? { workerData: () => {} } : {},
+        }),
+      });
+      if (ending === "startup-error" || ending === "clone-error") {
+        await expect(pool.run({ label: ending }, {})).rejects.toMatchObject({
+          code: "unavailable",
+        });
+      } else {
+        await pool.run({ label: "warm" }, {});
+        expect(fs.existsSync(directory)).toBe(true);
+        const worker = workers.at(-1)!;
+        if (ending === "close") {
+          await pool.close();
+        } else if (ending === "exit") {
+          await worker.terminate();
+          await pool.close();
+        } else {
+          const counters = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+          const active = pool.run(
+            { label: "blocked", counters, wait: true },
+            { signal: controller.signal },
+          );
+          void active.catch(() => {});
+          await expect.poll(() => Atomics.load(new Int32Array(counters), 0)).toBe(1);
+          expect(fs.existsSync(directory)).toBe(true);
+          controller.abort(new Error("scratch canceled"));
+          await expect(active).rejects.toThrow("scratch canceled");
+        }
+        expect(worker.threadId).toBe(-1);
+      }
+      await pool.close();
+      expect(fs.existsSync(directory)).toBe(false);
+      expect(fs.readFileSync(path.join(unrelated, "retained-module.js"), "utf8")).toBe(
+        "unrelated capture",
+      );
+    },
+  );
+  it("keeps canceled preparation charged until its retained input is released", async () => {
+    const pool = createPool({ workerUrl, maxPendingTasks: 1 });
+    const gate = createDeferredCore<PoolFixtureInput>();
+    const controller = new AbortController();
+    const first = pool.run(() => gate.promise, { signal: controller.signal });
+    const settled = Promise.allSettled([first]);
+    controller.abort();
+    await settled;
+    await expect(pool.run({ label: "excess" }, {})).rejects.toMatchObject({ code: "overloaded" });
+    gate.resolve({ label: "canceled" });
+    await gate.promise;
+    expect(await pool.run({ label: "recovered" }, {})).toMatchObject({ label: "recovered" });
+  });
+
+  it.each(["tasks", "bytes"] as const)(
+    "rejects excess pending %s and releases rejected inputs in caller context",
+    async (bound) => {
+      const context = new AsyncLocalStorage<string>();
+      const pool = createPool({
+        workerUrl,
+        maxPendingTasks: bound === "tasks" ? 2 : 10,
+        maxPendingBytes: 8,
+      });
+      const ready = createDeferredCore<PoolFixtureInput>();
+      const first = pool.run(() => ready.promise, { inputBytes: 4 });
+      const queued = pool.run({ label: "queued" }, { inputBytes: 4 });
+      const released: Array<string | undefined> = [];
+      let prepared = false;
+      const excess = context.run("rejected owner", () =>
+        pool.run(
+          () => {
+            prepared = true;
+            return { label: "excess" };
+          },
+          {
+            inputBytes: bound === "bytes" ? 1 : 0,
+            onInputConsumed: () => released.push(context.getStore()),
+          },
+        ),
+      );
+      const settled = Promise.allSettled([first, queued, excess]);
+      ready.resolve({ label: "first" });
+      const results = await settled;
+      expect(results[2]).toMatchObject({ status: "rejected", reason: { code: "overloaded" } });
+      expect(prepared).toBe(false);
+      expect(released).toEqual(["rejected owner"]);
+      expect(await pool.run({ label: "recovered" }, { inputBytes: 8 })).toMatchObject({
+        label: "recovered",
+      });
+    },
+  );
+
+  it("shares compute capacity across pools while ordered workers remain independent", async () => {
+    const limit = Math.max(1, availableParallelism() - 1);
+    const owner = createPool({ workerUrl, sharedCompute: true, maxWorkers: limit });
+    const waiting = createPool({ workerUrl, sharedCompute: true });
+    const independent = createPool();
+    const gate = createDeferredCore<PoolFixtureInput>();
+    const running = Array.from({ length: limit }, () => owner.run(() => gate.promise, {}));
+    let prepared = false;
+    const queued = waiting.run(() => {
+      prepared = true;
+      return { label: "waiting" };
+    }, {});
+    const settled = Promise.allSettled([...running, queued]);
+    try {
+      expect(prepared).toBe(false);
+      expect(await independent.run({ label: "ordered" }, {})).toMatchObject({ label: "ordered" });
+      expect(prepared).toBe(false);
+    } finally {
+      gate.resolve({ label: "owner" });
+      await settled;
+    }
+    expect(await queued).toMatchObject({ label: "waiting" });
+  });
+
+  it.each(["before", "during"] as const)(
+    "requests a host checkpoint for contention %s the exchange",
+    async (contention) => {
+      const context = new AsyncLocalStorage<string>();
+      let checkpointContext: string | undefined;
+      const limit = Math.max(1, availableParallelism() - 1);
+      const owner = createPool({ workerUrl, sharedCompute: true, maxWorkers: limit });
+      const waiting = createPool({ workerUrl, sharedCompute: true });
+      const gate = createDeferredCore<PoolFixtureInput>();
+      const entered = createDeferredCore();
+      const checkpoint = createDeferredCore();
+      let checkpointRequested = false;
+      const blockers = Array.from({ length: limit - 1 }, () => owner.run(() => gate.promise, {}));
+      const host = context.run("host owner", () =>
+        owner.run(
+          { label: "host", exchanges: 1 },
+          {
+            onRequest: async (_input, { yieldSignal }) => {
+              entered.resolve();
+              const requestCheckpoint = () => {
+                checkpointContext = context.getStore();
+                checkpointRequested = true;
+                checkpoint.resolve();
+              };
+              if (yieldSignal.aborted) {
+                requestCheckpoint();
+              } else {
+                yieldSignal.addEventListener("abort", requestCheckpoint, { once: true });
+              }
+              await checkpoint.promise;
+              return { input: null, timeoutMs: 10_000 };
+            },
+          },
+        ),
+      );
+      const settled = Promise.allSettled([...blockers, host]);
+      if (contention === "during") {
+        await entered.promise;
+      }
+      const next = context.run("contender", () => waiting.run({ label: "next" }, {}));
+      try {
+        await expect.poll(() => checkpointRequested).toBe(true);
+        expect(checkpointContext).toBe("host owner");
+        expect(await next).toMatchObject({ label: "next" });
+      } finally {
+        checkpoint.resolve();
+        gate.resolve({ label: "blocker" });
+        await Promise.allSettled([settled, next]);
+      }
+    },
+  );
+
+  it("moves worker-owned host request bytes out of the worker", async () => {
+    const pool = createPool();
+    let transferred: ArrayBuffer | undefined;
+    const result = await pool.run(
+      { label: "request bytes", exchanges: 2, relayBuffer: true },
+      {
+        timeoutMs: 10_000,
+        onRequest: async (value) => {
+          const request = value as { buffer?: ArrayBuffer };
+          if (request.buffer) {
+            transferred = request.buffer;
+            return { input: null, timeoutMs: 10_000 };
+          }
+          const bytes = new ArrayBuffer(1024 * 1024);
+          new Uint8Array(bytes).set([31, 47]);
+          return { input: bytes, transferList: [bytes], timeoutMs: 10_000 };
+        },
+      },
+    );
+    expect(result.relayedBufferBytes).toBe(0);
+    expect(transferred?.byteLength).toBe(1024 * 1024);
+    expect(new Uint8Array(transferred!).slice(0, 2)).toEqual(new Uint8Array([31, 47]));
+  });
+
+  it("transfers owned host reply bytes without retaining a copy in the parent", async () => {
+    const pool = createPool();
+    const bytes = new ArrayBuffer(1024 * 1024);
+    new Uint8Array(bytes).set([17, 29, 43]);
+    const result = await pool.run(
+      { label: "host bytes", exchanges: 1 },
+      {
+        timeoutMs: 10_000,
+        onRequest: async () => ({ input: bytes, transferList: [bytes], timeoutMs: 10_000 }),
+      },
+    );
+    expect(bytes.byteLength).toBe(0);
+    expect(result.buffer?.byteLength).toBe(1024 * 1024);
+    expect(new Uint8Array(result.buffer!).slice(0, 3)).toEqual(new Uint8Array([17, 29, 43]));
+  });
+
   it.each(["abort", "close"] as const)(
     "keeps host cancellation callbacks in the admitted caller context on %s",
     async (ending) => {

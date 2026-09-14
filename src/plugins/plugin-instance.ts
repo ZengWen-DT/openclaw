@@ -1,6 +1,7 @@
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import { PluginInstanceUnavailableError } from "./plugin-instance-error.js";
 import { pluginInstanceInvocation as invocation } from "./plugin-instance-invocation.js";
 import {
   pluginInstanceState,
@@ -17,10 +18,7 @@ import type {
 } from "./plugin-instance.types.js";
 import { resolvePluginReturnPromise } from "./plugin-return-value.js";
 import type { PluginRecord, PluginRegistry } from "./registry-types.js";
-import {
-  withPluginRuntimePluginScope,
-  withPluginRuntimeRegistryScope,
-} from "./runtime/gateway-request-scope.js";
+import { withPluginRuntimePluginScope } from "./runtime/gateway-request-scope.js";
 import { getPluginRuntimeGenerationRegistry } from "./runtime/generation-scope.js";
 
 const { values: valueInstances } = pluginInstanceState;
@@ -35,7 +33,7 @@ export class PluginInstance {
   controlPlaneInitialized = false;
   sourceDigest?: string;
   private moduleLoader?: (source: string) => unknown;
-  private moduleSourceExists?: (source: string) => boolean;
+  private moduleSourceExists?: false | ((source: string) => boolean);
   private accepting = true;
   private readonly calls = new Map<object, PluginRegistry | undefined>();
   private readonly consumers = new Map<
@@ -102,7 +100,7 @@ export class PluginInstance {
       return scoped.run(run);
     }
     if (!this.accepting || this.owner?.revoked) {
-      throw new Error(`Plugin ${this.pluginId} was reloaded or disabled; use its current tools.`);
+      throw new PluginInstanceUnavailableError(this.pluginId);
     }
     return this.invoke(run);
   }
@@ -114,7 +112,7 @@ export class PluginInstance {
     }
     // Fresh ordinary calls never inherit a scope's retained-consumer admission.
     if (!this.accepting || this.owner?.revoked) {
-      throw new Error(`Plugin ${this.pluginId} was reloaded or disabled; use its current tools.`);
+      throw new PluginInstanceUnavailableError(this.pluginId);
     }
     return this.invoke(run, this.lease(true, registry));
   }
@@ -249,9 +247,11 @@ export class PluginInstance {
   }
 
   private enter<T>(token: object, run: () => T): T {
-    const invoke = () => invocation.run({ instance: this, token }, run);
+    const current = invocation.getStore();
+    const call =
+      current?.instance === this && current.token === token ? current : { instance: this, token };
     if (!this.owner) {
-      return invoke();
+      return invocation.run(call, run);
     }
     const { record } = this.owner;
     const generation = getPluginRuntimeGenerationRegistry();
@@ -261,16 +261,16 @@ export class PluginInstance {
       this.consumers.get(token)?.registry ??
       this.calls.get(token) ??
       (generation?.plugins.includes(record) ? generation : this.owner.registry);
-    return withPluginRuntimeRegistryScope(registry, () =>
-      withPluginRuntimePluginScope(
-        {
-          pluginId: record.id,
-          pluginSource: record.source,
-          pluginOrigin: record.origin,
-          pluginTrustedOfficialInstall: record.trustedOfficialInstall,
-        },
-        invoke,
-      ),
+    return withPluginRuntimePluginScope(
+      {
+        pluginId: record.id,
+        pluginSource: record.source,
+        pluginOrigin: record.origin,
+        pluginTrustedOfficialInstall: record.trustedOfficialInstall,
+      },
+      run,
+      registry,
+      call,
     );
   }
 
@@ -331,7 +331,7 @@ export class PluginInstance {
   }
 
   hasModuleSource(source: string): boolean | undefined {
-    return this.moduleSourceExists?.(source);
+    return this.moduleSourceExists && this.moduleSourceExists(source);
   }
 
   quiesce(): boolean {
@@ -450,6 +450,8 @@ export class PluginInstance {
     this.calls.clear();
     this.waiters.forEach((wake) => wake());
     this.moduleLoader = undefined;
+    // Release captured paths without reopening the never-bound bundled-library fallback.
+    this.moduleSourceExists &&= false;
     this.slots.clear();
     if (failures.length) {
       log.warn(

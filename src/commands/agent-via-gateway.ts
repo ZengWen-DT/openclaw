@@ -20,6 +20,7 @@ import {
 import {
   AgentSelectionRequiredError,
   listAgentIds,
+  tryResolveAgentOperationAgentId,
   tryResolveSoleAgentId,
 } from "../agents/agent-scope-config.js";
 import { measureAgentStartup } from "../agents/startup-timing.js";
@@ -36,7 +37,6 @@ import {
 import {
   inheritLegacyDefaultAgentId,
   tryGetLegacyDefaultAgentId,
-  tryResolveLegacyCompatibilityAgentId,
 } from "../config/legacy.default-agent-owner.js";
 import { migratePersistedImplicitMainRoster } from "../config/legacy.roster.js";
 import { resolvePersistedSessionStoreOwnerForKey } from "../config/sessions/session-store-owner.js";
@@ -147,8 +147,6 @@ type AgentGatewayCallIdentity = Pick<
   Parameters<typeof callGateway>[0],
   "clientName" | "mode" | "scopes"
 >;
-type AgentSessionModule = typeof import("./agent/session.runtime.js");
-type AgentSessionModuleLoader = () => Promise<AgentSessionModule>;
 
 function usesImplicitRemoteCompatibilityDefault(roster: RemoteGatewayRoster): boolean {
   return (
@@ -171,7 +169,7 @@ function resolveImplicitCliAgentId(cfg: OpenClawConfig, remote?: RemoteGatewayRo
     ? remote.selectionRequired
       ? undefined
       : remote.defaultId
-    : tryResolveLegacyCompatibilityAgentId(selectionCfg);
+    : tryResolveAgentOperationAgentId(selectionCfg);
   if (selected) {
     return selected;
   }
@@ -190,9 +188,6 @@ const AGENT_CLI_SIGNAL_EXIT_CODES: Record<AgentCliSignal, number> = {
 };
 const MESSAGE_FILE_DECODER = new TextDecoder("utf-8", { fatal: true });
 
-const defaultAgentSessionModuleLoader: AgentSessionModuleLoader = () =>
-  import("./agent/session.runtime.js");
-let agentSessionModuleLoader: AgentSessionModuleLoader = defaultAgentSessionModuleLoader;
 const embeddedAgentCommandLoader = createLazyPromiseLoader(
   () => import("./agent.js").then((module) => module.agentCommand),
   { cacheRejections: true },
@@ -200,9 +195,10 @@ const embeddedAgentCommandLoader = createLazyPromiseLoader(
 const localAuditModuleLoader = createLazyPromiseLoader(() => import("./agent-local-audit.js"), {
   cacheRejections: true,
 });
-const agentSessionModuleCache = createLazyPromiseLoader(() => agentSessionModuleLoader(), {
-  cacheRejections: true,
-});
+const agentSessionModuleCache = createLazyPromiseLoader(
+  () => import("./agent/session.runtime.js"),
+  { cacheRejections: true },
+);
 const runtimeConfigModuleLoader = createLazyPromiseLoader(() => import("../config/io.js"), {
   cacheRejections: true,
 });
@@ -359,11 +355,6 @@ export const agentViaGatewayTesting = {
     runtimeConfigModuleLoader.clear();
     embeddedStateLockModuleLoader.clear();
     replyPayloadModuleLoader.clear();
-    agentSessionModuleLoader = defaultAgentSessionModuleLoader;
-  },
-  setAgentSessionModuleLoaderForTests(loader: AgentSessionModuleLoader): void {
-    agentSessionModuleCache.clear();
-    agentSessionModuleLoader = loader;
   },
   setGatewayAbortRetryDelaysMsForTests(delays?: readonly number[]): void {
     gatewayAbortRetryDelaysMsForTests = delays;

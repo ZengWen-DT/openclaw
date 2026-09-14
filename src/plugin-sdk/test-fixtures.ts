@@ -26,6 +26,7 @@ export { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text
 export { countLines, hasBalancedFences } from "../test-utils/chunk-test-helpers.js";
 export { expectGeneratedTokenPersistedToGatewayAuth } from "../test-utils/auth-token-assertions.js";
 export { typedCases } from "../test-utils/typed-cases.js";
+export { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 export { createRequireRecord } from "../../test/helpers/record.js";
 export type { RecordRequirementKind, RecordRequirementMessage } from "../../test/helpers/record.js";
 export {
@@ -69,3 +70,13 @@ export {
   createNoisyRgbaBuffer,
   createSolidPngBuffer,
 } from "./test-helpers/image-fixtures.js";
+export {
+  createMeetingBrowserFixture,
+  createMeetingNodeBrowserFixture,
+} from "./test-helpers/meeting-browser.js";
+export {
+  createMeetingPluginFixture,
+  defineMeetingPluginSurfaceTests,
+} from "./test-helpers/meeting-plugin-contract.js";
+export { defineMeetingChromeCleanupTests } from "./test-helpers/meeting-chrome-contract.js";
+export { defineMeetingSessionFlowTests } from "./test-helpers/meeting-session-contract.js";

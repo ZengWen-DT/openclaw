@@ -342,6 +342,7 @@ type PreparedMessageRoute = {
   accountId?: string | null;
   dryRun: boolean;
   defersExternalTargetResolution: boolean;
+  assertReadAuthorityCurrent?: () => void;
 };
 
 export async function prepareMessageRoute(params: {
@@ -382,7 +383,7 @@ export async function prepareMessageRoute(params: {
     action,
     args: actionParams,
     toolContext: input.toolContext,
-    targetAliasSpec: channelPlugin?.actions?.messageActionTargetAliases?.[action],
+    targetAliasSpec: channelPlugin?.actions?.messageActionTargetAliases?.[action] ?? null,
     // Trusted direct operators retain opaque resource-id workflows. Native conversation
     // aliases still normalize above and remain subject to the shared cross-context policy.
     allowResourceOnly: input.conversationReadOrigin === "direct-operator",
@@ -435,9 +436,10 @@ export async function prepareMessageRoute(params: {
         input.conversationReadOrigin,
       ),
     });
+  let assertReadAuthorityCurrent: (() => void) | undefined;
   if (!delegatesActionToGateway || dryRun) {
     const authorization = input.messageActionAuthorization;
-    actionParams = prepareExternalMessageActionTargetForResolution({
+    const preparedRead = prepareExternalMessageActionTargetForResolution({
       channel,
       action,
       cfg,
@@ -451,7 +453,10 @@ export async function prepareMessageRoute(params: {
         input.conversationReadOrigin,
       ),
       toolContext: authorization !== undefined ? authorization.toolContext : input.toolContext,
+      assertDirectAdapterHandoff: input.assertDirectAdapterHandoff,
     });
+    actionParams = preparedRead.params;
+    assertReadAuthorityCurrent = preparedRead.assertReadAuthorityCurrent;
   }
 
   return {
@@ -461,6 +466,7 @@ export async function prepareMessageRoute(params: {
     accountId,
     dryRun,
     defersExternalTargetResolution,
+    assertReadAuthorityCurrent,
   };
 }
 

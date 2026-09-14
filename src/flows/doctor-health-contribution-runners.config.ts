@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import nodePath from "node:path";
-import { UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE_ENV } from "../commands/doctor/shared/update-phase.js";
+import { shouldSkipLegacyUpdateDoctorConfigWrite } from "../commands/doctor/shared/update-phase.js";
 import { resolveIsConfigReadOnly, resolveIsNixMode } from "../config/paths.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { recordUpdateModelRetirement } from "../infra/update-deferred-model-retirement.js";
 import {
   getUpdateDoctorConfigWriteAuthority,
   recordUpdateDoctorConfigMigration,
@@ -16,23 +17,6 @@ import {
   resolveLegacyParentVersionOverride,
 } from "./doctor-health-contribution-utils.js";
 import type { HealthCheckContext, HealthFinding } from "./health-checks.js";
-
-function isExplicitOptOutEnvValue(value: string | undefined): boolean {
-  if (!value) {
-    return false;
-  }
-  // Update handoff predates canonical opt-in flags: every non-false value means the
-  // parent opted in, so preserve its broad acceptance until that protocol is retired.
-  const normalized = value.trim().toLowerCase();
-  return normalized !== "" && normalized !== "0" && normalized !== "false" && normalized !== "no";
-}
-
-function shouldSkipLegacyUpdateDoctorConfigWrite(env: NodeJS.ProcessEnv): boolean {
-  return (
-    isExplicitOptOutEnvValue(env.OPENCLAW_UPDATE_IN_PROGRESS) &&
-    !isExplicitOptOutEnvValue(env[UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE_ENV])
-  );
-}
 
 /** Removes queued retired profiles after any config references have been durably repaired. */
 export async function runRetiredAuthProfileCleanup(ctx: DoctorHealthFlowContext): Promise<void> {
@@ -113,9 +97,7 @@ export async function runWriteConfigHealth(
       const includeWrite = includeBoundary ? includeSnapshot : undefined;
       const writeSource =
         confirmedConfigSource ??
-        (includeWrite
-          ? { path: includeWrite.path, hash: hashConfigRaw(includeWrite.raw) }
-          : undefined);
+        (includeWrite ? { path: includeWrite.path, hash: includeWrite.hash } : undefined);
       const writeConfig = () =>
         transformConfigFile({
           ...(writeSource ? { baseHash: writeSource.hash } : {}),
@@ -304,6 +286,21 @@ export async function runWriteConfigHealth(
       );
     }
   }
+  if (ctx.configResult.modelRetirementRepairRan === true) {
+    recordUpdateModelRetirement("completed", ctx.env ?? process.env);
+    delete ctx.configResult.modelRetirementRepairRan;
+  }
+  const billingWarnings = ctx.configResult.modelBillingRouteWarnings;
+  if (billingWarnings?.length) {
+    const { note } = await import("../../packages/terminal-core/src/note.js");
+    const log = createSubsystemLogger("doctor");
+    note(billingWarnings.join("\n"), "Billing route changes");
+    for (const warning of billingWarnings) {
+      log.warn(warning);
+    }
+    recordDoctorHealthWarnings(ctx, [], billingWarnings);
+    delete ctx.configResult.modelBillingRouteWarnings;
+  }
   if (options.runPostWriteRepairs === false) {
     return;
   }
@@ -358,7 +355,11 @@ export async function runWriteConfigHealth(
 
 /** Commits the finalized config-flow candidate before fallible health diagnostics start. */
 export async function runInitialConfigWriteHealth(ctx: DoctorHealthFlowContext): Promise<void> {
-  if (ctx.configResult.shouldWriteConfig !== true) {
+  if (
+    ctx.configResult.shouldWriteConfig !== true &&
+    !ctx.configResult.modelBillingRouteWarnings?.length &&
+    ctx.configResult.modelRetirementRepairRan !== true
+  ) {
     return;
   }
   await runWriteConfigHealth(ctx, { runPostWriteRepairs: false });

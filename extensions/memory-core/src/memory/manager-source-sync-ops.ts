@@ -29,18 +29,33 @@ import type {
   MemorySyncProgressState,
 } from "./manager-sync-base.js";
 
-const SOURCE_SYNC_YIELD_EVERY = 10;
+const SOURCE_SYNC_YIELD_INTERVAL_MS = 12;
 const SOURCE_WIDE_SESSION_INDEX_FLUSH_FILES = 128;
 const log = createSubsystemLogger("memory");
 
 function createSourceSyncYield(total: number): () => Promise<void> {
   let completed = 0;
+  let workStartedAt = performance.now();
+  let pendingYield: Promise<void> | undefined;
   return async () => {
     completed += 1;
-    if (completed < total && completed % SOURCE_SYNC_YIELD_EVERY === 0) {
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
+    if (
+      !pendingYield &&
+      completed < total &&
+      performance.now() - workStartedAt >= SOURCE_SYNC_YIELD_INTERVAL_MS
+    ) {
+      // Every worker joins the same pause so another worker cannot keep
+      // admitting synchronous work while the event loop is waiting to run.
+      pendingYield = new Promise<void>((resolve) => {
+        setImmediate(() => {
+          workStartedAt = performance.now();
+          pendingYield = undefined;
+          resolve();
+        });
       });
+    }
+    if (pendingYield) {
+      await pendingYield;
     }
   };
 }
@@ -51,9 +66,14 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
     source: MemorySource,
     expectedHash = resolveMemorySourceExistingHash({ db: this.db, path: pathname, source }),
   ): Promise<void> {
-    await runSqliteImmediateTransaction(this.db, async () => () => {
-      this.database.sourceIndex.deleteIfCurrent({ path: pathname, source, expectedHash });
-    });
+    await runSqliteImmediateTransaction(
+      this.db,
+      async () => () => {
+        this.database.sourceIndex.deleteIfCurrent({ path: pathname, source, expectedHash });
+      },
+      undefined,
+      (write) => this.withDatabaseWrite(write),
+    );
   }
 
   private async deleteStaleSourceFiles(
@@ -284,6 +304,8 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
                 entry.path,
                 entry.hash,
               ).changes === 1,
+            undefined,
+            (write) => this.withDatabaseWrite(write),
           ))
         ) {
           throw new MemoryIndexRevisionConflictError(
@@ -293,7 +315,8 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
         this.advanceSyncProgress(params.progress);
         return null;
       }
-      return { ...entry, sessionId: corpusEntryForPath(absPath).sessionId };
+      // Keep the prepared entry's non-enumerable reset boundary.
+      return Object.assign(entry, { sessionId: corpusEntryForPath(absPath).sessionId });
     };
 
     if (params.deferIndex) {

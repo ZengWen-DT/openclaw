@@ -93,6 +93,7 @@ export type ChatComposerProps = ChatAttachmentControlsProps & {
   progressCard?: ProgressCard | null;
   runActive?: boolean;
   collapseTaskProgress?: boolean;
+  readingHistory?: boolean;
   runId?: string | null;
   onDismissProgressCard?: (card: ProgressCard) => void;
   gatewayQuestionPrompts?: readonly QuestionPrompt[];
@@ -162,7 +163,8 @@ export type ChatComposerProps = ChatAttachmentControlsProps & {
   onQueueRemove: (id: string) => void;
   onQueueRetry?: (id: string) => void;
   onQueueSteer?: (id: string) => void;
-  onQueueMove?: (id: string, toIndex: number) => void;
+  onQueueMove?: (id: string, targetId: string) => void;
+  displayQueue?: ChatQueueItem[];
   queuedEdit?: ChatQueuedEditProps;
   onClearReply?: () => void;
   onGoalAction?: (goalId: string, action: ChatGoalAction) => void;

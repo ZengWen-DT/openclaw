@@ -1,6 +1,10 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { WebSocket, WebSocketServer, type RawData } from "ws";
+import type { RawData } from "ws";
+import {
+  WebSocket as NpmWebSocket,
+  WebSocketServer as NpmWebSocketServer,
+} from "../../../packages/gateway-client/src/websocket.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { createOneTimeTicketStore } from "../../shared/one-time-ticket-store.js";
 import { rejectWebSocketUpgrade } from "../../shared/websocket-upgrade-reject.js";
@@ -16,6 +20,8 @@ import {
 } from "./rfb-preauth.js";
 import { createRfbClientMessageFilter } from "./rfb-view-only-filter.js";
 import type { DesktopSessionRegistry } from "./session-registry.js";
+
+type WebSocket = import("ws").WebSocket;
 
 export const DESKTOP_OBSERVE_PATH = "/desktop/observe";
 const TOKEN_TTL_MS = 60_000;
@@ -44,7 +50,10 @@ type DesktopObserverTokenEntry = {
 };
 
 const observerTokens = createOneTimeTicketStore<DesktopObserverTokenEntry>({ ttlMs: TOKEN_TTL_MS });
-const desktopObserverWss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES });
+const desktopObserverWss = new NpmWebSocketServer({
+  noServer: true,
+  maxPayload: MAX_PAYLOAD_BYTES,
+});
 
 export function mintDesktopObserverToken(params: {
   sourceKey: string;
@@ -211,7 +220,7 @@ export function handleDesktopObserveUpgrade(
       // A blocked desktop cannot drain, but the browser must still acknowledge close.
       ws.resume();
       desktopSocket.destroy();
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      if (ws.readyState === NpmWebSocket.OPEN || ws.readyState === NpmWebSocket.CONNECTING) {
         ws.close(code, reason);
       }
     };
@@ -245,7 +254,7 @@ export function handleDesktopObserveUpgrade(
         forwardClientChunk(rawDataBuffer(data));
       });
       desktopSocket.on("data", (chunk) => {
-        if (closeCause || ws.readyState !== WebSocket.OPEN) {
+        if (closeCause || ws.readyState !== NpmWebSocket.OPEN) {
           return;
         }
         if (entry.requester?.isCurrent() === false) {

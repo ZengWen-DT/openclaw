@@ -40,10 +40,7 @@ import {
   readHotSessionTranscriptSnapshot,
   readRestoredSessionTranscript,
 } from "./session-cold-storage-read.js";
-import {
-  assertSessionTranscriptHot,
-  readSessionColdTranscript,
-} from "./session-cold-storage-state.js";
+import { assertSessionTranscriptHot } from "./session-cold-storage-state.js";
 import { projectResetBoundaryNavigationSql } from "./session-model-context-projection.js";
 import { resolveSqliteSessionTranscriptReadFence } from "./session-transcript-read-fence.js";
 
@@ -72,7 +69,7 @@ export function createTranscriptIdentityReader(database: OpenClawAgentDatabase, 
       ),
   );
   return (eventId: string) =>
-    readHotSessionTranscriptSnapshot(database, sessionId, () => {
+    readHotSessionTranscriptSnapshot(database, sessionId, "identity", () => {
       const row = read(eventId).rows[0];
       return row ? { eventId: row.event_id, parentId: row.parent_id, seq: row.seq } : undefined;
     });
@@ -96,6 +93,41 @@ export async function loadTranscriptEvents(
 /** Loads raw transcript events synchronously from the additive SQLite transcript store. */
 export function loadTranscriptEventsSync(scope: SessionTranscriptReadScope): TranscriptEvent[] {
   return loadTranscriptReadSnapshotSync(scope).events;
+}
+
+/** Snapshot export payloads and their identity without opening the writable lifecycle. */
+export function readTranscriptExportSnapshotReadOnlySync(scope: SessionTranscriptReadScope) {
+  const resolved = resolveSqliteTranscriptReadScope(scope);
+  const result = withOpenClawAgentDatabaseReadOnly(
+    (database) =>
+      runSqliteDeferredTransactionSync(
+        database.db,
+        () => {
+          const fence = resolveSqliteSessionTranscriptReadFence({ database, ...resolved });
+          const sessionKey =
+            resolved.sessionKey ??
+            executeSqliteQueryTakeFirstSync(
+              database.db,
+              getSessionKysely(database.db)
+                .selectFrom("session_windows")
+                .select("session_key")
+                .where("session_id", "=", resolved.sessionId)
+                .limit(1),
+            )?.session_key;
+          return {
+            events: loadTranscriptEventsFromDatabase(database, resolved.sessionId, {
+              beforeEventSeq: fence?.beforeRawSeq,
+            }),
+            stats: readTranscriptStatsFromDatabase(database, resolved.sessionId),
+            sessionKey,
+          };
+        },
+        { operationLabel: "session transcript export snapshot" },
+      ),
+    toDatabaseOptions(resolved),
+    { throwOnMissingTable: true },
+  );
+  return result.found ? result.value : undefined;
 }
 
 /** Pair loaded bytes with the watermark that also fences opaque navigation edits. */
@@ -187,7 +219,7 @@ export function validatePreparedAssistantAppendSync(
 export function loadTranscriptHeaderSync(scope: SessionTranscriptReadScope): unknown {
   const resolved = resolveSqliteTranscriptReadScope(scope);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
-  return readHotSessionTranscriptSnapshot(database, resolved.sessionId, () => {
+  return readHotSessionTranscriptSnapshot(database, resolved.sessionId, "header", () => {
     const db = getSessionKysely(database.db);
     const row = executeSqliteQueryTakeFirstSync(
       database.db,
@@ -213,7 +245,7 @@ export function loadTranscriptTailEventsSync(
   }
   const resolved = resolveSqliteTranscriptReadScope(scope);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
-  return readHotSessionTranscriptSnapshot(database, resolved.sessionId, () => {
+  return readHotSessionTranscriptSnapshot(database, resolved.sessionId, "tail", () => {
     const db = getSessionKysely(database.db);
     return executeSqliteQuerySync(
       database.db,
@@ -237,7 +269,7 @@ export function loadTranscriptEventRowsAfterSeqSync(
 ): SessionTranscriptEventRow[] {
   const resolved = resolveSqliteTranscriptReadScope(scope);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
-  return readHotSessionTranscriptSnapshot(database, resolved.sessionId, () => {
+  return readHotSessionTranscriptSnapshot(database, resolved.sessionId, "incremental", () => {
     const db = getSessionKysely(database.db);
     let query = db
       .selectFrom("transcript_events")
@@ -261,7 +293,7 @@ export function readTranscriptEventAtSeqSync(
 ): SessionTranscriptEventRow | undefined {
   const resolved = resolveSqliteTranscriptReadScope(scope);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
-  return readHotSessionTranscriptSnapshot(database, resolved.sessionId, () => {
+  return readHotSessionTranscriptSnapshot(database, resolved.sessionId, "checkpoint", () => {
     const db = getSessionKysely(database.db);
     const row = executeSqliteQueryTakeFirstSync(
       database.db,
@@ -285,7 +317,7 @@ export function loadTranscriptEventsFromDatabase(
   sessionId: string,
   options: { beforeEventSeq?: number; projection?: "reset-boundary" } = {},
 ): TranscriptEvent[] {
-  return readHotSessionTranscriptSnapshot(database, sessionId, () => {
+  return readHotSessionTranscriptSnapshot(database, sessionId, "events", () => {
     const { beforeEventSeq } = options;
     const db = getSessionKysely(database.db);
     const rows = iterateSqliteQuerySync(
@@ -323,7 +355,7 @@ export function readTranscriptEventRows(
   sessionId: string,
   options: { afterSeq?: number } = {},
 ): SqliteTranscriptSnapshotRow[] {
-  return readHotSessionTranscriptSnapshot(database, sessionId, () => {
+  return readHotSessionTranscriptSnapshot(database, sessionId, "raw rows", () => {
     const db = getSessionKysely(database.db);
     const rows = executeSqliteQuerySync(
       database.db,
@@ -346,7 +378,7 @@ export function readTranscriptStorageRows(
   database: OpenClawAgentDatabase,
   sessionId: string,
 ): SqliteTranscriptStorageRow[] {
-  return readHotSessionTranscriptSnapshot(database, sessionId, () => {
+  return readHotSessionTranscriptSnapshot(database, sessionId, "storage rows", () => {
     const db = getSessionKysely(database.db);
     const rows = executeSqliteQuerySync(
       database.db,
@@ -370,6 +402,69 @@ function sqliteTranscriptJsonlByteSize() {
     + CASE WHEN COUNT(*) > 0 THEN COUNT(*) - 1 ELSE 0 END`.as("size_bytes");
 }
 
+function createTranscriptStatsQuery(database: Pick<OpenClawAgentDatabase, "db">) {
+  const db = getSessionKysely(database.db);
+  return prepareSqliteQuerySync<
+    string,
+    {
+      event_count: number;
+      max_seq: number | null;
+      size_bytes: number;
+      cold_event_count: number | null;
+      cold_last_seq: number | null;
+      cold_raw_bytes: number | null;
+      transcript_observed_at: number | null;
+      transcript_updated_at: number | null;
+    }
+  >(database.db, (parameter) =>
+    db
+      .selectFrom(
+        db
+          .selectFrom("transcript_events")
+          .select((eb) => [
+            eb.fn.count<number>("seq").as("event_count"),
+            eb.fn.max<number>("seq").as("max_seq"),
+            sqliteTranscriptJsonlByteSize(),
+          ])
+          .where(
+            "session_id",
+            "=",
+            parameter((sessionId) => sessionId),
+          )
+          .as("events"),
+      )
+      .leftJoin("session_transcript_cold_archives as cold", (join) =>
+        join.on(
+          "cold.session_id",
+          "=",
+          parameter((sessionId) => sessionId),
+        ),
+      )
+      .leftJoin("session_windows as session", (join) =>
+        join.on(
+          "session.session_id",
+          "=",
+          parameter((sessionId) => sessionId),
+        ),
+      )
+      .select([
+        "events.event_count",
+        "events.max_seq",
+        "events.size_bytes",
+        "cold.event_count as cold_event_count",
+        "cold.last_seq as cold_last_seq",
+        "cold.raw_bytes as cold_raw_bytes",
+        "session.transcript_observed_at",
+        "session.transcript_updated_at",
+      ]),
+  );
+}
+
+const transcriptStatsQueries = new WeakMap<
+  OpenClawAgentDatabase["db"],
+  ReturnType<typeof createTranscriptStatsQuery>
+>();
+
 /** Reads transcript freshness and byte size without materializing event rows. */
 function readTranscriptStatsFromDatabase(
   database: Pick<OpenClawAgentDatabase, "db">,
@@ -378,37 +473,22 @@ function readTranscriptStatsFromDatabase(
   return runSqliteDeferredTransactionSync(
     database.db,
     () => {
-      const cold = readSessionColdTranscript(database.db, sessionId);
-      const db = getSessionKysely(database.db);
-      const row = executeSqliteQueryTakeFirstSync(
-        database.db,
-        db
-          .selectFrom("transcript_events")
-          .select((eb) => [
-            eb.fn.count<number>("seq").as("event_count"),
-            eb.fn.max<number>("seq").as("max_seq"),
-            sqliteTranscriptJsonlByteSize(),
-          ])
-          .where("session_id", "=", sessionId),
-      );
-      const session = executeSqliteQueryTakeFirstSync(
-        database.db,
-        db
-          .selectFrom("session_windows")
-          .select(["transcript_observed_at", "transcript_updated_at"])
-          .where("session_id", "=", sessionId),
-      );
+      let query = transcriptStatsQueries.get(database.db);
+      if (!query) {
+        query = createTranscriptStatsQuery(database);
+        transcriptStatsQueries.set(database.db, query);
+      }
+      const row = query(sessionId).rows[0];
       return {
-        eventCount: cold?.event_count ?? row?.event_count ?? 0,
-        ...(session?.transcript_updated_at !== null && session?.transcript_updated_at !== undefined
-          ? { lastMutationAtMs: session.transcript_updated_at }
+        eventCount: row?.cold_event_count ?? row?.event_count ?? 0,
+        ...(row?.transcript_updated_at !== null && row?.transcript_updated_at !== undefined
+          ? { lastMutationAtMs: row.transcript_updated_at }
           : {}),
-        ...(session?.transcript_observed_at !== null &&
-        session?.transcript_observed_at !== undefined
-          ? { lastObservedMutationAtMs: session.transcript_observed_at }
+        ...(row?.transcript_observed_at !== null && row?.transcript_observed_at !== undefined
+          ? { lastObservedMutationAtMs: row.transcript_observed_at }
           : {}),
-        maxSeq: cold?.last_seq ?? row?.max_seq ?? 0,
-        sizeBytes: cold?.raw_bytes ?? row?.size_bytes ?? 0,
+        maxSeq: row?.cold_last_seq ?? row?.max_seq ?? 0,
+        sizeBytes: row?.cold_raw_bytes ?? row?.size_bytes ?? 0,
       };
     },
     { operationLabel: "session transcript stats" },
@@ -628,7 +708,7 @@ export function findTranscriptEventInDatabase(
   sessionId: string,
   match: (event: TranscriptEvent) => boolean,
 ): { event: TranscriptEvent } | undefined {
-  return readHotSessionTranscriptSnapshot(database, sessionId, () => {
+  return readHotSessionTranscriptSnapshot(database, sessionId, "match", () => {
     const db = getSessionKysely(database.db);
     const rows = iterateSqliteQuerySync(
       database.db,

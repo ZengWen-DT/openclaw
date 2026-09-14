@@ -108,7 +108,7 @@ export async function reloadGatewayPlugins(
   };
   const recordCleanup = (result: PluginHostCleanupResult) => {
     for (const pluginId of result.deferredPluginIds ?? []) {
-      const warning = `Plugin ${pluginId} cleanup is deferred until its admitted turn finishes.`;
+      const warning = `Plugin ${pluginId} cleanup is deferred until its admitted work finishes.`;
       log.info(warning);
       recordWarning(warning);
     }
@@ -134,7 +134,7 @@ export async function reloadGatewayPlugins(
       errors.push(error);
     }
   };
-  const replacePluginIds = new Set(requestedIds);
+  const replacePluginIds = new Set([...requestedIds, ...(params.reloadPluginIds ?? [])]);
   for (const record of previousRegistry.plugins) {
     if (
       params.changedPaths.some(
@@ -161,32 +161,18 @@ export async function reloadGatewayPlugins(
   let releaseChannelStarts: ReturnType<typeof channelManager.pauseChannelStarts> | undefined;
   const channelTargets = new Set<ChannelId>();
   const quiescedInstances: PluginInstanceHandle[] = [];
+  let rollbackConfigEffects: (() => Promise<void>) | undefined;
   const skipChannels =
     isTruthyEnvValue(params.env?.OPENCLAW_SKIP_CHANNELS) ||
     isTruthyEnvValue(params.env?.OPENCLAW_SKIP_PROVIDERS);
-  const stopReplacedChannels = async () => {
-    for (const { plugin } of previousRegistry.channels) {
-      if (!channelTargets.has(plugin.id)) {
-        continue;
-      }
-      await cleanup(`Plugin channel ${plugin.id} cleanup failed`, () =>
-        channelManager.stopChannel(plugin.id, undefined, {
-          manual: false,
-          strict: true,
-          routeHandoff: true,
-        }),
-      );
-    }
-  };
-  const stopReplacedServices = async (services: PluginServicesHandle | null | undefined) => {
-    await cleanup("Plugin service cleanup failed", async () => {
+  const stopReplacedServices = (services: PluginServicesHandle | null | undefined) =>
+    cleanup("Plugin service cleanup failed", async () => {
       await services?.stop({
         strict: true,
         deadlineAtMs: Date.now() + PLUGIN_SERVICE_REPLACEMENT_STOP_TIMEOUT_MS,
         pluginIds: changedPluginIds,
       });
     });
-  };
   const startReplacedChannels = async (registry: typeof previousRegistry, errors: unknown[]) => {
     for (const { plugin } of registry.channels) {
       if (skipChannels || !channelTargets.has(plugin.id)) {
@@ -197,6 +183,7 @@ export async function reloadGatewayPlugins(
         const result = await channelManager.startChannel(plugin.id, undefined, {
           manual: false,
           preserveManualStop: true,
+          skipUnavailableAccounts: true,
         });
         // Early rollback can retain a live account behind the public task-owned outcome.
         const failures = [...result].filter(
@@ -244,7 +231,7 @@ export async function reloadGatewayPlugins(
       config,
       workspaceDir: pluginWorkspaceDir,
       // SAFETY: Gateway cron implements the SDK hook surface, which erases core-only job fields.
-      getCron: () => runtimeState.cronState.cron as PluginHookGatewayCronService,
+      getCron: kernel.getCronService as () => PluginHookGatewayCronService,
     };
     await withPluginHttpRouteRegistry(registry, () =>
       start
@@ -357,10 +344,13 @@ export async function reloadGatewayPlugins(
     }
     await params.checkpoint?.();
     assertCurrent();
-    params.prepareConfigEffects({ pluginIds: changedPluginIds, channels: channelTargets });
-    releaseChannelStarts = channelManager.pauseChannelStarts(channelTargets);
+    rollbackConfigEffects = params.prepareConfigEffects({
+      pluginIds: changedPluginIds,
+      channels: channelTargets,
+    });
     phase = "drain";
-    for (const sidecar of runtimeState.gatewayLifetimeSidecars) {
+    releaseChannelStarts = channelManager.pauseChannelStarts(channelTargets);
+    for (const sidecar of runtimeState.gatewayLifetimeSidecars.snapshot()) {
       const prepared = sidecar.preparePluginReload?.({
         previousRegistry,
         nextRegistry,
@@ -408,7 +398,18 @@ export async function reloadGatewayPlugins(
     await cleanup("Plugin stop hook failed", () =>
       runLifecycleHooks(previousRegistry, false, previousConfig),
     );
-    await stopReplacedChannels();
+    for (const { plugin } of previousRegistry.channels) {
+      if (!channelTargets.has(plugin.id)) {
+        continue;
+      }
+      await cleanup(`Plugin channel ${plugin.id} cleanup failed`, () =>
+        channelManager.stopChannel(plugin.id, undefined, {
+          manual: false,
+          strict: true,
+          routeHandoff: true,
+        }),
+      );
+    }
     await stopReplacedServices(previousServices);
     for (const record of previousRegistry.plugins) {
       if (changedPluginIds.has(record.id)) {
@@ -429,7 +430,7 @@ export async function reloadGatewayPlugins(
         config: params.nextConfig,
         workspaceDir: pluginWorkspaceDir,
         broadcastPluginEvent,
-        getCronService: () => runtimeState.cronState.cron,
+        getCronService: kernel.getCronService,
         previous: previousServices,
         onHandle: (handle) => {
           candidateServices = handle;
@@ -580,13 +581,20 @@ export async function reloadGatewayPlugins(
       }
       loaded?.retireGatewayRuntimeBindings();
       if (candidateRegistry) {
-        await disposePluginRegistryInstances(candidateRegistry, previousRegistry).catch(
-          onCleanupFailure("Plugin candidate cleanup failed"),
+        void disposePluginRegistryInstances(candidateRegistry, previousRegistry).catch(() => {});
+        // Rejected candidates keep the same physical cleanup owner as replaced generations.
+        kernel.pluginMetadata.retire(cache, (options) =>
+          waitForPluginRegistryRetirement(candidateRegistry, options),
+        );
+        await kernel.pluginMetadata
+          .waitForRetirement()
+          .then(recordCleanup)
+          .catch(onCleanupFailure("Plugin candidate cleanup failed"));
+      } else {
+        await retirePluginCache(cache).catch(
+          onCleanupFailure("Plugin candidate cache cleanup failed"),
         );
       }
-      await retirePluginCache(cache).catch(
-        onCleanupFailure("Plugin candidate cache cleanup failed"),
-      );
       // A pending signal blocks recovery work until delivery settles; suspension
       // must let this admitted reload finish. Only one-way drain owns teardown.
       if (phase !== "prepare") {
@@ -605,7 +613,7 @@ export async function reloadGatewayPlugins(
               config: previousConfig,
               workspaceDir: pluginWorkspaceDir,
               broadcastPluginEvent,
-              getCronService: () => runtimeState.cronState.cron,
+              getCronService: kernel.getCronService,
               previous: kernel.pluginRuntimeGeneration.currentServices(),
               onHandle: (handle) => {
                 kernel.pluginRuntimeGeneration.publishServices(
@@ -640,6 +648,9 @@ export async function reloadGatewayPlugins(
           recoveryErrors.push(recoveryError);
         } finally {
           await releaseChannelHandoffs(recoveryErrors);
+        }
+        if (recoveryErrors.length === 0) {
+          await attempt(recoveryErrors, () => rollbackConfigEffects?.());
         }
         if (recoveryErrors.length > 0) {
           const recoveryError =

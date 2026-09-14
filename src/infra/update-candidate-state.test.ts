@@ -7,23 +7,23 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { runCommandBuffered } from "../process/exec.js";
 import { getFileLockProcessStartTime } from "../shared/pid-alive.js";
 import { withAgentDatabaseMaintenanceLease } from "../state/openclaw-agent-db.js";
+import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db-cache.js";
 import {
-  closeOpenClawStateDatabaseByPath,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import { hasNodeErrorCode } from "./path-guards.js";
-import { runtimeProcessEntrypoints } from "./runtime-process-entrypoints.js";
-import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
-import { projectUpdateCandidatePlugins } from "./update-candidate-plugins.js";
+import {
+  copyUpdateCandidatePlugins,
+  prepareUpdateCandidatePlugins,
+} from "./update-candidate-plugins.js";
 import { prepareUpdateCandidateRehearsal } from "./update-candidate-rehearsal.js";
 import {
   readUpdateStateSchemaVersions,
-  type snapshotUpdateCandidateState,
   updateStateSchemaVersionsMatch,
-  UpdateCandidateStateSnapshotSchema,
 } from "./update-candidate-state.js";
+import { runUpdateCandidateSnapshotWorker } from "./update-candidate-state.test-support.js";
 
 let root: string;
 beforeEach(async () => {
@@ -46,31 +46,13 @@ async function createDatabase(file: string, sql = ""): Promise<void> {
   }
 }
 
-async function runSnapshotWorker(
-  input: Omit<Parameters<typeof snapshotUpdateCandidateState>[0], "candidateRoot">,
+function runSnapshotWorker(
+  input: Omit<Parameters<typeof runUpdateCandidateSnapshotWorker>[0], "candidateRoot">,
 ) {
-  // Backup/VACUUM cannot be cancelled in-process; use the canary's worker before fixture cleanup.
-  const result = await runCommandBuffered(
-    [
-      process.execPath,
-      ...resolveRuntimeWorkerArgv(
-        resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.updateCandidateState),
-      ),
-    ],
-    {
-      input: JSON.stringify({
-        ...input,
-        candidateRoot: path.join(root, "candidate-host"),
-        mode: "snapshot",
-      }),
-      timeoutMs: 30_000,
-      killGraceMs: 500,
-      maxOutputBytes: { stdout: 1024 * 1024, stderr: 20_000 },
-    },
-  );
-  expect(result.code, result.stderr.toString("utf8")).toBe(0);
-  return UpdateCandidateStateSnapshotSchema.parse(JSON.parse(result.stdout.toString("utf8")))
-    .versions;
+  return runUpdateCandidateSnapshotWorker({
+    ...input,
+    candidateRoot: path.join(root, "candidate-host"),
+  });
 }
 
 it.each(["DELETE", "WAL"])(
@@ -243,67 +225,6 @@ it("keeps absent stores explicit and observes newly created databases for rollba
   expect(updateStateSchemaVersionsMatch(after, after.toReversed(), candidate)).toBe(true);
 });
 
-it("inspects with the installed candidate and selected Node after the old package is removed", async () => {
-  const stateDir = path.join(root, "state-owner");
-  await createDatabase(path.join(stateDir, "state", "openclaw.sqlite"));
-  const previousRoot = path.join(root, "previous-package");
-  const candidateRoot = path.join(root, "candidate-package");
-  const worker = `
-    import path from "node:path";
-    import { DatabaseSync } from "node:sqlite";
-    let input = "";
-    for await (const chunk of process.stdin) input += chunk;
-    const file = path.join(JSON.parse(input).stateDir, "state", "openclaw.sqlite");
-    const db = new DatabaseSync(file, { readOnly: true });
-    try {
-      console.log(JSON.stringify([{ path: file, userVersion: db.prepare("PRAGMA user_version").get().user_version }]));
-    } finally {
-      db.close();
-    }
-  `;
-  for (const packageRoot of [previousRoot, candidateRoot]) {
-    const file = path.join(packageRoot, "dist/infra/update-candidate-state.worker.js");
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(path.join(packageRoot, "package.json"), '{"type":"module"}');
-    await fs.writeFile(file, worker);
-  }
-  const entrypoint = runtimeProcessEntrypoints.updateCandidateState;
-  const originalModuleUrl = entrypoint.currentModuleUrl;
-  Object.assign(entrypoint, {
-    currentModuleUrl: pathToFileURL(path.join(previousRoot, "dist/old-updater.js")).href,
-  });
-  try {
-    const before = await readUpdateStateSchemaVersions({ stateDir, config: {} });
-    expect(before).toEqual([
-      { path: path.join(stateDir, "state", "openclaw.sqlite"), userVersion: 3 },
-    ]);
-    await fs.rm(previousRoot, { recursive: true });
-    const selectedNodeMarker = path.join(root, "selected-node-ran");
-    let nodeRunner = process.execPath;
-    if (process.platform !== "win32") {
-      nodeRunner = path.join(root, "selected-node");
-      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-      await fs.writeFile(
-        nodeRunner,
-        `#!/bin/sh\nprintf selected > ${quote(selectedNodeMarker)}\nexec ${quote(process.execPath)} "$@"\n`,
-        { mode: 0o755 },
-      );
-    }
-    const after = await readUpdateStateSchemaVersions({
-      stateDir,
-      config: {},
-      root: candidateRoot,
-      nodeRunner,
-    });
-    expect(after).toEqual(before);
-    if (process.platform !== "win32") {
-      expect(await fs.readFile(selectedNodeMarker, "utf8")).toBe("selected");
-    }
-  } finally {
-    Object.assign(entrypoint, { currentModuleUrl: originalModuleUrl });
-  }
-});
-
 it.runIf(process.platform !== "win32")(
   "preserves distinct registered databases reached through symlink parent traversal",
   async () => {
@@ -315,7 +236,10 @@ it.runIf(process.platform !== "win32")(
     await fs.symlink(symlinkTarget, path.join(source, "link"), "dir");
     const filesystemPath = path.join(source, "external", "x", "openclaw-agent.sqlite");
     const lexicalPath = path.join(source, "x", "openclaw-agent.sqlite");
-    await createDatabase(filesystemPath, "UPDATE evidence SET value = 'filesystem';");
+    await createDatabase(
+      filesystemPath,
+      "UPDATE evidence SET value = 'filesystem'; PRAGMA user_version = 4;",
+    );
     await createDatabase(lexicalPath, "UPDATE evidence SET value = 'lexical';");
     await createDatabase(
       shared,
@@ -327,6 +251,12 @@ it.runIf(process.platform !== "win32")(
     insert.run("lexical", lexicalPath);
     registry.close();
 
+    const versions = await readUpdateStateSchemaVersions({ stateDir: source, config: {} });
+    expect(versions).toContainEqual({
+      path: `${source}${path.sep}link${path.sep}..${path.sep}x${path.sep}openclaw-agent.sqlite`,
+      userVersion: 4,
+    });
+    expect(versions).toContainEqual({ path: lexicalPath, userVersion: 3 });
     await runSnapshotWorker({ stateDir: source, targetStateDir: target, config: {} });
 
     const copiedRegistry = openNodeSqliteDatabase(path.join(target, "state", "openclaw.sqlite"));
@@ -915,12 +845,14 @@ it("projects through an aliased temporary state directory without changing sourc
   await fs.writeFile(path.join(dependency, "package.json"), '{"name":"dependency"}');
   await fs.writeFile(path.join(dependency, "value.txt"), "source");
   await fs.symlink(dependency, path.join(plugin, "node_modules", "dependency"), "junction");
-  const paths = await projectUpdateCandidatePlugins({
+  const params = {
     config: { plugins: { load: { paths: [plugin] } } },
     stateDir: source,
     targetStateDir: path.join(alias, "candidate"),
     candidateRoot: root,
-  });
+  } satisfies Parameters<typeof prepareUpdateCandidatePlugins>[0];
+  const projection = await prepareUpdateCandidatePlugins(params);
+  const paths = await copyUpdateCandidatePlugins(projection, params);
   const copied = path.join(paths[plugin]!, "node_modules", "dependency", "value.txt");
   expect((await fs.realpath(copied)).startsWith(physical + path.sep)).toBe(true);
   await fs.writeFile(copied, "private");

@@ -196,6 +196,9 @@ describe("OpenAI realtime voice provider routing", () => {
     ).toMatchObject({
       handlesAgentConsult: true,
       supportsToolCalls: false,
+      supportsBargeIn: false,
+      handlesInputAudioBargeIn: true,
+      supportsActivationNameGating: false,
       voices,
       voiceSelectionPolicy: "allowlist-default",
     });
@@ -805,45 +808,70 @@ describe("OpenAI realtime voice provider routing", () => {
     expect(createBrowserSession).toHaveBeenCalledTimes(1);
   });
 
-  it("passes configured gpt-live model and voice to the native broker", async () => {
-    const { broker, createBrowserSession } = createQuicksilverBrowserBrokerFixture();
-    const provider = buildOpenAIRealtimeVoiceProvider({
-      quicksilverBrowserSessionBroker: broker,
-    });
+  it.each([
+    { model: "gpt-live-test-canary", voice: "spruce", publicApi: false },
+    { model: "gpt-live-1", voice: "marin", publicApi: true },
+    { model: "gpt-live-1-codex", voice: "cove", publicApi: false },
+  ])(
+    "passes $model voice and channel instructions to the native broker",
+    async ({ model, voice, publicApi }) => {
+      const { broker, createBrowserSession } = createQuicksilverBrowserBrokerFixture();
+      const provider = buildOpenAIRealtimeVoiceProvider({
+        quicksilverBrowserSessionBroker: broker,
+      });
 
-    await provider.createBrowserSession?.({
-      providerConfig: provider.resolveConfig?.({
-        cfg: {} as never,
-        rawConfig: {
-          apiKey: "test-api-key-platform",
-          model: "gpt-live-test-canary",
-          speakerVoice: "spruce",
-        },
-      }),
-      instructions: "Always address the caller as Captain.",
-      agentId: "voice-agent",
-      workspaceDir: "/tmp/openclaw-agent-workspace",
-      initialItems: [],
-      runAgentConsult: vi.fn(async () => ({ text: "Done" })),
-    } as never);
+      await provider.createBrowserSession?.({
+        providerConfig: provider.resolveConfig?.({
+          cfg: {} as never,
+          rawConfig: {
+            apiKey: "test-api-key-platform",
+            model,
+            speakerVoice: voice,
+          },
+        }),
+        instructions: "Always address the caller as Captain.",
+        agentId: "voice-agent",
+        workspaceDir: "/tmp/openclaw-agent-workspace",
+        initialItems: [],
+        runAgentConsult: vi.fn(async () => ({ text: "Done" })),
+      } as never);
 
-    expect(createBrowserSession).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "gpt-live-test-canary", voice: "spruce" }),
-      { type: "api-key", token: "test-api-key-platform" },
-    );
-    const quicksilverRequest = requireRecord(
-      createBrowserSession.mock.calls[0]?.[0],
-      "quicksilver request",
-    );
-    expect(quicksilverRequest.instructions).toMatch(/^You are OpenClaw's realtime voice layer\./);
-    expect(quicksilverRequest.instructions).toContain(
-      "Context on the commentary channel is silent background",
-    );
-    expect(quicksilverRequest.instructions).toContain(
-      "Context on the speakable channel is your answer",
-    );
-    expect(quicksilverRequest.instructions).toMatch(/Always address the caller as Captain\.$/);
-  });
+      expect(createBrowserSession).toHaveBeenCalledWith(expect.objectContaining({ model, voice }), {
+        type: "api-key",
+        token: "test-api-key-platform",
+      });
+      const quicksilverRequest = requireRecord(
+        createBrowserSession.mock.calls[0]?.[0],
+        "quicksilver request",
+      );
+      expect(quicksilverRequest.instructions).toMatch(/^You are OpenClaw's realtime voice layer\./);
+      expect(quicksilverRequest.instructions).toContain(
+        "Delegate each user request once and wait for its result.",
+      );
+      expect(quicksilverRequest.instructions).toContain(
+        "New user follow-ups, corrections, and explicit retries are new requests.",
+      );
+      if (publicApi) {
+        expect(quicksilverRequest.instructions).toContain(
+          "session.thinking.append is silent context",
+        );
+        expect(quicksilverRequest.instructions).toContain(
+          "session.commentary.append is an update to speak aloud",
+        );
+        expect(quicksilverRequest.instructions).not.toContain(
+          "commentary channel is silent background",
+        );
+      } else {
+        expect(quicksilverRequest.instructions).toContain(
+          "Context on the commentary channel is silent background",
+        );
+        expect(quicksilverRequest.instructions).toContain(
+          "Context on the speakable channel is your answer",
+        );
+      }
+      expect(quicksilverRequest.instructions).toMatch(/Always address the caller as Captain\.$/);
+    },
+  );
 
   it.each([
     { configuredModel: "gpt-live-test-canary", requestedModel: "gpt-realtime-2.1", voice: "marin" },

@@ -567,6 +567,45 @@ describe("doctor runtime tool schema checks", () => {
     });
   });
 
+  it.each([undefined, "provider:default"])(
+    "defers shared OAuth without suppressing non-OAuth probes (auth profile=%s)",
+    async (authProfileId) => {
+      const findings = await collectRuntimeToolSchemaFindings({
+        agents: {
+          entries: {
+            main: { default: true, workspace: "/tmp/main-workspace" },
+            worker: { workspace: "/tmp/worker-workspace" },
+          },
+        },
+        mcp: {
+          servers: {
+            authenticated: {
+              url: "https://oauth.example.test/mcp",
+              transport: "streamable-http",
+              auth: "oauth",
+              ...(authProfileId ? { oauth: { authProfileId } } : {}),
+            },
+            public: { url: "https://public.example.test/mcp", transport: "sse" },
+            local: { command: "fixture-mcp" },
+          },
+        },
+      });
+      expect(findings).toEqual([
+        expect.objectContaining({
+          severity: "info",
+          path: "mcp.servers.authenticated",
+          message: expect.stringContaining("OAuth may rotate external credentials"),
+          fixHint: expect.stringContaining("openclaw mcp probe"),
+        }),
+      ]);
+      expect(mocks.createBundleMcpToolRuntime).toHaveBeenCalledTimes(1);
+      expect(mocks.createBundleMcpToolRuntime).toHaveBeenCalledWith(
+        expect.objectContaining({ excludeServerNames: new Set(["authenticated"]) }),
+      );
+      expect(mocks.disposeBundleRuntime).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("does not report bundle MCP schemas filtered out by the final runtime tool policy", async () => {
     mocks.createBundleMcpToolRuntime.mockReturnValueOnce({
       tools: [
@@ -670,7 +709,7 @@ describe("doctor gateway runtime checks", () => {
     mocks.resolveGatewayService.mockReset().mockReturnValue({ label: "openclaw-gateway" });
   });
 
-  it("projects every degraded SecretRef owner from exactly one authenticated read-only status RPC", async () => {
+  it("projects SecretRef and SQLite warnings from one authenticated read-only status RPC", async () => {
     const cfg = { gateway: { mode: "local" as const } };
     const privateToken = "SYNTHETIC_PRIVATE_URL_TOKEN";
     mocks.buildGatewayProbeConnectionDetails.mockResolvedValueOnce({
@@ -708,6 +747,17 @@ describe("doctor gateway runtime checks", () => {
         },
       ],
       degradedPlugins: [{ pluginId: "not-this-check" }],
+      sqliteWal: {
+        state: "blocked",
+        observedAtMs: 1_800_000,
+        walBytes: 128 * 1024 * 1024,
+        databaseBytes: 32 * 1024 * 1024,
+        logFrames: 4000,
+        checkpointedFrames: 100,
+        lastCompletedAtMs: null,
+        consecutiveBlocked: 2,
+        warning: true,
+      },
     });
 
     const findings = await collectGatewayHealthFindings({
@@ -748,6 +798,12 @@ describe("doctor gateway runtime checks", () => {
         message: expect.stringContaining("provider:vault"),
         path: expect.stringContaining("providers.example.0"),
         target: expect.stringContaining("provider:vault"),
+      }),
+      expect.objectContaining({
+        checkId: "core/doctor/gateway-health",
+        severity: "warning",
+        message: expect.stringContaining("SQLite WAL: checkpoint blocked"),
+        fixHint: expect.stringContaining("openclaw status --deep"),
       }),
     ]);
     expect(findings[1]?.message).toContain("tts.providers.elevenlabs.voiceId");
@@ -976,7 +1032,7 @@ describe("doctor gateway runtime checks", () => {
   ])(
     "reports current Node $version probe outcome as $severity",
     async ({ version, text, severity, message }) => {
-      mocks.detectRuntime.mockReturnValue({
+      mocks.detectRuntime.mockResolvedValue({
         kind: "node",
         version,
         execPath: "/opt/runtime/bin/node",
@@ -1543,7 +1599,7 @@ describe("doctor provider catalog projection checks", () => {
         path: "plugins.entries.mockplugin",
         target: "mockplugin",
         message: "Provider catalog mockplugin failed during doctor validation.",
-        requirement: "Cannot perform 'get' on a proxy that has been revoked",
+        requirement: expect.stringMatching(/proxy.*revoked/iu),
       }),
     );
   });

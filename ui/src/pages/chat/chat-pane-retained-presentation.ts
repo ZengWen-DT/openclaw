@@ -1,5 +1,5 @@
-import "../../components/modal-dialog.ts";
 import { html, nothing } from "lit";
+import "../../components/modal-dialog.ts";
 import { t } from "../../i18n/index.ts";
 import { boardProviderCacheKey } from "../../lib/board/provider.ts";
 import { formatUiError } from "../../lib/format-error.ts";
@@ -21,9 +21,11 @@ import { retryReconnectableQueuedChatSends } from "./chat-send-actions.ts";
 import { setChatError } from "./chat-send-queue-state.ts";
 import { refreshCurrentChatSessionList } from "./chat-session.ts";
 import { invalidateImageLightbox } from "./chat-state-page.ts";
+import { refreshChatMetadata } from "./chat-state-refresh.ts";
 import { selectedChatSessionRow } from "./chat-state-route.ts";
 import { getChatComposerState } from "./components/chat-composer-state.ts";
 import { dismissConfirmedActionPopovers } from "./components/chat-message.ts";
+import { clearSessionWorkspacePreviews } from "./components/chat-session-workspace-state.ts";
 import { resetTaskDetail } from "./components/chat-task-detail-state.ts";
 import { resetTranscriptSession } from "./components/chat-thread-interactions.ts";
 import { CHAT_COMPOSER_DRAFT_STORAGE_ERROR } from "./composer-persistence.ts";
@@ -158,6 +160,9 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
   }
 
   protected override presentedChanged(presented: boolean): void {
+    if (!presented) {
+      this.dashboardPresentationActivation = undefined;
+    }
     if (!this.isConnected) {
       return;
     }
@@ -169,6 +174,7 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
       const state = this.state;
       if (state) {
         this.unreadPatchGuard.beginActivation(state.sessionKey);
+        void refreshChatMetadata(state, { automatic: true });
       }
       const deferredHydrationActive = this.resumeDeferredSessionHydration();
       if (state && !deferredHydrationActive) {
@@ -220,7 +226,7 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
       // so the transcript loader's timer/fetch loop must be stopped here.
       resetTaskDetail(state);
       state.sidebarContent = null;
-      state.attachmentSidebarContent = null;
+      clearSessionWorkspacePreviews(state);
       state.requestUpdate?.();
     }
     this.querySelector(".chat-transcript-announcement")?.setAttribute("aria-live", "off");

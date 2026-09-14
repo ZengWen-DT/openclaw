@@ -41,6 +41,8 @@ import {
   tryResolveSessionCompatibilityOwnerAgentId,
 } from "../session-request-agent.js";
 import {
+  authorizeIncognitoSessionTarget,
+  authorizeSessionSharingTarget,
   canAccessIncognitoSession,
   createSessionListEntryFilter,
   isGatewayAdmin,
@@ -49,7 +51,7 @@ import {
   resolveSessionVisibility,
 } from "../session-sharing.js";
 import { resolveSessionStoreAgentId } from "../session-store-key.js";
-import { readSessionPreviewItemsFromTranscript } from "../session-transcript-readers.js";
+import { readSessionPreviewItemsFromTranscript } from "../session-transcript-preview.js";
 import type { SessionListActiveRunProjector } from "../session-utils-contracts.js";
 import { projectGatewaySessionActiveRun } from "../session-utils-display.js";
 import {
@@ -142,14 +144,20 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
         const targetSessionKeys =
           scopedSessionKeys ??
           (restrictVisibility
-            ? listSessionEntriesReadOnly({ agentId: target.agentId, storePath: target.storePath })
+            ? listSessionEntriesReadOnly({
+                agentId: target.agentId,
+                storePath: target.storePath,
+                projection: "list",
+                clone: false,
+              })
                 .map((entry) => entry.sessionKey)
                 .filter((sessionKey) => {
-                  if (!canSearchSessionKey(sessionKey)) {
+                  // A shared physical store can include rows owned by another agent.
+                  const parsed = parseAgentSessionKey(sessionKey);
+                  if (parsed && normalizeAgentId(parsed.agentId) !== agentId) {
                     return false;
                   }
-                  const parsed = parseAgentSessionKey(sessionKey);
-                  return !parsed || normalizeAgentId(parsed.agentId) === agentId;
+                  return canSearchSessionKey(sessionKey);
                 })
             : undefined);
         if (targetSessionKeys?.length === 0) {
@@ -454,6 +462,27 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
             () =>
               result.sessions.forEach((session, index) => {
                 const sharingTarget = sharingTargets[index];
+                const isMember = sharingTarget
+                  ? membershipKeys.has(
+                      `${sharingTarget.storeTarget.agentId}\0${sharingTarget.storePath}\0${sharingTarget.storeKey}`,
+                    )
+                  : false;
+                if (session.activitySummary) {
+                  session.activitySummary.canEnsure = Boolean(
+                    sharingTarget &&
+                    !authorizeIncognitoSessionTarget({
+                      client,
+                      sessionKey: session.key,
+                      target: sharingTarget,
+                    }) &&
+                    !authorizeSessionSharingTarget({
+                      cfg,
+                      client,
+                      target: sharingTarget,
+                      isMember,
+                    }),
+                  );
+                }
                 const visibility = sharingTarget
                   ? resolveSessionVisibility(sharingTarget.entry)
                   : "shared";
@@ -469,12 +498,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
                   visibility,
                   ...(sharingTarget
                     ? {
-                        sharingRole: sharing.roleForTarget(
-                          sharingTarget,
-                          membershipKeys.has(
-                            `${sharingTarget.storeTarget.agentId}\0${sharingTarget.storePath}\0${sharingTarget.storeKey}`,
-                          ),
-                        ),
+                        sharingRole: sharing.roleForTarget(sharingTarget, isMember),
                       }
                     : {}),
                   ...projectGatewaySessionActiveRun(activeRunState, session.status),
@@ -623,6 +647,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
           agentId: requestedAgent.agentId,
           exactRead: true,
           readOnly: true,
+          projection: "list",
         });
         const entry = resolveCanonicalSessionEntryFromStoreKeys(target.store, target.storeKeys);
         if (!entry?.sessionId || roleVisibilityFilter?.(target.canonicalKey, entry) === false) {

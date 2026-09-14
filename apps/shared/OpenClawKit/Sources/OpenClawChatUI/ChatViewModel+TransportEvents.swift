@@ -29,6 +29,7 @@ extension OpenClawChatViewModel {
             let reconnected = ok && !self.healthOK
             applyTransportHealth(ok)
             if reconnected {
+                self.refreshAgentsIfRequested()
                 let session = self.currentSessionSnapshot()
                 Task { [weak self] in await self?.fetchModels(sessionSnapshot: session) }
                 self.scheduleProgressCardFetch()
@@ -36,6 +37,7 @@ extension OpenClawChatViewModel {
                 Task { [weak self] in await self?.refreshSwarmCapability() }
                 Task { [weak self] in await self?.loadComposerCapabilities(force: true) }
             } else if !ok {
+                self.invalidateAgentCatalog()
                 self.modelAvailabilityIsSessionScoped = false
                 self.invalidateComposerCapabilities()
             }
@@ -43,6 +45,7 @@ extension OpenClawChatViewModel {
             let context = self.currentSessionSnapshot()
             Task { await self.pollHealthIfNeeded(force: false, sessionSnapshot: context) }
         case .chatMetadataChanged:
+            self.refreshAgentsIfRequested()
             let session = self.currentSessionSnapshot()
             Task { [weak self] in await self?.fetchModels(sessionSnapshot: session) }
             Task { [weak self] in await self?.refreshSwarmCapability(sessionSnapshot: session) }
@@ -52,7 +55,7 @@ extension OpenClawChatViewModel {
             self.sessions = ChatSessionSidebarModel.applying(
                 observerDigest: digest,
                 to: self.sessions,
-                activeAgentId: self.activeAgentId)
+                activeAgentId: self.currentSessionSnapshot().deliveryAgentID)
         case let .chat(chat):
             self.handleChatEvent(chat)
         case let .sessionMessage(message):
@@ -70,6 +73,8 @@ extension OpenClawChatViewModel {
             self.resolveQuestionEvent(resolved)
             self.reconcileQuestionsAfterEvent()
         case .routeChanged, .seqGap:
+            self.invalidateAgentCatalog(clear: true)
+            self.refreshAgentsIfRequested()
             if case .routeChanged = evt {
                 self.applyProgressCard(nil)
             }
@@ -111,7 +116,7 @@ extension OpenClawChatViewModel {
         let projectedSessions = ChatSessionSidebarModel.applying(
             sessionChange: change,
             to: self.sessions,
-            activeAgentId: self.activeAgentId)
+            activeAgentId: self.currentSessionSnapshot().deliveryAgentID)
         if let projectedSessions {
             self.sessions = projectedSessions
         } else if !ownedSwarmActivityNote, change.reason != "patch", change.reason != "command-metadata" {
@@ -133,7 +138,7 @@ extension OpenClawChatViewModel {
         guard ChatSessionSidebarModel.sessionMatchesActiveAgent(
             sessionKey: eventSessionKey,
             agentId: change.agentId,
-            activeAgentId: self.activeAgentId)
+            activeAgentId: self.currentSessionSnapshot().deliveryAgentID)
         else { return }
         let swarmEvent = self.observeSwarmEvent(change)
         let ownedSwarmActivityNote = swarmEvent && SelfContainedSwarmHelpers.isActivityNote(change)
@@ -238,7 +243,7 @@ extension OpenClawChatViewModel {
             if let projected = ChatSessionSidebarModel.applying(
                 sessionChange: change,
                 to: self.sessions,
-                activeAgentId: self.activeAgentId)
+                activeAgentId: self.currentSessionSnapshot().deliveryAgentID)
             {
                 self.sessions = projected
             }
@@ -434,7 +439,7 @@ extension OpenClawChatViewModel {
             if let projected = ChatSessionSidebarModel.applying(
                 sessionChange: change,
                 to: self.sessions,
-                activeAgentId: self.activeAgentId)
+                activeAgentId: self.currentSessionSnapshot().deliveryAgentID)
             {
                 self.sessions = projected
             }
@@ -648,7 +653,11 @@ extension OpenClawChatViewModel {
             details: message.details,
             isError: message.isError,
             provenance: message.provenance,
-            historyMarker: message.historyMarker)
+            historyMarker: message.historyMarker,
+            phase: message.phase,
+            turnBoundary: message.turnBoundary,
+            steerTargetRunID: message.steerTargetRunID,
+            streamFallback: message.streamFallback)
     }
 
     private func handleAgentEvent(_ evt: OpenClawAgentEventPayload) {
@@ -1083,7 +1092,7 @@ extension OpenClawChatViewModel {
         let nextIndex = messages.index(after: userIndex)
         guard nextIndex < messages.endIndex else { return false }
         return messages[nextIndex...].contains { message in
-            guard message.role.lowercased() == "assistant" else { return false }
+            guard message.role.lowercased() == "assistant", message.streamSegmentID == nil else { return false }
             let text = message.content.compactMap(\.text).joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return !text.isEmpty || message.errorMessage != nil
@@ -1098,7 +1107,7 @@ extension OpenClawChatViewModel {
             return false
         }
         return messages[messages.index(after: lastUserIndex)...].contains { message in
-            guard message.role.lowercased() == "assistant" else { return false }
+            guard message.role.lowercased() == "assistant", message.streamSegmentID == nil else { return false }
             let text = message.content.compactMap(\.text).joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return !text.isEmpty || message.errorMessage != nil
@@ -1108,7 +1117,9 @@ extension OpenClawChatViewModel {
     private static func assistantHapticEvent(
         for message: OpenClawChatMessage) -> OpenClawChatHaptics.Event?
     {
-        guard message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "assistant" else {
+        guard message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "assistant",
+              message.streamSegmentID == nil
+        else {
             return nil
         }
         let text = message.content.compactMap(\.text).joined(separator: "\n")

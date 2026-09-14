@@ -80,29 +80,34 @@ async function materializeRequestedModelCatalog(
   snapshot: PreparedModelRuntimeSnapshot,
   readOnly: boolean | undefined,
   refreshFullCatalog: LoadPreparedModelCatalogParams["refreshFullCatalog"],
+  providerIds?: readonly string[],
 ): Promise<PreparedModelRuntimeSnapshot> {
   if (!snapshot.loadFullModelCatalog) {
     return snapshot;
   }
-  // Only an explicit refresh request initializes or refreshes inventory.
+  // Explicit refresh waits for acquisition; ordinary reads return saved rows during renewal.
   const inventoryCatalog =
     refreshFullCatalog === true
       ? await refreshPreparedModelRuntimeCatalog(snapshot, {
           refresh: readOnly !== true,
+          ...(providerIds ? { providerIds } : {}),
         })
       : undefined;
   const modelCatalog =
     inventoryCatalog ??
     (readOnly === true
       ? snapshot.readFullModelCatalog?.()
-      : await snapshot.loadFullModelCatalog({ refresh: refreshFullCatalog === true }));
+      : await snapshot.loadFullModelCatalog({
+          refresh: refreshFullCatalog === true,
+          ...(providerIds ? { providerIds } : {}),
+        }));
   if (!modelCatalog) {
     return snapshot;
   }
   return materializePreparedModelCatalogOwner(snapshot, modelCatalog);
 }
 
-/** Carries a completed catalog and its paired auth without acquiring or refreshing facts. */
+/** Carries the published catalog and paired auth while expired inventory renews separately. */
 export function materializePreparedModelCatalogOwner(
   snapshot: PreparedModelRuntimeSnapshot,
   modelCatalog: ModelCatalogSnapshot | undefined = snapshot.readFullModelCatalog?.(),
@@ -236,7 +241,7 @@ export function getPublishedPreparedModelCatalogOwnerSnapshot(
   return getPreparedModelRuntimeSnapshot(activationFull);
 }
 
-/** Returns the newest published catalog without starting discovery. */
+/** Returns the newest published catalog while expired inventory renews in the background. */
 export function getPreparedModelCatalogSnapshot(
   params: LoadPreparedModelCatalogParams = {},
 ): ModelCatalogSnapshot | undefined {
@@ -334,7 +339,7 @@ async function withPreparedModelCatalogOwnerPolicy<T>(
   read: (snapshot: PreparedModelRuntimeSnapshot) => T | Promise<T>,
   preparePublishedOwner = preparePublishedCatalogOwner,
 ): Promise<T> {
-  // Ordinary reads stay passive; explicit refresh keeps its existing writable default.
+  // Ordinary reads return published rows; explicit refresh keeps its writable default.
   const request = {
     ...params,
     readOnly: params.readOnly ?? params.refreshFullCatalog !== true,
@@ -356,6 +361,7 @@ async function withPreparedModelCatalogOwnerPolicy<T>(
             snapshot,
             request.readOnly,
             request.refreshFullCatalog,
+            request.providerDiscoveryProviderIds,
           );
     // Projection must finish before releasing the selected generation's resources.
     return await read(owner);

@@ -24,6 +24,7 @@ import {
 import { resolveRuntimeServiceBuildId, resolveRuntimeServiceVersion } from "../../../version.js";
 import { verifyAgentRuntimeIdentityToken } from "../../agent-runtime-identity-token.js";
 import { buildAuthenticatedPresenceUser } from "../../authenticated-presence-user.js";
+import { prepareGatewayRecipientProfile } from "../../expected-profile.js";
 import { shouldUseGatewayOwnerProfile } from "../../gateway-owner-profile.js";
 import { createAuthenticatedGitHubIdentitySync } from "../../github-user-identity.js";
 import {
@@ -63,7 +64,6 @@ import type {
   DeviceAuthorizedGatewayConnect,
   GatewayConnectPhaseContext,
 } from "./message-handler-types.js";
-import { prepareGatewayReceiverHandoff } from "./request-start.js";
 
 /** Match production release versions (YYYY.M.PATCH or YYYY.M.PATCH-beta.N). */
 const RELEASED_VERSION_RE = /^\d{4}\.\d+\.\d+/;
@@ -73,10 +73,6 @@ type AuthenticatedNodePairingAdmission = NonNullable<
 > & {
   authenticated: { nodeId: string; publicKey: string; token: string };
 };
-
-function isReleasedVersion(version: string): boolean {
-  return RELEASED_VERSION_RE.test(version);
-}
 
 export async function attachAuthenticatedGatewayConnect(
   context: GatewayConnectPhaseContext,
@@ -445,12 +441,14 @@ export async function attachAuthenticatedGatewayConnect(
     ) {
       return;
     }
+    nextClient.preparedRecipientProfileId = undefined;
     const profile = resolveAuthenticatedProfile(profileId, updatedAt);
     if (nextClient.authenticatedUserProfile) {
       Object.assign(nextClient.authenticatedUserProfile, profile);
     } else {
       nextClient.authenticatedUserProfile = profile;
     }
+    prepareGatewayRecipientProfile(nextClient);
     attachGatewayLocalUserIngress(
       nextClient,
       prepareLocalUserIngress(nextClient.authenticatedUserProfile),
@@ -486,8 +484,8 @@ export async function attachAuthenticatedGatewayConnect(
         clientVersion &&
         gatewayVersion &&
         clientVersion !== gatewayVersion &&
-        isReleasedVersion(gatewayVersion) &&
-        isReleasedVersion(clientVersion)
+        RELEASED_VERSION_RE.test(gatewayVersion) &&
+        RELEASED_VERSION_RE.test(clientVersion)
       ) {
         logWsControl.info(
           `node version mismatch conn=${connId} client=${formatForLog(clientLabel)} clientVersion=${formatForLog(clientVersion)} gatewayVersion=${gatewayVersion}; closing for supervisor restart`,
@@ -538,15 +536,16 @@ export async function attachAuthenticatedGatewayConnect(
     }
     return;
   }
-  const handoffReceiver = prepareGatewayReceiverHandoff(socket, role);
-  if (!handoffReceiver) {
-    const message = "unsupported Gateway WebSocket receiver";
-    markHandshakeFailure("unsupported-websocket-receiver", {});
+  const handoffReceiver = context.handler.prepareAuthenticatedReceive(role);
+  if (!handoffReceiver.ok) {
+    const { cause, message } = handoffReceiver.error;
+    markHandshakeFailure(cause, {});
     sendHandshakeErrorResponse(ErrorCodes.UNAVAILABLE, message);
     await releasePendingNodePairingCleanup();
     close(1011, message);
     return;
   }
+  prepareGatewayRecipientProfile(nextClient);
   if (!setClient(nextClient)) {
     await releasePendingNodePairingCleanup();
     setCloseCause("connect-aborted-before-register", {
@@ -557,7 +556,7 @@ export async function attachAuthenticatedGatewayConnect(
   }
   // Only registered operators use bounded router starts. Node lifecycle traffic,
   // workers and preauth retain native yielding and their existing queue/drain rules.
-  handoffReceiver();
+  handoffReceiver.value();
   setHandshakeState("connected");
   advanceHandshakePhase("session_attached");
   logWs("in", "connect", {

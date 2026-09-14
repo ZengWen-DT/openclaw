@@ -7,6 +7,7 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { persistClawPackageRef } from "../claws/provenance.js";
 import type { ClawAddPlan } from "../claws/types.js";
 import type { OpenClawConfig } from "../config/config.js";
+import { resolveStateDir } from "../config/paths.js";
 import { recordInstalledPluginIndexInstallOwner } from "../plugins/installed-plugin-index-install-owner.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import {
@@ -14,7 +15,6 @@ import {
   buildPluginDiagnosticsReportMock,
   buildPluginSnapshotReportMock,
   createTestInstalledPluginIndex,
-  parseClawHubPluginSpecMock,
   pluginCliConfigMock,
   pluginLifecycleGatewayMock,
   resolvePluginLifecycleGatewayMock,
@@ -34,7 +34,7 @@ import {
   writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock,
 } from "./plugins-cli-test-helpers.js";
 
-const CLI_STATE_ROOT = "/tmp/openclaw-state";
+const CLI_STATE_ROOT = resolveStateDir();
 let alphaInstallPath: string;
 let readInstallRecords: (typeof import("../plugins/installed-plugin-index-record-reader.js"))["loadInstalledPluginIndexInstallRecordsSync"];
 const ORIGINAL_OPENCLAW_NIX_MODE = process.env.OPENCLAW_NIX_MODE;
@@ -348,10 +348,6 @@ describe("plugins cli uninstall", () => {
     process.env.OPENCLAW_STATE_DIR = tempDirs.make("openclaw-claw-plugin-ref-");
     closeOpenClawStateDatabaseForTest();
     try {
-      const { parseClawHubPluginSpec } = await vi.importActual<
-        typeof import("../infra/clawhub-spec.js")
-      >("../infra/clawhub-spec.js");
-      parseClawHubPluginSpecMock.mockImplementation(parseClawHubPluginSpec);
       const installRecord = {
         source: "clawhub" as const,
         spec: "clawhub:@owner/audit",

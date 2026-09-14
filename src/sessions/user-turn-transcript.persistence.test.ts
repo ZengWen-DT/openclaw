@@ -1,6 +1,5 @@
 // User turn persistence tests cover the shared transcript writer.
 import fs from "node:fs";
-import path from "node:path";
 import {
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
@@ -10,12 +9,7 @@ import { castAgentMessage } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../agents/harness/hook-helpers.js";
-import { formatSqliteSessionFileMarker } from "../config/sessions/legacy-sqlite-marker.js";
-import {
-  loadTranscriptEvents,
-  loadSessionEntry,
-  replaceSessionEntry,
-} from "../config/sessions/session-accessor.js";
+import { loadSessionEntry, replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import { resolveSessionTranscriptDatabasePath } from "../config/sessions/session-accessor.transcript-target.js";
 import { resolveSessionColdArchivePath } from "../config/sessions/session-cold-storage-codec.js";
 import { readSessionColdTranscript } from "../config/sessions/session-cold-storage-state.js";
@@ -28,7 +22,11 @@ import {
 } from "../state/openclaw-agent-db.js";
 import { createUserTurnTranscriptRecorder } from "./user-turn-transcript.js";
 import { buildChannelUserTurnSender } from "./user-turn-transcript.metadata.js";
-import { persistUserTurnTranscript } from "./user-turn-transcript.test-support.js";
+import {
+  createSqliteTranscriptTarget,
+  persistUserTurnTranscript,
+  readTranscriptMessages,
+} from "./user-turn-transcript.test-support.js";
 import type { UserTurnOriginalInputCommit } from "./user-turn-transcript.types.js";
 
 describe("persistUserTurnTranscript", () => {
@@ -37,51 +35,6 @@ describe("persistUserTurnTranscript", () => {
   afterEach(() => {
     resetGlobalHookRunner();
   });
-
-  function createSqliteTranscriptTarget(params: {
-    dir: string;
-    sessionId?: string;
-    sessionKey?: string;
-  }) {
-    const sessionId = params.sessionId ?? "session-1";
-    const sessionKey = params.sessionKey ?? "agent:main:main";
-    const storePath = path.join(params.dir, "agents", "main", "sessions", "sessions.json");
-    fs.mkdirSync(path.dirname(storePath), { recursive: true });
-    const sqliteMarker = formatSqliteSessionFileMarker({
-      agentId: "main",
-      sessionId,
-      storePath,
-    });
-    return {
-      agentId: "main",
-      cwd: params.dir,
-      sessionEntry: undefined,
-      sessionId,
-      sessionKey,
-      storePath,
-      sqliteMarker,
-    };
-  }
-
-  async function readTranscriptMessages(params: {
-    sessionId: string;
-    sessionKey: string;
-    storePath: string;
-  }): Promise<Array<Record<string, unknown>>> {
-    return (
-      await loadTranscriptEvents({
-        agentId: "main",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        storePath: params.storePath,
-      })
-    )
-      .map((entry) => (entry as { message?: unknown }).message)
-      .filter(
-        (message): message is Record<string, unknown> =>
-          typeof message === "object" && message !== null,
-      );
-  }
 
   it.each(["available", "missing"] as const)(
     "resumes a cold current transcript only when its archive is %s",
@@ -668,11 +621,19 @@ describe("persistUserTurnTranscript", () => {
             hookCalls += 1;
             const message = (event as { message: Record<string, unknown> }).message;
             const meta = message["__openclaw"] as {
-              transport?: { conversationRef?: string; messageId?: string };
+              transport?: {
+                conversationRef?: string;
+                messageId?: string;
+                clients?: Array<{ displayName?: string }>;
+              };
             };
             if (meta.transport) {
               meta.transport.conversationRef = "conv_tampered";
               meta.transport.messageId = "tampered-message";
+              const source = meta.transport.clients?.[0];
+              if (source) {
+                source.displayName = "Forged app";
+              }
             }
             return {
               message: castAgentMessage({
@@ -703,6 +664,7 @@ describe("persistUserTurnTranscript", () => {
           conversationRef: "conv_0123456789abcdef0123456789abcdef",
           messageId: "inbound-1",
           replyToId: "outbound-1",
+          clients: [{ id: "cli", mode: "cli", displayName: "Original app" }],
         },
       },
       beforeMessageWrite: runAgentHarnessBeforeMessageWriteHook,
@@ -722,6 +684,7 @@ describe("persistUserTurnTranscript", () => {
           conversationRef: "conv_0123456789abcdef0123456789abcdef",
           messageId: "inbound-1",
           replyToId: "outbound-1",
+          clients: [{ id: "cli", mode: "cli", displayName: "Original app" }],
         },
       },
       beforeMessageWrite: runAgentHarnessBeforeMessageWriteHook,
@@ -743,6 +706,7 @@ describe("persistUserTurnTranscript", () => {
             conversationRef: "conv_0123456789abcdef0123456789abcdef",
             messageId: "inbound-1",
             replyToId: "outbound-1",
+            clients: [{ id: "cli", mode: "cli", displayName: "Original app" }],
           },
         },
       }),

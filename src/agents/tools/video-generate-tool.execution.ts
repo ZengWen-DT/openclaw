@@ -3,7 +3,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { SsrFPolicy } from "../../infra/net/ssrf.js";
 import { resolveGeneratedMediaMaxBytes } from "../../media/configured-max-bytes.js";
 import { probeMediaFilesWithinBudget } from "../../media/media-probe.js";
-import { saveMediaBuffer } from "../../media/store.js";
+import { extractOriginalFilename, saveMediaBuffer } from "../../media/store.js";
 import { SaveMediaSourceError } from "../../media/store.shared.js";
 import { generateVideo } from "../../video-generation/runtime.js";
 import type {
@@ -104,6 +104,7 @@ function formatIgnoredVideoGenerationOverride(override: VideoGenerationIgnoredOv
 
 export async function loadReferenceAssets(params: {
   inputs: string[];
+  roles: string[];
   expectedKind: "image" | "video" | "audio";
   maxBytes: number;
   workspaceDir?: string;
@@ -133,9 +134,16 @@ export async function loadReferenceAssets(params: {
     }),
     mapRemote: (url) => ({ url }),
   });
-  return loaded.map(({ source, resolvedInput, rewrittenFrom }) =>
-    Object.assign({ sourceAsset: source, resolvedInput }, rewrittenFrom ? { rewrittenFrom } : {}),
-  );
+  return loaded.map(({ source, resolvedInput, rewrittenFrom }, index) => {
+    const role = params.roles[index];
+    if (role) {
+      source.role = role;
+    }
+    return Object.assign(
+      { sourceAsset: source, resolvedInput },
+      rewrittenFrom ? { rewrittenFrom } : {},
+    );
+  });
 }
 
 type LoadedReferenceAsset = Awaited<ReturnType<typeof loadReferenceAssets>>[number];
@@ -358,7 +366,7 @@ export async function executeVideoGenerationJob(params: {
         type: "video" as const,
         path: video.media.path,
         mimeType: video.media.contentType,
-        name: video.media.id,
+        name: extractOriginalFilename(video.media.path),
         sizeBytes: video.media.size,
         ...(typeof normalizedDurationSeconds === "number"
           ? { durationMs: normalizedDurationSeconds * 1000 }

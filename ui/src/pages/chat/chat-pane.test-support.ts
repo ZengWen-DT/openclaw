@@ -22,6 +22,7 @@ import type { GatewaySessionRow } from "../../api/types.ts";
 import { createApplicationTheme } from "../../app/bootstrap-theme.ts";
 import { createChatAttachmentHandoff } from "../../app/chat-attachment-handoff.ts";
 import { createChatSubmissions } from "../../app/chat-submissions.ts";
+import { createConnectionBootstrapCoordinator } from "../../app/connection-bootstrap.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import type { ApplicationPlacementStartupStatus } from "../../app/session-placement-startup.ts";
 import { loadSettings } from "../../app/settings.ts";
@@ -30,6 +31,7 @@ import { createAgentIdentityCapability } from "../../lib/agents/identity.ts";
 import { createAgentCapability } from "../../lib/agents/index.ts";
 import type { CatalogSessionKey } from "../../lib/sessions/catalog-key.ts";
 import { createSessionCapability, type SessionCapability } from "../../lib/sessions/index.ts";
+import { createSessionArchiveState } from "../../lib/sessions/session-archive-state.ts";
 import "./chat-pane.ts";
 import {
   createTestGatewayClient,
@@ -88,6 +90,7 @@ export type TestChatPane = HTMLElement & {
   discardStagedAttachments?: () => void;
   resumeStagedAttachments?: () => void;
   acceptTaskSuggestion: (suggestion: TaskSuggestion) => Promise<void>;
+  dismissTaskSuggestion: (suggestion: TaskSuggestion) => Promise<void>;
   copyTaskSuggestionPrompt: (suggestion: TaskSuggestion) => Promise<void>;
   handleDocumentKeydown: (event: KeyboardEvent) => void;
   handleTaskSuggestionEvent: (event: TaskSuggestionEvent) => void;
@@ -202,19 +205,35 @@ export function createGatewayBrowserClientFixture(
   return client;
 }
 
-type FixtureContextServices = "theme" | "agentIdentity" | "agents" | "sessions";
+type FixtureContextServices =
+  | "theme"
+  | "agentIdentity"
+  | "agents"
+  | "sessions"
+  | "connectionBootstrap";
 
 function withLiveCapabilities(
   context: Omit<ApplicationContext, FixtureContextServices> & { sessions?: SessionCapability },
 ): ApplicationContext {
+  const connectionBootstrap = createConnectionBootstrapCoordinator();
+  const synchronizeBootstrap = (snapshot: ApplicationContext["gateway"]["snapshot"]) =>
+    connectionBootstrap.synchronize({
+      client: snapshot.client,
+      connected: snapshot.phase === "connected",
+    });
+  synchronizeBootstrap(context.gateway.snapshot);
+  const stopBootstrap = context.gateway.subscribe(synchronizeBootstrap);
   const theme = createApplicationTheme(
     loadSettings(context.gateway.connection.gatewayUrl),
     context.gateway,
   );
   const agents = createAgentCapability(context.gateway);
   const sessions =
-    context.sessions ?? createSessionCapability(context.gateway, context.agentSelection);
+    context.sessions ??
+    createSessionCapability(context.gateway, context.agentSelection, { connectionBootstrap });
   onTestFinished(() => {
+    stopBootstrap();
+    connectionBootstrap.reset();
     if (!context.sessions) {
       sessions.dispose();
     }
@@ -223,6 +242,7 @@ function withLiveCapabilities(
   });
   return {
     ...context,
+    connectionBootstrap,
     theme,
     agents,
     sessions,
@@ -307,7 +327,16 @@ type SessionCapabilityFixtureOverrides = Omit<Partial<SessionCapability>, "patch
 export function createSessionCapabilityFixture(
   overrides: SessionCapabilityFixtureOverrides = {},
 ): SessionCapability {
-  return { deletionState: () => undefined, ...overrides } as typeof overrides & SessionCapability;
+  const archiveState = createSessionArchiveState(
+    (key) => overrides.state?.result?.sessions.find((row) => row.key === key),
+    () => {},
+  );
+  return {
+    deletionState: () => undefined,
+    archiveVisibility: archiveState.visibility,
+    beginArchive: archiveState.beginPending,
+    ...overrides,
+  } as typeof overrides & SessionCapability;
 }
 
 export function createSessionContext(
@@ -440,7 +469,6 @@ export function createTestChatPane(params: {
     sessionsError: null,
     sessionsLoading: false,
     sidebarContent: null,
-    attachmentSidebarContent: null,
     sidebarFocusPanelId: "",
     sidebarFocusVersion: 0,
     sidebarLayout: { columns: [] },

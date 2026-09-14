@@ -1208,7 +1208,7 @@ async function runCliWithPreparedOutputMode(
     env: process.env,
   });
   const useSourceOnlyBestEffortConfig =
-    !isCurrentRuntimeSupported() ||
+    !(await isCurrentRuntimeSupported()) ||
     normalizedInvocation.primary === "update" ||
     (normalizedInvocation.primary === "doctor" && hasFlag(normalizedArgv, "--lint"));
   const readBestEffortCliConfig = async (): Promise<OpenClawConfig> => {
@@ -1221,7 +1221,7 @@ async function runCliWithPreparedOutputMode(
           // Routing must not create state before Doctor decides whether migrations are needed.
           observe: false,
           ...(isolateProxyConfigEnv ? { isolateEnv: true } : {}),
-          ...(bestEffortConfigStartupPolicy.validateConfigOnly
+          ...(bestEffortConfigStartupPolicy.validateConfigOnly || isGatewayRunInvocation
             ? { pluginValidation: "core-only" }
             : { skipPluginValidation: true }),
         };

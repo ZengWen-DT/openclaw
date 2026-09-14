@@ -12,10 +12,7 @@ import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { Minimatch } from "minimatch";
 import { extractFrontmatterBlock } from "../../packages/markdown-core/src/frontmatter.js";
 import type { ChatType } from "../channels/chat-type.js";
-import {
-  isRootFileMissingFailure,
-  openRootFileFollowingParents,
-} from "../infra/boundary-file-read.js";
+import { isRootFileMissingFailure, openRootFile } from "../infra/boundary-file-read.js";
 import { isHardlinkFallbackError } from "../infra/directory-durability.js";
 import { hasErrnoCode } from "../infra/errno.js";
 import { sameFileIdentity, tempFile, type FileIdentityStat } from "../infra/fs-safe-advanced.js";
@@ -153,10 +150,11 @@ async function readWorkspaceFileWithGuards(params: {
     // in openRootFile still protects against a swapped file between attempts.
     return await retryAsync(
       async () => {
-        const opened = await openRootFileFollowingParents({
+        const opened = await openRootFile({
           absolutePath: params.filePath,
           rootPath: params.workspaceDir,
           boundaryLabel: "workspace root",
+          symlinks: "follow-parents-within-root",
         });
         if (!opened.ok) {
           // Boundary resolution can report transient IO as "validation", while
@@ -963,6 +961,8 @@ async function ensureGitRepo(
 export async function ensureAgentWorkspace(params?: {
   dir?: string;
   ensureBootstrapFiles?: boolean;
+  /** Creation-time role content; existing workspace files are still preserved. */
+  templates?: Partial<Record<"AGENTS.md" | "SOUL.md" | "IDENTITY.md", string>>;
   /** Guard each new mutation after async preparation; admitted effects may settle. */
   beforePersistentApply?: () => void;
   /**
@@ -1151,9 +1151,13 @@ export async function ensureAgentWorkspace(params?: {
     }
   }
 
-  const agentsTemplate = await loadTemplate(DEFAULT_AGENTS_FILENAME);
-  const soulTemplate = await loadTemplate(DEFAULT_SOUL_FILENAME);
-  const identityTemplate = await loadTemplate(DEFAULT_IDENTITY_FILENAME);
+  const agentsTemplate =
+    params?.templates?.[DEFAULT_AGENTS_FILENAME] ?? (await loadTemplate(DEFAULT_AGENTS_FILENAME));
+  const soulTemplate =
+    params?.templates?.[DEFAULT_SOUL_FILENAME] ?? (await loadTemplate(DEFAULT_SOUL_FILENAME));
+  const identityTemplate =
+    params?.templates?.[DEFAULT_IDENTITY_FILENAME] ??
+    (await loadTemplate(DEFAULT_IDENTITY_FILENAME));
   const userTemplate = await loadTemplate(DEFAULT_USER_FILENAME);
   // Template and filesystem checks above are async. Another process may have
   // completed setup while they ran, so optional-file policy needs fresh state.

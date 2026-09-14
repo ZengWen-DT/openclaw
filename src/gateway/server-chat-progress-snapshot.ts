@@ -1,11 +1,33 @@
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import type { AgentEventPayload } from "../infra/agent-events.js";
-import { jsonUtf8Bytes } from "../infra/json-utf8-bytes.js";
 
 const CHAT_RUN_PROGRESS_MAX_EVENTS = 50;
 const CHAT_RUN_PROGRESS_MAX_BYTES = 128 * 1024;
 const CHAT_RUN_PROGRESS_MAX_EVENT_BYTES = 64 * 1024;
 const CHAT_RUN_PROGRESS_MAX_REVIEWS_PER_TOOL = 16;
+const retainedEventBytes = new WeakMap<AgentEventPayload, number>();
+
+function captureProgressEvent(event: AgentEventPayload) {
+  try {
+    const json = JSON.stringify(event);
+    const byteLength = Buffer.byteLength(json, "utf8");
+    if (byteLength > CHAT_RUN_PROGRESS_MAX_EVENT_BYTES) {
+      return undefined;
+    }
+    // Own the wire representation; producers and replay readers cannot change
+    // captured content or invalidate its size after this synchronous receipt.
+    const captured: AgentEventPayload = JSON.parse(json, (_key, value: unknown) =>
+      value !== null && typeof value === "object" ? Object.freeze(value) : value,
+    );
+    if (!asNullableRecord(captured.data)) {
+      return undefined;
+    }
+    retainedEventBytes.set(captured, byteLength);
+    return { event: captured, byteLength };
+  } catch {
+    return undefined;
+  }
+}
 
 export type ChatRunProgressSnapshot = {
   events: AgentEventPayload[];
@@ -32,6 +54,7 @@ export function updateChatRunProgressSnapshot(
       "running_setup",
       "provisioning_environment",
       "preparing_context",
+      "memory_flushing",
       "starting_model",
     ].includes(phase);
   const isRetryStatus = event.stream === "run_status" && phase === "retrying";
@@ -103,29 +126,14 @@ export function updateChatRunProgressSnapshot(
     ? next.events.find((candidate) => candidate.stream === "usage")
     : undefined;
 
-  let recounted = false;
   const removeWhere = (predicate: (candidate: AgentEventPayload) => boolean) => {
-    let removedBytes = 0;
     next.events = next.events.filter((candidate) => {
       if (!predicate(candidate)) {
         return true;
       }
-      if (recounted) {
-        removedBytes += jsonUtf8Bytes(candidate);
-      }
+      next.byteLength -= retainedEventBytes.get(candidate)!;
       return false;
     });
-    if (recounted) {
-      next.byteLength -= removedBytes;
-    } else {
-      // Nested producer payloads can change between updates. Recount once,
-      // then charge only evictions during this synchronous update.
-      next.byteLength = next.events.reduce(
-        (total, candidate) => total + jsonUtf8Bytes(candidate),
-        0,
-      );
-      recounted = true;
-    }
   };
 
   if (
@@ -187,14 +195,21 @@ export function updateChatRunProgressSnapshot(
           phase,
           name: typeof data.name === "string" ? data.name : undefined,
           toolCallId,
-          args: phase === "start" ? data.args : undefined,
-          partialResult: phase === "update" ? data.partialResult : undefined,
-          diff: phase === "input_delta" ? data.diff : undefined,
-          review: phase === "review" ? data.review : undefined,
-          approvalReviewOutcome:
-            phase === "review" || phase === "result" ? data.approvalReviewOutcome : undefined,
-          isError: phase === "result" ? data.isError : undefined,
-          result: phase === "result" ? data.result : undefined,
+          ...(phase === "start"
+            ? { args: data.args }
+            : phase === "update"
+              ? { partialResult: data.partialResult }
+              : phase === "input_delta"
+                ? { diff: data.diff }
+                : phase === "review"
+                  ? { review: data.review, approvalReviewOutcome: data.approvalReviewOutcome }
+                  : phase === "result"
+                    ? {
+                        approvalReviewOutcome: data.approvalReviewOutcome,
+                        isError: data.isError,
+                        result: data.result,
+                      }
+                    : {}),
         }
     : isAssistant
       ? {} // Reconnect needs the progress sequence, not another copy of buffered assistant text.
@@ -210,7 +225,7 @@ export function updateChatRunProgressSnapshot(
       delete storedData[key];
     }
   }
-  let storedEvent: AgentEventPayload = {
+  const storedEvent: AgentEventPayload = {
     runId: event.runId,
     seq: event.seq,
     stream: event.stream,
@@ -220,20 +235,19 @@ export function updateChatRunProgressSnapshot(
     ...(event.sessionKey ? { sessionKey: event.sessionKey } : {}),
     ...(event.agentId ? { agentId: event.agentId } : {}),
   };
-  let eventBytes = jsonUtf8Bytes(storedEvent);
-  if (eventBytes > CHAT_RUN_PROGRESS_MAX_EVENT_BYTES && isTool) {
+  let captured = captureProgressEvent(storedEvent);
+  if (!captured && isTool) {
     delete storedData.args;
     delete storedData.partialResult;
     delete storedData.diff;
     delete storedData.result;
-    storedEvent = { ...storedEvent, data: storedData };
-    eventBytes = jsonUtf8Bytes(storedEvent);
+    captured = captureProgressEvent(storedEvent);
   }
-  if (eventBytes > CHAT_RUN_PROGRESS_MAX_EVENT_BYTES) {
+  if (!captured) {
     return next;
   }
-  next.events.push(storedEvent);
-  next.byteLength += eventBytes;
+  next.events.push(captured.event);
+  next.byteLength += captured.byteLength;
   if (phase === "review") {
     const reviews = next.events.filter(
       (candidate) =>

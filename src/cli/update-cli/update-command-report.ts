@@ -66,27 +66,22 @@ export async function runInteractiveUpdateFailureAction(params: {
       const result: UpdateRunResult = params.result ?? {
         status: "error",
         mode: "unknown",
-        reason: "unexpected-error",
         steps: [],
         durationMs: 0,
       };
-      // Managed handoffs can finish with a compact result while the canonical
-      // ledger still contains the failed activation/rollback phases. Read that
-      // history in the admitted state scope, but keep reporting usable if it is
-      // unavailable or locked.
+      const stateDir = resolveStateDir(params.env);
       let recordedRun: ReturnType<typeof getUpdateRun>;
       try {
         recordedRun = getUpdateRun(params.attemptId, { env: params.env });
       } catch {
-        recordedRun = undefined;
+        // A missing or locked ledger must not prevent reporting the direct failure.
       }
-      const stateDir = resolveStateDir(params.env);
       const prepared = await prepareUpdateFailureReport(
         {
           attemptId: params.attemptId,
           ...(params.error ? { error: params.error } : {}),
           result,
-          ...(recordedRun ? { recordedRun } : {}),
+          recordedRun,
           ...(result.after?.upstreamRef ? { target: result.after.upstreamRef } : {}),
         },
         { env: params.env, stateDir },

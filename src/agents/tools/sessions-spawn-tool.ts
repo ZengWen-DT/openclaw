@@ -5,10 +5,8 @@
  */
 import { Type } from "typebox";
 import { isAcpRuntimeSpawnAvailable } from "../../acp/runtime/availability.js";
-import {
-  resolveThreadBindingSpawnPolicy,
-  supportsAutomaticThreadBindingSpawn,
-} from "../../channels/thread-bindings-policy.js";
+import { supportsThreadBindingSpawn } from "../../channels/conversation-resolution.js";
+import { resolveThreadBindingSpawnPolicy } from "../../channels/thread-bindings-policy.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveSnakeCaseParamKey } from "../../param-key.js";
@@ -139,7 +137,7 @@ function resolveSessionsSpawnThreadAvailability(opts?: {
 }): SessionsSpawnThreadAvailability {
   const channel = opts?.agentChannel;
   const cfg = opts?.config;
-  if (!channel || !cfg || !supportsAutomaticThreadBindingSpawn(channel)) {
+  if (!channel || !cfg || !supportsThreadBindingSpawn(channel)) {
     return { subagent: false, acp: false };
   }
   const resolve = (kind: "subagent" | "acp") => {
@@ -196,7 +194,7 @@ function createSessionsSpawnToolSchema(params: {
     cwd: Type.Optional(
       Type.String({
         description:
-          "Child working directory. Visible paths outside configured agent workspaces require operator.admin. Omitted with worktree=true: inherit the same-agent parent managed repository; otherwise use the target agent workspace.",
+          "Child working directory. Visible paths outside configured agent workspaces require operator.admin. Mutually exclusive with projectId/projectGitUrl. With no source selector and worktree=true: inherit the same-agent parent managed repository; otherwise use the target agent workspace.",
       }),
     ),
     ...(params.threadAvailable
@@ -204,7 +202,7 @@ function createSessionsSpawnToolSchema(params: {
           thread: Type.Optional(
             Type.Boolean({
               description:
-                'Bind new chat thread when supported; true defaults mode="session"; unavailable with visible=true.',
+                'Bind to the current conversation or a new thread, as supported by the channel; true defaults mode="session"; unavailable with visible=true.',
             }),
           ),
         }
@@ -223,6 +221,10 @@ function createSessionsSpawnToolSchema(params: {
           "false: fire-and-forget; requester gets no completion handoff when the child finishes.",
       }),
     ),
+    completionTarget: optionalStringEnum(["parent"] as const, {
+      description:
+        "parent: return results in a private requester turn; no automatic channel delivery. Native hidden run only; unavailable with ACP, collect, visible, thread, session mode, or expectsCompletionMessage=false.",
+    }),
     sandbox: optionalStringEnum(SESSIONS_SPAWN_SANDBOX_MODES, {
       description: '"inherit" parent sandbox policy; "require" fails unless child is sandboxed.',
     }),
@@ -445,6 +447,15 @@ export function createSessionsSpawnTool(
         const taskName = taskNameResult.taskName;
         const label = readToolStringParam(params, "label") ?? "";
         const runtime = params.runtime === "acp" ? "acp" : "subagent";
+        const completionTarget = params.completionTarget;
+        if (completionTarget !== undefined && completionTarget !== "parent") {
+          throw new ToolInputError('sessions_spawn completionTarget must be "parent" or omitted.');
+        }
+        if (completionTarget === "parent" && (runtime === "acp" || params.visible === true)) {
+          throw new ToolInputError(
+            'sessions_spawn completionTarget="parent" requires a hidden native subagent run.',
+          );
+        }
         if (collect && runtime === "acp") {
           throw new ToolInputError('sessions_spawn collect=true supports runtime="subagent" only.');
         }
@@ -647,6 +658,7 @@ export function createSessionsSpawnTool(
             context,
             lightContext,
             expectsCompletionMessage,
+            completionTarget,
             attachments,
             attachMountPath:
               params.attachAs && typeof params.attachAs === "object"

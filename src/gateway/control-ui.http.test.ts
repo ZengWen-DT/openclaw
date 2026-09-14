@@ -22,7 +22,7 @@ import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import { AVATAR_MAX_DATA_URL_CHARS } from "../shared/avatar-limits.js";
 import { AVATAR_MAX_BYTES } from "../shared/avatar-policy.js";
-import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db.js";
+import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db-cache.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { buildAssistantMediaContentDisposition } from "./assistant-media-content-disposition.js";
@@ -795,15 +795,12 @@ describe("handleControlUiHttpRequest", () => {
   });
 
   it.each([
-    { filename: "voice.ogg", disposition: "inline" },
-    { filename: "clip.mp4", disposition: "inline" },
-    { filename: "report.pdf", disposition: "attachment" },
-    {
-      filename: "invoice---123e4567-e89b-12d3-a456-426614174000.pdf",
-      disposition: "attachment",
-    },
-    { filename: "archive.bin", disposition: "attachment" },
-  ])("serves $filename with $disposition disposition", async ({ filename, disposition }) => {
+    ["voice.ogg", "inline"],
+    ["clip.mp4", "inline"],
+    ["report.pdf", "attachment"],
+    ["invoice---123e4567-e89b-12d3-a456-426614174000.pdf", "attachment"],
+    ["archive.bin", "attachment"],
+  ])("serves %s with %s disposition", async (filename, disposition) => {
     await withAllowedAssistantMediaRoot({
       prefix: "ui-media-disposition-",
       fn: async (tmpRoot) => {

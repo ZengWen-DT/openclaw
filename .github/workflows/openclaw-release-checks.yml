@@ -1318,6 +1318,7 @@ jobs:
             !ref.startsWith("extended-stable/") &&
             compareReleaseVersions(candidate.baseVersion, workflow.baseVersion) >= 0;
           let supportsOperatorScenario = false;
+          let supportsSiblingScenario = false;
           if (currentLine) {
             const sha = process.env.CANDIDATE_SOURCE_SHA;
             assert(/^[a-f0-9]{40}$/u.test(sha || ""), "Candidate source SHA is required.");
@@ -1328,6 +1329,7 @@ jobs:
             assert(Array.isArray(names) && names.every((name) => typeof name === "string"),
               "Candidate survivor directory metadata was invalid.");
             supportsOperatorScenario = names.includes("legacy-operator-state.mjs");
+            supportsSiblingScenario = names.includes("custom-plugin-siblings.mjs");
           }
           const baselines = supportsOperatorScenario ? "supported-lines" : "";
           // The child prepares/reuses a registry only for unpublished artifacts.
@@ -1336,10 +1338,12 @@ jobs:
           const soak = process.env.RUN_RELEASE_SOAK === "true";
           // Targets without the fixture registry retain the preexisting scenario
           // inventory. This does not opt into frozen-target scenario omissions.
-          const scenarios = legacyOperator
-            ? (soak ? "reported-issues" : "base legacy-operator-state")
-            : (soak ? parseUpgradeSurvivorScenarios("reported-issues")
-                .filter((scenario) => scenario !== "legacy-operator-state").join(" ") : "base");
+          const scenarios = (soak
+            ? parseUpgradeSurvivorScenarios("reported-issues")
+            : ["base", "legacy-operator-state", "custom-plugin-siblings"])
+            .filter((scenario) => scenario !== "legacy-operator-state" || legacyOperator)
+            .filter((scenario) => scenario !== "custom-plugin-siblings" || supportsSiblingScenario)
+            .join(" ");
           appendFileSync(process.env.GITHUB_OUTPUT,
             `baselines=${baselines}\nscenarios=${scenarios}\n`);
           NODE

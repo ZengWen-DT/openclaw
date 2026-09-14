@@ -167,17 +167,6 @@ export type NodeConnectivityResult =
   | { ok: true }
   | { ok: false; error: { code: string; message: string } };
 
-/** Minimal websocket ping/pong surface used by connectivity checks. */
-type PingableSocket = {
-  ping?: (data?: Buffer, mask?: boolean, cb?: (err?: Error) => void) => void;
-  once?: (event: "pong" | "close" | "error", listener: (...args: unknown[]) => void) => unknown;
-  off?: (event: "pong" | "close" | "error", listener: (...args: unknown[]) => void) => unknown;
-  removeListener?: (
-    event: "pong" | "close" | "error",
-    listener: (...args: unknown[]) => void,
-  ) => unknown;
-};
-
 const SERIALIZED_EVENT_PAYLOAD = Symbol("openclaw.serializedEventPayload");
 const AUTHORIZED_SYSTEM_RUN_EVENT_GRACE_MS = 5 * 60 * 1000;
 const SLOW_CONSUMER_CLOSE_CODE = 1008;
@@ -348,6 +337,7 @@ export class NodeRegistry {
       isCommandAllowed: (nodeId, command) =>
         this.isCommandAllowed(nodeId, command, this.options.getConfig?.()),
       listCurrentConnected: () => this.listCurrentConnected(),
+      getCurrentConnected: (nodeId) => this.getCurrentConnected(nodeId),
       hasCurrentPairingStateResolver: Boolean(this.options.resolveCurrentPairingState),
       resolvePairingLease: async (node) => {
         const current = this.nodesById.get(node.nodeId);
@@ -748,8 +738,21 @@ export class NodeRegistry {
 
   /** Resolve persistent pairing state before projecting connected sessions. */
   async listCurrentConnected(): Promise<NodeSession[]> {
+    return await this.resolveCurrentConnectedSessions(this.listConnectedSessions());
+  }
+
+  async getCurrentConnected(nodeId: string): Promise<NodeSession | undefined> {
+    const node = this.nodesById.get(nodeId);
+    return node && node.client.invalidated !== true
+      ? (await this.resolveCurrentConnectedSessions([node]))[0]
+      : undefined;
+  }
+
+  private async resolveCurrentConnectedSessions(
+    candidates: readonly PairingBoundNodeSession[],
+  ): Promise<NodeSession[]> {
     const resolved = await Promise.all(
-      this.listConnectedSessions().map((node) =>
+      candidates.map((node) =>
         this.resolvePairingLease(this.capturePairingLease(node), { invalidateStale: true }),
       ),
     );
@@ -1016,14 +1019,14 @@ export class NodeRegistry {
         : { ok: true as const };
       return currentConnectionResult(result);
     }
-    const socket = node.client.socket as PingableSocket;
+    const socket = node.client.webSocket;
     if (!this.isNodeWebSocketOpen(node)) {
       return {
         ok: false,
         error: { code: "NOT_CONNECTED", message: "node socket not open" },
       };
     }
-    if (typeof socket.ping !== "function" || typeof socket.once !== "function") {
+    if (!socket) {
       return { ok: true };
     }
 
@@ -1031,12 +1034,9 @@ export class NodeRegistry {
     return await new Promise<NodeConnectivityResult>((resolve) => {
       let settled = false;
       const cleanup = () => {
-        socket.off?.("pong", onPong);
-        socket.off?.("close", onClose);
-        socket.off?.("error", onError);
-        socket.removeListener?.("pong", onPong);
-        socket.removeListener?.("close", onClose);
-        socket.removeListener?.("error", onError);
+        socket.off("pong", onPong);
+        socket.off("close", onClose);
+        socket.off("error", onError);
       };
       const finish = (result: NodeConnectivityResult) => {
         if (settled) {
@@ -1071,11 +1071,11 @@ export class NodeRegistry {
         timeout,
       );
 
-      socket.once?.("pong", onPong);
-      socket.once?.("close", onClose);
-      socket.once?.("error", onError);
+      socket.once("pong", onPong);
+      socket.once("close", onClose);
+      socket.once("error", onError);
       try {
-        socket.ping?.(undefined, false, (err?: Error) => {
+        socket.ping(undefined, false, (err?: Error) => {
           if (err) {
             finish({
               ok: false,

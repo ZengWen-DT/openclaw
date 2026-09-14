@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveNodeRuntimeInfo } from "../../daemon/runtime-paths.js";
+import { prepareUpdateFailureReport } from "../../infra/update-failure-report-prepare.js";
 import { withTempDir } from "../../test-utils/temp-dir.js";
 import { resolvePackageRuntimePreflight } from "./update-command-service-plan.js";
 
@@ -11,7 +12,7 @@ vi.mock("../../../node-sqlite.mjs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../node-sqlite.mjs")>();
   return {
     ...actual,
-    detectCurrentSqliteCapabilities: () => ({
+    detectCurrentSqliteCapabilities: async () => ({
       available: true,
       version: "3.51.3",
       text: probeState.text,
@@ -24,9 +25,60 @@ vi.mock("../../../node-sqlite.mjs", async (importOriginal) => {
 describe("package runtime compatibility guidance", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
     probeState.text = true;
     vi.mocked(resolveNodeRuntimeInfo).mockReset();
   });
+
+  it.each([
+    [">=24.16.0 <25 || >=26.1.0", "24.16.0", "2026.9.4", "2026.9.4"],
+    [null, "unspecified", "2026.9.4", "2026.9.4"],
+    ["invalid", "unspecified", "2026.9.4", "2026.9.4"],
+    [">=24.16.0", "24.16.0", "2026.9.4-beta.1", "2026.9.4-beta.1"],
+    [">=24.16.0", "24.16.0", "2026.9.4-private-customer", "[redacted-version]"],
+  ] as const)(
+    "records inspected runtime facts for public refusal reports: %s / %s / %s",
+    async (nodeEngine, floor, version, publicVersion) => {
+      vi.mocked(resolveNodeRuntimeInfo).mockResolvedValue({
+        status: "probe-failed",
+        error: new Error("probe timed out"),
+      });
+      const runtime = await resolvePackageRuntimePreflight({
+        target: { version, nodeEngine },
+        nodeRunner: "/fixture/private/node",
+      });
+      expect(runtime).toMatchObject({
+        ok: false,
+        failureFacts: [{ check: "node-runtime", code: "node-runtime-preflight" }],
+      });
+      if (runtime.ok) {
+        throw new Error("Expected runtime refusal");
+      }
+      expect(runtime.failureFacts?.[0]?.message).toContain(`Target package: openclaw@${version}`);
+      const report = await prepareUpdateFailureReport({
+        attemptId: "runtime-refusal",
+        result: {
+          status: "error",
+          mode: "npm",
+          durationMs: 0,
+          steps: [
+            {
+              name: "node-runtime-preflight",
+              command: "",
+              cwd: "",
+              durationMs: 0,
+              exitCode: 1,
+              failureFacts: runtime.failureFacts,
+            },
+          ],
+        },
+      });
+      expect(report.body).not.toContain("private-customer");
+      expect(report.body).toContain(`Target package: openclaw@${publicVersion}`);
+      expect(report.body).toContain(`Minimum Node engine: ${floor}`);
+      expect(report.body).not.toContain("/fixture/private");
+    },
+  );
 
   it.each([false, true])(
     "admits only a compatible explicit replacement (fallback=%s)",
@@ -91,6 +143,14 @@ describe("package runtime compatibility guidance", () => {
       });
       expect(result).toEqual({
         ok: false,
+        failureFacts: [
+          {
+            check: "node-runtime",
+            code: "node-runtime-preflight",
+            affectedKey: "engines.node",
+            message: `Target package: openclaw@2026.9.3; Minimum Node engine: 24.16.0; Running Node: ${node}`,
+          },
+        ],
         error: [
           `Node ${node} is incompatible with openclaw@2026.9.3.`,
           `Node ${node}: node:sqlite truncates TEXT at embedded NUL (nodejs/node#61954); use 24.16+/26.1+ or a build with the fix`,
@@ -167,6 +227,58 @@ describe("package runtime compatibility guidance", () => {
   it("preserves an absent target", async () => {
     await expect(resolvePackageRuntimePreflight({})).resolves.toEqual({ ok: true, value: {} });
   });
+
+  it.each([
+    { timeoutMs: undefined, startupMs: 11_000, admitted: true },
+    { timeoutMs: 1_500_000, startupMs: 1_300_000, admitted: true },
+    { timeoutMs: 50, startupMs: 100, admitted: false },
+  ])(
+    "allows a slow selected Node within its owner budget $timeoutMs",
+    async ({ timeoutMs, startupMs, admitted }) => {
+      vi.useFakeTimers();
+      vi.mocked(resolveNodeRuntimeInfo).mockImplementation(async (_node, _env, allowance) => {
+        if (allowance === undefined) {
+          throw new Error("Runtime probe requires a finite allowance");
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, Math.min(startupMs, allowance));
+        });
+        return allowance < startupMs
+          ? { status: "probe-failed", error: new Error("runtime startup timed out") }
+          : {
+              status: "supported",
+              version: "24.19.0",
+              sqliteVersion: "3.51.3",
+              nodeSharedSqlite: false,
+              sqliteProbe: {
+                available: true,
+                version: "3.51.3",
+                text: true,
+                blob: true,
+                json: true,
+              },
+            };
+      });
+      const pending = resolvePackageRuntimePreflight({
+        target: { version: "2026.9.4", nodeEngine: ">=24.16.0" },
+        nodeRunner: "/fixture/bin/node",
+        timeoutMs,
+      });
+      await vi.advanceTimersByTimeAsync(startupMs);
+      const result = await pending;
+      if (admitted) {
+        expect(result).toEqual({
+          ok: true,
+          value: { nodeRunner: "/fixture/bin/node", targetVersion: "2026.9.4" },
+        });
+      } else {
+        expect(result).toMatchObject({
+          ok: false,
+          error: expect.stringContaining("runtime startup timed out"),
+        });
+      }
+    },
+  );
 
   it("refuses a failed recorded-runtime probe even with an unknown target engine", async () => {
     vi.mocked(resolveNodeRuntimeInfo).mockResolvedValue({

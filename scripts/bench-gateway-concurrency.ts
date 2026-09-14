@@ -3,6 +3,7 @@ import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "n
 import { randomUUID } from "node:crypto";
 import {
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -19,13 +20,29 @@ import { asFiniteNumber } from "../packages/normalization-core/src/number-coerci
 import { isRecord } from "../packages/normalization-core/src/record-coerce.ts";
 import { sliceUtf16Safe } from "../packages/normalization-core/src/utf16-slice.ts";
 import { applyMockOpenAiModelConfig } from "./e2e/lib/fixtures/mock-openai-config.mjs";
+import {
+  startGatewayBrowserProbe,
+  type BrowserSessionClick,
+  type BrowserSessionTarget,
+} from "./lib/gateway-bench-browser.ts";
 import { delay, stopChild } from "./lib/gateway-bench-child.ts";
 import {
-  controlGatewayHeapProfile,
+  type GatewayMemorySample,
+  type GatewayRpc,
+  getFreePort,
+  readGatewayMemory,
+  readProcessRssMb,
+} from "./lib/gateway-bench-probes.ts";
+import {
+  controlGatewayProfile,
+  measureGatewayCpuUsage,
+  readGatewayCpuProfile,
+  readGatewayCpuUsage,
   readGatewayHeapProfile,
   type GatewayHeapProfile,
-} from "./lib/gateway-bench-heap.ts";
-import { getFreePort, readProcessRssMb } from "./lib/gateway-bench-probes.ts";
+  type GatewayCpuProfile,
+  type GatewayCpuUsage,
+} from "./lib/gateway-bench-profile.ts";
 import {
   BASE_GATEWAY_BENCH_CONFIG,
   buildGatewayBenchChildArgs,
@@ -91,25 +108,35 @@ type FreshConnectionProbe = {
   ok: boolean;
 };
 
-type GatewayRpc = <T>(method: string, params: unknown, timeoutMs?: number) => Promise<T>;
-
-type GatewayMemorySample = {
-  atMs: number;
-  heapTotalMb: number;
-  heapUsedMb: number;
-  rssMb: number;
-};
-
 type GatewayChildExit = {
   atMonotonicMicros: number;
   exitCode: number | null;
   signal: string | null;
 };
 
+type MainProfileArtifacts = {
+  scope: "main-isolate";
+  workersManifestPath: string;
+};
+
 type BenchmarkRun = {
-  heapProfile?: GatewayHeapProfile;
+  browser?: {
+    newPageReadyMs: number;
+    initialSessionReadyMs: number | null;
+    historyMessagesPerTarget: number;
+    inventory: {
+      seededLoadSessions: number;
+      seededClickSessions: number;
+      unarchivedSessions: number;
+      retainedSessions: number;
+    };
+    clicks: BrowserSessionClick[];
+  };
+  heapProfile?: GatewayHeapProfile & MainProfileArtifacts;
+  loadCpuProfile?: GatewayCpuProfile & MainProfileArtifacts;
   controlPlane: Array<TimedProbe & { method: string }>;
   controlUi: ControlUiProbe[];
+  cpuUsage: GatewayCpuUsage;
   durationMs: number;
   freshConnection: FreshConnectionProbe;
   gatewayExit?: Awaited<ReturnType<typeof stopChild>>;
@@ -141,10 +168,13 @@ type BenchmarkRun = {
 };
 
 type CliOptions = {
+  browserHistoryMessages: number;
+  browserSessionClicks: number;
   cadenceMs: number;
   concurrency: number;
   controlPlane: boolean;
   cpuProfDir?: string;
+  loadCpuProfDir?: string;
   heapProfDir?: string;
   diagnosticsTimeline: boolean;
   entry: string;
@@ -157,6 +187,7 @@ type CliOptions = {
   maxHandshakeMs?: number;
   output?: string;
   pluginCount: number;
+  probeRounds?: number;
   runs: number;
   sessionCount: number;
   sessionUpdateClients: number;
@@ -165,6 +196,7 @@ type CliOptions = {
   subscribers: number;
   timeoutMs: number;
   toolEvents: boolean;
+  turnsPerSession: number;
   visibleObserver: boolean;
   warmup: number;
   workspaceFanout: boolean;
@@ -178,6 +210,7 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_WARMUP = 0;
 const MOCK_RESPONSE_CHUNK_DELAY_MS = 1_000;
 const MAX_CONCURRENCY = 64;
+const MAX_TURNS_PER_SESSION = 100;
 const MAX_PLUGIN_COUNT = 100;
 const MAX_SESSION_COUNT = 10_000;
 const MAX_SESSION_UPDATES = 100_000;
@@ -203,9 +236,12 @@ const BOOLEAN_FLAGS = new Set([
   "--workspace-fanout",
 ]);
 const VALUE_FLAGS = new Set([
+  "--browser-history-messages",
+  "--browser-session-clicks",
   "--cadence-ms",
   "--concurrency",
   "--cpu-prof-dir",
+  "--load-cpu-prof-dir",
   "--heap-prof-dir",
   "--entry",
   "--history-burst",
@@ -216,6 +252,7 @@ const VALUE_FLAGS = new Set([
   "--max-handshake-ms",
   "--output",
   "--plugin-count",
+  "--probe-rounds",
   "--runs",
   "--session-count",
   "--session-update-clients",
@@ -223,6 +260,7 @@ const VALUE_FLAGS = new Set([
   "--stream-chunk-delay-ms",
   "--subscribers",
   "--timeout-ms",
+  "--turns-per-session",
   "--warmup",
 ]);
 
@@ -255,6 +293,18 @@ function parseBoundedNonNegativeInt(
 function parseOptions(argv: string[] = process.argv.slice(2)): CliOptions {
   validateCliArgs(argv, { booleanFlags: BOOLEAN_FLAGS, valueFlags: VALUE_FLAGS });
   const options = {
+    browserHistoryMessages: parseBoundedPositiveInt(
+      parseFlagValue(argv, "--browser-history-messages"),
+      80,
+      "--browser-history-messages",
+      500,
+    ),
+    browserSessionClicks: parseBoundedNonNegativeInt(
+      parseFlagValue(argv, "--browser-session-clicks"),
+      0,
+      "--browser-session-clicks",
+      20,
+    ),
     cadenceMs: parseBoundedPositiveInt(
       parseFlagValue(argv, "--cadence-ms"),
       DEFAULT_CADENCE_MS,
@@ -269,6 +319,7 @@ function parseOptions(argv: string[] = process.argv.slice(2)): CliOptions {
     ),
     controlPlane: hasFlag(argv, "--control-plane"),
     cpuProfDir: resolveOutputPath(parseFlagValue(argv, "--cpu-prof-dir")),
+    loadCpuProfDir: resolveOutputPath(parseFlagValue(argv, "--load-cpu-prof-dir")),
     heapProfDir: resolveOutputPath(parseFlagValue(argv, "--heap-prof-dir")),
     diagnosticsTimeline: !hasFlag(argv, "--no-diagnostics-timeline"),
     entry: resolveEntry(parseFlagValue(argv, "--entry"), DEFAULT_ENTRY),
@@ -320,6 +371,15 @@ function parseOptions(argv: string[] = process.argv.slice(2)): CliOptions {
       "--plugin-count",
       MAX_PLUGIN_COUNT,
     ),
+    probeRounds:
+      parseFlagValue(argv, "--probe-rounds") === undefined
+        ? undefined
+        : parseBoundedPositiveInt(
+            parseFlagValue(argv, "--probe-rounds"),
+            1,
+            "--probe-rounds",
+            MAX_SAMPLES_PER_RUN,
+          ),
     runs: parseBoundedPositiveInt(parseFlagValue(argv, "--runs"), DEFAULT_RUNS, "--runs", MAX_RUNS),
     sessionCount: parseBoundedNonNegativeInt(
       parseFlagValue(argv, "--session-count"),
@@ -358,6 +418,12 @@ function parseOptions(argv: string[] = process.argv.slice(2)): CliOptions {
       10 * 60_000,
     ),
     toolEvents: hasFlag(argv, "--tool-events"),
+    turnsPerSession: parseBoundedPositiveInt(
+      parseFlagValue(argv, "--turns-per-session"),
+      1,
+      "--turns-per-session",
+      MAX_TURNS_PER_SESSION,
+    ),
     visibleObserver: hasFlag(argv, "--visible-observer"),
     warmup: parseBoundedNonNegativeInt(
       parseFlagValue(argv, "--warmup"),
@@ -367,8 +433,22 @@ function parseOptions(argv: string[] = process.argv.slice(2)): CliOptions {
     ),
     workspaceFanout: hasFlag(argv, "--workspace-fanout"),
   };
+  if (options.loadCpuProfDir && options.heapProfDir) {
+    throw new CliArgumentError(
+      "--load-cpu-prof-dir and --heap-prof-dir require separate benchmark runs",
+    );
+  }
   const historyMessageCount =
-    Math.max(options.sessionCount, options.concurrency) * options.historyMessages;
+    Math.max(options.sessionCount, options.concurrency) * options.historyMessages +
+    (options.browserSessionClicks > 0
+      ? (options.browserSessionClicks + 1) * options.browserHistoryMessages
+      : 0);
+  if (
+    options.probeRounds !== undefined &&
+    options.probeRounds * options.historyClients * options.historyBurst > MAX_SAMPLES_PER_RUN
+  ) {
+    throw new CliArgumentError("fixed history workload must not exceed 2048 requests per run");
+  }
   if (
     historyMessageCount > 100_000 ||
     historyMessageCount * options.historyMessageChars > 256 * 1024 * 1024
@@ -386,15 +466,20 @@ Usage:
   node scripts/bench-gateway-concurrency.ts [options]
 
 Options:
-  --concurrency <n>  Concurrent synthetic streaming turns (default: ${DEFAULT_CONCURRENCY})
+  --browser-history-messages <n> Messages per browser click target, independent of inventory history (default: 80, max: 500)
+  --browser-session-clicks <n> Click n existing sessions and revisit one during load (default: 0, max: 20; requires built UI and Chromium)
+  --concurrency <n>  Concurrent synthetic sessions (default: ${DEFAULT_CONCURRENCY})
+  --turns-per-session <n> Serial turns per session (default: 1, max: ${MAX_TURNS_PER_SESSION})
   --control-plane   Also probe tasks.list, cron.list, and cron.status during load
   --history-messages <n> Inject up to 500 synthetic messages per seeded session
   --history-message-chars <n> Synthetic message size (default: 1024, max: 65536)
   --cpu-prof-dir <p> Write Gateway V8 CPU profiles to this directory
-  --heap-prof-dir <p> Sample load-phase allocations, including GC-collected objects
+  --load-cpu-prof-dir <p> Capture load-phase main/Worker CPU over private IPC, including on Windows
+  --heap-prof-dir <p> Sample load-phase main/Worker allocations, including GC-collected objects
   --runs <n>         Measured gateway runs (default: ${DEFAULT_RUNS})
   --warmup <n>       Warmup gateway runs (default: ${DEFAULT_WARMUP})
   --cadence-ms <ms>  Probe cadence (default: ${DEFAULT_CADENCE_MS})
+  --probe-rounds <n> Run exactly n sampler rounds and n bursts per history client
   --timeout-ms <ms>  Per-run cap, excluding probe warmup (default: ${DEFAULT_TIMEOUT_MS})
   --entry <path>     Gateway CLI entry file (default: ${DEFAULT_ENTRY})
   --session-count <n> Seed up to ${MAX_SESSION_COUNT} distinct sessions before load
@@ -408,7 +493,7 @@ Options:
   --no-diagnostics-timeline Disable diagnostics timeline file writes
   --plugin-count <n> Configure synthetic plugins through plugins.load.paths (default: 0)
   --tool-events      Make every synthetic turn execute a tool before replying
-  --workspace-fanout Bind each turn to a distinct workspace
+  --workspace-fanout Bind each session to a distinct workspace
   --max-control-ms   Fail when any load-phase health/control probe exceeds this bound
   --max-handshake-ms Fail when a fresh authenticated connection exceeds this bound
   --output <path>    Write machine-readable JSON to a file
@@ -679,16 +764,27 @@ function buildConfig(
   mockPort: number,
   concurrency: number,
   pluginCount: number,
+  browserSessionClicks: number,
 ): string {
   const controlUiRoot = path.join(root, "control-ui");
   mkdirSync(controlUiRoot, { recursive: true });
   const checkoutIndex = path.join(process.cwd(), "ui", "index.html");
-  copyFileSync(
-    existsSync(checkoutIndex)
-      ? checkoutIndex
-      : path.join(process.cwd(), "dist", "control-ui", "index.html"),
-    path.join(controlUiRoot, "index.html"),
-  );
+  if (browserSessionClicks > 0) {
+    const builtUi = path.join(process.cwd(), "dist", "control-ui");
+    if (!existsSync(path.join(builtUi, "index.html"))) {
+      throw new Error(
+        "--browser-session-clicks requires built Control UI assets; run pnpm ui:build",
+      );
+    }
+    cpSync(builtUi, controlUiRoot, { recursive: true });
+  } else {
+    copyFileSync(
+      existsSync(checkoutIndex)
+        ? checkoutIndex
+        : path.join(process.cwd(), "dist", "control-ui", "index.html"),
+      path.join(controlUiRoot, "index.html"),
+    );
+  }
 
   const config = structuredClone(BASE_GATEWAY_BENCH_CONFIG) as Record<string, unknown>;
   config.gateway = {
@@ -700,6 +796,7 @@ function buildConfig(
   agents.defaults = {
     ...(agents.defaults as Record<string, unknown>),
     maxConcurrent: concurrency,
+    heartbeat: { every: "0m" },
     utilityModel: "openai/gpt-5.6-luna",
   };
   const pluginFixtures =
@@ -792,29 +889,6 @@ async function connectGateway(
   };
 }
 
-async function readGatewayMemory(
-  rpc: GatewayRpc,
-  runStartedAt: number,
-): Promise<GatewayMemorySample> {
-  const result = await rpc<{
-    processMemory?: { heapTotalBytes?: number; heapUsedBytes?: number; rssBytes?: number };
-  }>("status", { includeChannelSummary: false });
-  const memory = result.processMemory;
-  const heapTotalBytes = asFiniteNumber(memory?.heapTotalBytes);
-  const heapUsedBytes = asFiniteNumber(memory?.heapUsedBytes);
-  const rssBytes = asFiniteNumber(memory?.rssBytes);
-  if (heapTotalBytes === undefined || heapUsedBytes === undefined || rssBytes === undefined) {
-    throw new Error("Gateway status did not report process memory");
-  }
-  const toMb = (bytes: number) => bytes / 1024 / 1024;
-  return {
-    atMs: performance.now() - runStartedAt,
-    heapTotalMb: toMb(heapTotalBytes),
-    heapUsedMb: toMb(heapUsedBytes),
-    rssMb: toMb(rssBytes),
-  };
-}
-
 function readGatewayProcessRssMb(pid: number | undefined): number | null {
   if (!pid) {
     return null;
@@ -896,6 +970,27 @@ async function runTurn(
   if (completed.status !== "ok") {
     throw new Error(`agent ${index + 1} did not complete: ${JSON.stringify(completed)}`);
   }
+}
+
+async function runSessionTurns(
+  rpc: GatewayRpc,
+  index: number,
+  deadlineAt: number,
+  options: {
+    onStarted?: () => void;
+    sessionKey: string;
+    toolEvents: boolean;
+    turnsPerSession: number;
+  },
+): Promise<number> {
+  for (let turn = 0; turn < options.turnsPerSession; turn += 1) {
+    requireRemainingMs(deadlineAt, `starting session ${index + 1} turn ${turn + 1}`);
+    await runTurn(rpc, index * options.turnsPerSession + turn, deadlineAt, options.toolEvents, {
+      sessionKey: options.sessionKey,
+      onStarted: turn === 0 ? options.onStarted : undefined,
+    });
+  }
+  return options.turnsPerSession;
 }
 
 async function sampleGateway(params: {
@@ -1032,7 +1127,44 @@ async function warmGatewayProbes(params: {
   );
 }
 
+async function runProbeRounds(params: {
+  rounds?: number;
+  deadlineAt: number;
+  cadenceMs: number;
+  cadenceFrom: "start" | "completion";
+  runFirst: boolean;
+  shouldContinue: () => boolean;
+  stopped: () => boolean;
+  runRound: (index: number) => Promise<void>;
+}): Promise<number> {
+  let completed = 0;
+  const hasWork = () =>
+    !params.stopped() &&
+    (params.rounds === undefined
+      ? (completed === 0 && params.runFirst) || params.shouldContinue()
+      : completed < params.rounds);
+  while (hasWork()) {
+    requireRemainingMs(params.deadlineAt, "starting gateway probe round");
+    const startedAt = performance.now();
+    await params.runRound(completed);
+    completed += 1;
+    if (!hasWork()) {
+      break;
+    }
+    const elapsed = params.cadenceFrom === "start" ? performance.now() - startedAt : 0;
+    await delay(
+      Math.min(
+        Math.max(0, params.cadenceMs - elapsed),
+        requireRemainingMs(params.deadlineAt, "pacing gateway probes"),
+      ),
+    );
+  }
+  return completed;
+}
+
 async function runGatewaySample(options: {
+  browserHistoryMessages: number;
+  browserSessionClicks: number;
   cadenceMs: number;
   concurrency: number;
   controlPlane: boolean;
@@ -1040,12 +1172,14 @@ async function runGatewaySample(options: {
   diagnosticsTimeline: boolean;
   entry: string;
   cpuProfDir?: string;
+  loadCpuProfDir?: string;
   heapProfDir?: string;
   historyBurst: number;
   historyClients: number;
   historyMessages: number;
   historyMessageChars: number;
   pluginCount: number;
+  probeRounds?: number;
   sessionCount: number;
   sessionUpdateClients: number;
   sessionUpdates: number;
@@ -1053,6 +1187,7 @@ async function runGatewaySample(options: {
   subscribers: number;
   timeoutMs: number;
   toolEvents: boolean;
+  turnsPerSession: number;
   visibleObserver: boolean;
   workspaceFanout: boolean;
 }): Promise<BenchmarkRun> {
@@ -1064,11 +1199,17 @@ async function runGatewaySample(options: {
   const heapProfilePath = options.heapProfDir
     ? path.resolve(options.heapProfDir, `gateway-load-${randomUUID()}.heapprofile`)
     : undefined;
+  const loadCpuProfilePath = options.loadCpuProfDir
+    ? path.resolve(options.loadCpuProfDir, `gateway-load-${randomUUID()}.cpuprofile`)
+    : undefined;
   const protocolVersion = await readGatewayProtocolVersion(options.entry);
   let gateway: ChildProcess | undefined;
   let mockProvider: ChildProcessWithoutNullStreams | undefined;
   let client: Awaited<ReturnType<typeof connectGateway>> | undefined;
+  let browserProbe: Awaited<ReturnType<typeof startGatewayBrowserProbe>> | undefined;
   const auxiliaryClients: Array<Awaited<ReturnType<typeof connectGateway>>> = [];
+  let probesStopped = false;
+  const probeJobs: Promise<unknown>[] = [];
   let gatewayOutput = { readOutput: () => "", readStderrTail: () => "" };
   let mockOutput = { readOutput: () => "", readStderrTail: () => "" };
   let result: BenchmarkRun;
@@ -1086,7 +1227,13 @@ async function runGatewaySample(options: {
 
   try {
     try {
-      const configPath = buildConfig(root, mockPort, options.concurrency, options.pluginCount);
+      const configPath = buildConfig(
+        root,
+        mockPort,
+        options.concurrency,
+        options.pluginCount,
+        options.browserSessionClicks,
+      );
       mockProvider = spawn(process.execPath, ["scripts/e2e/mock-openai-server.mjs"], {
         cwd: process.cwd(),
         detached: process.platform !== "win32",
@@ -1106,12 +1253,16 @@ async function runGatewaySample(options: {
         mkdirSync(options.cpuProfDir, { recursive: true });
       }
       const gatewayArgs = buildGatewayBenchChildArgs(options.entry, port);
-      if (heapProfilePath) {
-        mkdirSync(path.dirname(heapProfilePath), { recursive: true });
-        gatewayArgs.unshift(
-          "--import",
-          new URL("./lib/gateway-bench-heap-preload.ts", import.meta.url).href,
-        );
+      gatewayArgs.unshift(
+        "--import",
+        new URL("./lib/gateway-bench-profile-preload.ts", import.meta.url).href,
+      );
+      if (heapProfilePath || loadCpuProfilePath) {
+        for (const profilePath of [heapProfilePath, loadCpuProfilePath]) {
+          if (profilePath) {
+            mkdirSync(path.dirname(profilePath), { recursive: true });
+          }
+        }
       }
       gateway = spawn(
         process.execPath,
@@ -1121,7 +1272,7 @@ async function runGatewaySample(options: {
         {
           cwd: process.cwd(),
           detached: process.platform !== "win32",
-          stdio: heapProfilePath ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
+          stdio: ["pipe", "pipe", "pipe", "ipc"],
           env: {
             ...createGatewayBenchEnv(root, configPath, {
               caseEnv: {
@@ -1189,6 +1340,7 @@ async function runGatewaySample(options: {
       client.setDeadlineAt(setupDeadlineAt);
       const sessionCount = Math.max(options.concurrency, options.sessionCount);
       const prepareSessions =
+        options.browserSessionClicks > 0 ||
         options.workspaceFanout ||
         options.sessionCount > 0 ||
         options.historyClients > 0 ||
@@ -1244,6 +1396,46 @@ async function runGatewaySample(options: {
         );
       }
       const sessionSeedDurationMs = performance.now() - sessionSeedStartedAt;
+      const browserTargets: BrowserSessionTarget[] = [];
+      const browserHistoryMessages = options.browserHistoryMessages;
+      if (options.browserSessionClicks > 0) {
+        for (let index = 0; index <= options.browserSessionClicks; index += 1) {
+          const target = {
+            key: `agent:main:sidebar-click-${index}`,
+            marker: `Sidebar click history ${index}.`,
+          };
+          await rpc("sessions.create", { key: target.key, agentId: "main" });
+          for (let message = 0; message < browserHistoryMessages; message += 1) {
+            const prefix = `## Synthetic message ${message + 1}\n\n${target.marker}\n\n`;
+            const messageText =
+              prefix +
+              "Synthetic **benchmark** paragraph. "
+                .repeat(Math.ceil(options.historyMessageChars / 35))
+                .slice(0, Math.max(0, options.historyMessageChars - prefix.length));
+            await rpc("chat.inject", { sessionKey: target.key, message: messageText });
+          }
+          browserTargets.push(target);
+        }
+        browserProbe = await startGatewayBrowserProbe({
+          port,
+          timeoutMs: requireRemainingMs(setupDeadlineAt, "opening browser"),
+          initial: browserTargets[0]!,
+          visibleSessions: options.concurrency + browserTargets.length,
+        });
+      }
+      let browserInventory: NonNullable<BenchmarkRun["browser"]>["inventory"] | undefined;
+      if (browserProbe) {
+        const [unarchived, retained] = await Promise.all([
+          rpc<{ totalCount: number }>("sessions.list", { limit: 1, archived: false }),
+          rpc<{ totalCount: number }>("sessions.list", { limit: 1, archived: "all" }),
+        ]);
+        browserInventory = {
+          seededLoadSessions: sessionCount,
+          seededClickSessions: browserTargets.length,
+          unarchivedSessions: unarchived.totalCount,
+          retainedSessions: retained.totalCount,
+        };
+      }
       // Normal inventory maintenance can archive older fixture sessions while seeding.
       // Active turns and observers use the newest sessions; history still spans the inventory.
       const turnSessionKeys = sessionKeys.slice(-options.concurrency);
@@ -1295,8 +1487,15 @@ async function runGatewaySample(options: {
         auxiliaryClients.push(subscriptionProbeClient);
       }
       const memoryBefore = await readGatewayMemory(rpc, runStartedAt);
+      if (loadCpuProfilePath) {
+        await controlGatewayProfile(gateway, "cpu", "start", loadCpuProfilePath, {
+          includeWorkers: true,
+        });
+      }
       if (heapProfilePath) {
-        await controlGatewayHeapProfile(gateway, "start", heapProfilePath);
+        await controlGatewayProfile(gateway, "heap", "start", heapProfilePath, {
+          includeWorkers: true,
+        });
       }
       const setupDurationMs = performance.now() - setupStartedAt;
       // Large session fixtures are setup, not benchmarked load. Every measured
@@ -1317,27 +1516,31 @@ async function runGatewaySample(options: {
       let lastRssSampleAt = performance.now();
       let turnsDone = false;
       let updatesDone = options.sessionUpdates === 0;
-      const workloadDone = () => turnsDone && updatesDone;
+      let browserDone = !browserProbe;
+      const workloadDone = () => turnsDone && updatesDone && browserDone;
       let startedTurnCount = 0;
       let resolveAllTurnsStarted!: () => void;
       const allTurnsStarted = new Promise<void>((resolve) => {
         resolveAllTurnsStarted = resolve;
       });
+      const cpuBefore = await readGatewayCpuUsage(gateway);
       const turnsStartedAt = performance.now();
       // Keep the live artifact intact: buffered setup writes can arrive after this boundary.
       // Inclusive millisecond timestamps conservatively include events on the boundary.
       const timelineFrom = Date.now();
       const loadStartMonotonicMicros = Number(process.hrtime.bigint() / 1_000n);
       const turns = Promise.all(
-        Array.from({ length: options.concurrency }, (_, index) =>
-          runTurn(rpc, index, loadDeadlineAt, options.toolEvents, {
+        turnSessionKeys.map((sessionKey, index) =>
+          runSessionTurns(rpc, index, loadDeadlineAt, {
             onStarted: () => {
               startedTurnCount += 1;
               if (startedTurnCount === options.concurrency) {
                 resolveAllTurnsStarted();
               }
             },
-            ...(turnSessionKeys[index] ? { sessionKey: turnSessionKeys[index] } : {}),
+            sessionKey,
+            toolEvents: options.toolEvents,
+            turnsPerSession: options.turnsPerSession,
           }),
         ),
       ).finally(() => {
@@ -1358,9 +1561,37 @@ async function runGatewaySample(options: {
           };
         }
       });
-      const sampler = (async () => {
-        for (;;) {
-          const sampleStartedAt = performance.now();
+      const browserClicks = allTurnsStarted.then(async (): Promise<BrowserSessionClick[]> => {
+        try {
+          if (!browserProbe) {
+            return [];
+          }
+          const clicks: BrowserSessionClick[] = [];
+          const targets = [...browserTargets.slice(1), browserTargets.at(-2)!];
+          for (const [index, target] of targets.entries()) {
+            clicks.push(
+              await browserProbe.click(
+                target,
+                index === targets.length - 1,
+                () => !turnsDone,
+                Math.min(30_000, requireRemainingMs(loadDeadlineAt, "clicking sidebar session")),
+              ),
+            );
+          }
+          return clicks;
+        } finally {
+          browserDone = true;
+        }
+      });
+      const sampler = runProbeRounds({
+        rounds: options.probeRounds,
+        deadlineAt: loadDeadlineAt,
+        cadenceMs: options.cadenceMs,
+        cadenceFrom: "start",
+        runFirst: true,
+        shouldContinue: () => !workloadDone() && readyz.length < MAX_SAMPLES_PER_RUN,
+        stopped: () => probesStopped,
+        runRound: async () => {
           const subscriptionKey = turnSessionKeys[readyz.length % turnSessionKeys.length];
           const [sample, subscription, controlProbes] = await Promise.all([
             sampleGateway({
@@ -1403,37 +1634,37 @@ async function runGatewaySample(options: {
             peakRssMb = Math.max(peakRssMb, readGatewayProcessRssMb(gateway?.pid) ?? 0);
             lastRssSampleAt = performance.now();
           }
-          if (workloadDone() || readyz.length >= MAX_SAMPLES_PER_RUN) {
-            break;
-          }
-          await delay(
-            Math.min(
-              Math.max(0, options.cadenceMs - (performance.now() - sampleStartedAt)),
-              requireRemainingMs(loadDeadlineAt, "sampling gateway load"),
-            ),
-          );
-        }
-      })();
+        },
+      });
+      probeJobs.push(sampler);
       const historyLoad = Promise.all(
-        historyClients.map(async (historyClient, clientIndex) => {
+        historyClients.map((historyClient, clientIndex) => {
           let offset = clientIndex * options.historyBurst;
-          while (!workloadDone() && history.length < MAX_SAMPLES_PER_RUN) {
-            const probes = await Promise.all(
-              Array.from({ length: options.historyBurst }, (_, index) =>
-                timeRpcProbe(
-                  historyClient.request,
-                  "chat.history",
-                  { sessionKey: sessionKeys[(offset + index) % sessionKeys.length] },
-                  runStartedAt,
+          const job = runProbeRounds({
+            rounds: options.probeRounds,
+            deadlineAt: loadDeadlineAt,
+            cadenceMs: options.cadenceMs,
+            cadenceFrom: "completion",
+            runFirst: false,
+            shouldContinue: () => !workloadDone() && history.length < MAX_SAMPLES_PER_RUN,
+            stopped: () => probesStopped,
+            runRound: async () => {
+              const probes = await Promise.all(
+                Array.from({ length: options.historyBurst }, (_, index) =>
+                  timeRpcProbe(
+                    historyClient.request,
+                    "chat.history",
+                    { sessionKey: sessionKeys[(offset + index) % sessionKeys.length] },
+                    runStartedAt,
+                  ),
                 ),
-              ),
-            );
-            history.push(...probes);
-            offset += options.historyBurst;
-            if (!workloadDone()) {
-              await delay(Math.min(options.cadenceMs, remainingMs(loadDeadlineAt)));
-            }
-          }
+              );
+              history.push(...probes);
+              offset += options.historyBurst;
+            },
+          });
+          probeJobs.push(job);
+          return job;
         }),
       );
       let nextUpdateIndex = 0;
@@ -1460,21 +1691,36 @@ async function runGatewaySample(options: {
       ).finally(() => {
         updatesDone = true;
       });
-      const [freshConnectionResult] = await Promise.all([
+      const [freshConnectionResult, sessionTurnCounts, browserClickResults] = await Promise.all([
         freshConnection,
         turns,
+        browserClicks,
         sampler,
         historyLoad,
         sessionUpdateLoad,
       ]);
+      const cpuAfter = await readGatewayCpuUsage(gateway);
       const loadEndMonotonicMicros = Number(process.hrtime.bigint() / 1_000n);
       const turnsDurationMs = performance.now() - turnsStartedAt;
       const memoryAfter = await readGatewayMemory(rpc, runStartedAt);
       timelineWindow = { from: timelineFrom, through: Date.now() };
-      let heapProfile: GatewayHeapProfile | undefined;
+      let loadCpuProfile: BenchmarkRun["loadCpuProfile"];
+      if (loadCpuProfilePath) {
+        await controlGatewayProfile(gateway, "cpu", "stop", loadCpuProfilePath);
+        loadCpuProfile = {
+          ...readGatewayCpuProfile(loadCpuProfilePath),
+          scope: "main-isolate",
+          workersManifestPath: `${loadCpuProfilePath}.workers.json`,
+        };
+      }
+      let heapProfile: BenchmarkRun["heapProfile"];
       if (heapProfilePath) {
-        await controlGatewayHeapProfile(gateway, "stop", heapProfilePath);
-        heapProfile = readGatewayHeapProfile(heapProfilePath);
+        await controlGatewayProfile(gateway, "heap", "stop", heapProfilePath);
+        heapProfile = {
+          ...readGatewayHeapProfile(heapProfilePath),
+          scope: "main-isolate",
+          workersManifestPath: `${heapProfilePath}.workers.json`,
+        };
       }
       if (options.historyClients > 0 && !history.some((sample) => sample.ok)) {
         const failure = history[0]?.error ?? "no requests completed before turns finished";
@@ -1486,9 +1732,22 @@ async function runGatewaySample(options: {
         : 0;
 
       result = {
+        ...(browserProbe && browserInventory
+          ? {
+              browser: {
+                newPageReadyMs: browserProbe.newPageReadyMs,
+                initialSessionReadyMs: browserProbe.initialSessionReadyMs,
+                historyMessagesPerTarget: browserHistoryMessages,
+                inventory: browserInventory,
+                clicks: browserClickResults,
+              },
+            }
+          : {}),
         ...(heapProfile ? { heapProfile } : {}),
+        ...(loadCpuProfile ? { loadCpuProfile } : {}),
         controlPlane,
         controlUi,
+        cpuUsage: measureGatewayCpuUsage(cpuBefore, cpuAfter),
         durationMs: performance.now() - runStartedAt,
         freshConnection: freshConnectionResult,
         history,
@@ -1507,29 +1766,37 @@ async function runGatewaySample(options: {
         sessionsList,
         sessionUpdates,
         setupDurationMs,
-        turnCount: options.concurrency,
+        turnCount: sessionTurnCounts.reduce((sum, count) => sum + count, 0),
         turnsDurationMs,
       };
     } catch (error) {
       const detail = formatRunFailure(error, gatewayOutput, mockOutput);
       throw new Error(detail, { cause: error });
     } finally {
-      for (const auxiliaryClient of auxiliaryClients) {
-        auxiliaryClient.close();
-      }
-      client?.close();
-      if (gateway) {
-        if (options.cpuProfDir && gateway.exitCode === null && gateway.signalCode === null) {
-          // V8 flushes the main-isolate CPU profile on its normal interrupt path.
-          const profileFlushed = new Promise<void>((resolve) => {
-            gateway!.once("exit", () => {
-              resolve();
-            });
-          });
-          gateway.kill("SIGINT");
-          await Promise.race([profileFlushed, delay(2_000)]);
+      probesStopped = true;
+      try {
+        await browserProbe?.close();
+      } finally {
+        for (const auxiliaryClient of auxiliaryClients) {
+          auxiliaryClient.close();
         }
-        gatewayExit = await stopChild(gateway);
+        client?.close();
+        if (gateway) {
+          if (options.cpuProfDir && gateway.exitCode === null && gateway.signalCode === null) {
+            // V8 flushes the main-isolate CPU profile on its normal interrupt path.
+            const profileFlushed = new Promise<void>((resolve) => {
+              gateway!.once("exit", () => {
+                resolve();
+              });
+            });
+            gateway.kill("SIGINT");
+            await Promise.race([profileFlushed, delay(2_000)]);
+          }
+          gatewayExit = await stopChild(gateway);
+        }
+        // A fatal turn may end Promise.all before fixed probe rounds settle.
+        // Join their closed-client failures before removing the fixture state.
+        await Promise.allSettled(probeJobs);
       }
     }
     if (options.diagnosticsTimeline) {
@@ -1572,6 +1839,7 @@ function summarizeRuns(
   options: Pick<CliOptions, "maxControlMs" | "maxHandshakeMs"> = {},
 ) {
   const controlPlane = runs.flatMap((run) => run.controlPlane);
+  const browserClicks = runs.flatMap((run) => run.browser?.clicks ?? []);
   const controlUi = runs.flatMap((run) => run.controlUi);
   const readyz = runs.flatMap((run) => run.readyz);
   const sessionsList = runs.flatMap((run) => run.sessionsList);
@@ -1622,8 +1890,41 @@ function summarizeRuns(
         ]
       : [];
   });
+  for (const sample of browserClicks) {
+    if (sample.error) {
+      budgetViolations.push(`Browser session ${sample.sessionKey} failed: ${sample.error}`);
+    }
+  }
   return {
+    ...(browserClicks.length > 0
+      ? {
+          browserSessionClicks: {
+            failedSamples: browserClicks.filter((sample) => sample.error !== null).length,
+            samplesOutsideActiveLoad: browserClicks.filter(
+              (sample) => !sample.activeLoadAtStart || !sample.activeLoadAtFinish,
+            ).length,
+            firstVisitReadyMs: summarizeNumbers(
+              browserClicks.flatMap((sample) =>
+                !sample.revisit && sample.readyMs !== null ? [sample.readyMs] : [],
+              ),
+            ),
+            revisitReadyMs: summarizeNumbers(
+              browserClicks.flatMap((sample) =>
+                sample.revisit && sample.readyMs !== null ? [sample.readyMs] : [],
+              ),
+            ),
+          },
+        }
+      : {}),
     budgetViolations,
+    gatewayProcessCpuMs: summarizeNumbers(runs.map((run) => run.cpuUsage.process.totalMs)),
+    gatewayProcessCpuMsPerTurn: summarizeNumbers(
+      runs.map((run) => run.cpuUsage.process.totalMs / run.turnCount),
+    ),
+    gatewayMainThreadCpuMs: summarizeNumbers(runs.map((run) => run.cpuUsage.mainThread.totalMs)),
+    gatewayProcessCpuCoreRatio: summarizeNumbers(
+      runs.map((run) => run.cpuUsage.process.totalMs / run.cpuUsage.wallMs),
+    ),
     gatewaySampledAllocatedBytes: summarizeNumbers(
       runs.flatMap((run) => (run.heapProfile ? [run.heapProfile.sampledAllocatedBytes] : [])),
     ),
@@ -1662,6 +1963,30 @@ function summarizeRuns(
       (run) =>
         run.gatewayExit && (run.gatewayExit.exitCode !== 0 || run.gatewayExit.signal !== null),
     ).length,
+    gatewayExternalGrowthMb: summarizeNumbers(
+      runs.flatMap((run) => {
+        const before = run.memory.before.externalMb;
+        const after = run.memory.after.externalMb;
+        return before === undefined || after === undefined ? [] : [after - before];
+      }),
+    ),
+    gatewayExternalMb: summarizeNumbers(
+      runs.flatMap((run) =>
+        run.memory.after.externalMb === undefined ? [] : [run.memory.after.externalMb],
+      ),
+    ),
+    gatewayArrayBuffersGrowthMb: summarizeNumbers(
+      runs.flatMap((run) => {
+        const before = run.memory.before.arrayBuffersMb;
+        const after = run.memory.after.arrayBuffersMb;
+        return before === undefined || after === undefined ? [] : [after - before];
+      }),
+    ),
+    gatewayArrayBuffersMb: summarizeNumbers(
+      runs.flatMap((run) =>
+        run.memory.after.arrayBuffersMb === undefined ? [] : [run.memory.after.arrayBuffersMb],
+      ),
+    ),
     gatewayHeapGrowthMb: summarizeNumbers(
       runs.map((run) => run.memory.after.heapUsedMb - run.memory.before.heapUsedMb),
     ),
@@ -1696,6 +2021,7 @@ function summarizeRuns(
     sessionUpdateLatencyMs: summarizeNumbers(sessionUpdates.map((sample) => sample.latencyMs)),
     sessionUpdateSampleCount: sessionUpdates.length,
     setupDurationMs: summarizeNumbers(runs.map((run) => run.setupDurationMs)),
+    turnCount: runs.reduce((sum, run) => sum + run.turnCount, 0),
     turnsDurationMs: summarizeNumbers(runs.map((run) => run.turnsDurationMs)),
   };
 }
@@ -1738,6 +2064,8 @@ async function main(): Promise<void> {
   const options = parseOptions(argv);
   const runs = await runBenchmarkSamples({ onProgress: console.error, options });
   const payload = {
+    browserHistoryMessages: options.browserHistoryMessages,
+    browserSessionClicks: options.browserSessionClicks,
     cadenceMs: options.cadenceMs,
     concurrency: options.concurrency,
     controlPlane: options.controlPlane,
@@ -1750,6 +2078,15 @@ async function main(): Promise<void> {
     historyClients: options.historyClients,
     mode: "mock-streaming-agent",
     pluginCount: options.pluginCount,
+    probeWorkload: {
+      mode: options.probeRounds === undefined ? "adaptive" : "fixed-rounds",
+      samplerRoundsPerRun: options.probeRounds ?? null,
+      historyRequestsPerRun:
+        options.probeRounds === undefined
+          ? null
+          : options.probeRounds * options.historyClients * options.historyBurst,
+      peakRssSampling: "sampler-rounds-and-final-memory",
+    },
     runs,
     sessionCount: Math.max(options.sessionCount, options.concurrency),
     sessionUpdateClients: options.sessionUpdates > 0 ? options.sessionUpdateClients : 0,
@@ -1758,6 +2095,7 @@ async function main(): Promise<void> {
     subscribers: options.subscribers,
     summary: summarizeRuns(runs, options),
     toolEvents: options.toolEvents,
+    turnsPerSession: options.turnsPerSession,
     visibleObserver: options.visibleObserver,
     workspaceFanout: options.workspaceFanout,
   };
@@ -1779,6 +2117,8 @@ export const testing = {
   formatRunFailure,
   requestHttp,
   runBenchmarkSamples,
+  runProbeRounds,
+  runSessionTurns,
   runTurn,
   sampleGateway,
   readDiagnosticsTimelineSpans,

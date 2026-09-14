@@ -3,16 +3,14 @@ import {
   asPositiveFiniteNumber,
 } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import {
-  countActiveDescendantRuns,
-  getSessionDisplaySubagentRunByChildSessionKey,
-} from "../agents/subagents/registry/subagent-registry-read.js";
+import { buildSubagentSessionListReadIndex } from "../agents/subagents/registry/subagent-registry-read.js";
 import {
   RECENT_ENDED_SUBAGENT_CHILD_SESSION_MS,
   shouldKeepSubagentRunChildLink,
 } from "../agents/subagents/registry/subagent-run-liveness.js";
 import { isTerminalSessionStatus, type SessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { runSynchronousWork, type SynchronousWork } from "../shared/synchronous-work.js";
 import {
   estimateAggregateUsageCost,
   type ModelCostConfig,
@@ -68,72 +66,51 @@ export function resolvePositiveNumber(value: number | null | undefined): number 
 
 type SessionCompactionCheckpointEntry = NonNullable<SessionEntry["compactionCheckpoints"]>[number];
 
-function isProjectableCompactionCheckpoint(
-  value: unknown,
-): value is SessionCompactionCheckpointEntry {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const checkpoint = value as {
-    checkpointId?: unknown;
-    createdAt?: unknown;
-    reason?: unknown;
-  };
-  return (
-    Boolean(normalizeOptionalString(checkpoint.checkpointId)) &&
-    typeof checkpoint.createdAt === "number" &&
-    Number.isFinite(checkpoint.createdAt) &&
-    (checkpoint.reason === "manual" ||
-      checkpoint.reason === "auto-threshold" ||
-      checkpoint.reason === "overflow-retry" ||
-      checkpoint.reason === "timeout-retry")
-  );
-}
-
-export function resolveProjectableCompactionCheckpoints(
+export function resolveSessionCompactionSummary(
   entry?: Pick<SessionEntry, "compactionCheckpoints"> | null,
-): SessionCompactionCheckpointEntry[] {
+): Pick<GatewaySessionRow, "compactionCheckpointCount" | "latestCompactionCheckpoint"> {
   const checkpoints = entry?.compactionCheckpoints;
-  if (!Array.isArray(checkpoints) || checkpoints.length === 0) {
-    return [];
+  if (!Array.isArray(checkpoints)) {
+    return {};
   }
-  return checkpoints.filter(isProjectableCompactionCheckpoint);
-}
-
-export function resolveLatestCompactionCheckpoint(
-  checkpoints: readonly SessionCompactionCheckpointEntry[],
-): SessionCompactionCheckpointEntry | undefined {
-  return checkpoints.reduce<SessionCompactionCheckpointEntry | undefined>(
-    (latest, checkpoint) =>
-      !latest || checkpoint.createdAt > latest.createdAt ? checkpoint : latest,
-    undefined,
-  );
-}
-
-export function buildCompactionCheckpointPreview(
-  checkpoint: SessionCompactionCheckpointEntry | undefined,
-): GatewaySessionRow["latestCompactionCheckpoint"] {
-  if (!checkpoint) {
-    return undefined;
-  }
-  const checkpointId = normalizeOptionalString(checkpoint.checkpointId);
-  const createdAt = checkpoint.createdAt;
-  const reason = checkpoint.reason;
-  if (!checkpointId || typeof createdAt !== "number" || !Number.isFinite(createdAt)) {
-    return undefined;
-  }
-  if (
-    reason !== "manual" &&
-    reason !== "auto-threshold" &&
-    reason !== "overflow-retry" &&
-    reason !== "timeout-retry"
-  ) {
-    return undefined;
+  let compactionCheckpointCount = 0;
+  let latest: SessionCompactionCheckpointEntry | undefined;
+  for (const value of checkpoints) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      continue;
+    }
+    const checkpoint = value as {
+      checkpointId?: unknown;
+      createdAt?: unknown;
+      reason?: unknown;
+    };
+    const checkpointId = normalizeOptionalString(checkpoint.checkpointId);
+    const { createdAt, reason } = checkpoint;
+    if (
+      !checkpointId ||
+      typeof createdAt !== "number" ||
+      !Number.isFinite(createdAt) ||
+      (reason !== "manual" &&
+        reason !== "auto-threshold" &&
+        reason !== "overflow-retry" &&
+        reason !== "timeout-retry")
+    ) {
+      continue;
+    }
+    compactionCheckpointCount += 1;
+    if (!latest || createdAt > latest.createdAt) {
+      latest = value;
+    }
   }
   return {
-    checkpointId,
-    createdAt,
-    reason,
+    compactionCheckpointCount,
+    latestCompactionCheckpoint: latest
+      ? {
+          checkpointId: latest.checkpointId.trim(),
+          createdAt: latest.createdAt,
+          reason: latest.reason,
+        }
+      : undefined,
   };
 }
 
@@ -234,17 +211,13 @@ export function resolveSessionChildOwners(params: {
   key: string;
   entry: SessionEntry;
   now: number;
-  subagentRuns?: SessionListRowContext["subagentRuns"];
+  subagentRuns: SessionListRowContext["subagentRuns"];
 }): string[] {
   const { key, entry, now, subagentRuns } = params;
-  const latest = subagentRuns
-    ? subagentRuns.getDisplaySubagentRun(key)
-    : getSessionDisplaySubagentRunByChildSessionKey(key);
+  const latest = subagentRuns.getDisplaySubagentRun(key);
   const keep = latest
     ? shouldKeepSubagentRunChildLink(latest, {
-        activeDescendants: subagentRuns
-          ? subagentRuns.countActiveDescendantRuns(key)
-          : countActiveDescendantRuns(key),
+        activeDescendants: subagentRuns.countActiveDescendantRuns(key),
         now,
       })
     : shouldKeepStoreOnlyChildLink(entry, now);
@@ -275,13 +248,24 @@ export function buildStoreChildSessionIndex(params: {
   subagentRuns?: SessionListRowContext["subagentRuns"];
   excludedChildKeys?: ReadonlySet<string>;
 }): Map<string, string[]> {
+  return runSynchronousWork(buildStoreChildSessionIndexWork(params));
+}
+
+export function* buildStoreChildSessionIndexWork(
+  params: Parameters<typeof buildStoreChildSessionIndex>[0],
+  shouldYield?: () => boolean,
+): SynchronousWork<Map<string, string[]>> {
   const children = new Map<string, string[]>();
   if (params.keys.length === 0) {
     return children;
   }
+  const subagentRuns = params.subagentRuns ?? buildSubagentSessionListReadIndex(params.now);
   const parents = new Set(params.keys);
   // One store pass discovers both persisted navigation and runtime-only controller links.
   for (const key of Object.keys(params.store)) {
+    if (shouldYield?.()) {
+      yield;
+    }
     const entry = params.store[key];
     if (!entry || params.excludedChildKeys?.has(key)) {
       continue;
@@ -290,7 +274,7 @@ export function buildStoreChildSessionIndex(params: {
       key,
       entry,
       now: params.now,
-      subagentRuns: params.subagentRuns,
+      subagentRuns,
     })) {
       if (parents.has(owner)) {
         const siblings = children.get(owner) ?? [];

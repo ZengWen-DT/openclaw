@@ -8,6 +8,7 @@ import {
   createConfiguredGatewayLocalProbe,
   type ConfiguredGatewayLocalProbe,
 } from "../../gateway/local-http-probe.js";
+import { readGatewayOwnerLease } from "../../infra/gateway-owner-lease.js";
 import { classifyPortListener } from "../../infra/ports-format.js";
 import { inspectPortUsage } from "../../infra/ports-inspect.js";
 import type { PortUsage } from "../../infra/ports-types.js";
@@ -94,13 +95,18 @@ export async function inspectGatewayRestart(params: {
   expectedVersion?: string | null;
   expectedBuildId?: string | null;
   requirePluginHealth?: boolean;
-  includeUnknownListenersAsStale?: boolean;
   probeContext?: GatewayRestartProbeContext;
   configuredProbe?: ConfiguredGatewayLocalProbe;
   probeHosts?: readonly string[];
   signal?: AbortSignal;
+  timeoutMs?: number;
 }): Promise<GatewayRestartSnapshot> {
   params.signal?.throwIfAborted();
+  const startedAtMs = performance.now();
+  const remainingTimeoutMs = () =>
+    params.timeoutMs === undefined
+      ? undefined
+      : Math.max(1, params.timeoutMs - (performance.now() - startedAtMs));
   const env = params.env ?? process.env;
   const probeHosts =
     params.probeHosts ??
@@ -125,6 +131,7 @@ export async function inspectGatewayRestart(params: {
         ...params.probeContext,
         ...(params.configuredProbe ? { configuredProbe: params.configuredProbe } : {}),
         env,
+        timeoutMs: remainingTimeoutMs(),
         ...(params.signal ? { signal: params.signal } : {}),
       });
       probeError = reachability.probeError;
@@ -134,9 +141,12 @@ export async function inspectGatewayRestart(params: {
     }
     return reachability;
   };
-  let runtime: GatewayServiceRuntime = { status: "unknown" };
+  let runtime: GatewayServiceRuntime;
   try {
-    runtime = await params.service.readRuntime(env);
+    runtime =
+      params.timeoutMs === undefined
+        ? await params.service.readRuntime(env)
+        : await params.service.readRuntime(env, { timeoutMs: remainingTimeoutMs() });
   } catch (err) {
     runtime = { status: "unknown", detail: String(err) };
   }
@@ -193,16 +203,6 @@ export async function inspectGatewayRestart(params: {
           (listener) => classifyPortListener(listener, params.port) === "gateway",
         )
       : [];
-  const fallbackListenerPids =
-    params.includeUnknownListenersAsStale &&
-    process.platform === "win32" &&
-    runtime.status !== "running" &&
-    portUsage.status === "busy"
-      ? portUsage.listeners
-          .filter((listener) => classifyPortListener(listener, params.port) === "unknown")
-          .map((listener) => listener.pid)
-          .filter((pid): pid is number => Number.isFinite(pid))
-      : [];
   const running = runtime.status === "running";
   const runtimePid = runtime.pid;
   const listenerAttributionGap = hasListenerAttributionGap(portUsage);
@@ -230,25 +230,25 @@ export async function inspectGatewayRestart(params: {
     gatewayVersion = reachable.gatewayVersion;
     gatewayBuildId = reachable.gatewayBuildId;
   }
-  const staleGatewayPids = Array.from(
-    new Set([
-      ...gatewayListeners
-        .filter((listener) => Number.isFinite(listener.pid))
-        .filter((listener) => {
-          if (!running) {
-            return true;
-          }
-          if (runtimePid == null) {
-            return false;
-          }
-          return !listenerOwnedByRuntimePid({ listener, runtimePid });
-        })
-        .map((listener) => listener.pid as number),
-      ...fallbackListenerPids.filter(
-        (pid) => runtime.pid == null || pid !== runtime.pid || !running,
-      ),
-    ]),
-  );
+  // Read after probes: an owner can acquire the coordinator while health is unavailable.
+  const owner =
+    portUsage.status === "busy" ? readGatewayOwnerLease({ env, port: params.port }) : undefined;
+  // A recorded owner is never stale by PID inference; other listeners are foreign.
+  // 2026.9.3 Gateways have no row and retain the installed-runtime ownership path.
+  const staleGatewayPids = owner
+    ? []
+    : Array.from(
+        new Set(
+          gatewayListeners.flatMap((listener) =>
+            typeof listener.pid === "number" &&
+            Number.isFinite(listener.pid) &&
+            (!running ||
+              (runtimePid != null && !listenerOwnedByRuntimePid({ listener, runtimePid })))
+              ? [listener.pid]
+              : [],
+          ),
+        ),
+      );
 
   return finalizeGatewayRestartSnapshot(
     {
@@ -317,7 +317,6 @@ export async function waitForGatewayHealthyRestart(params: {
   env?: NodeJS.ProcessEnv;
   expectedVersion?: string | null;
   expectedBuildId?: string | null;
-  includeUnknownListenersAsStale?: boolean;
   requireRunningService?: boolean;
   requirePluginHealth?: boolean;
   supervisorKeepsAlive?: boolean;
@@ -332,6 +331,10 @@ export async function waitForGatewayHealthyRestart(params: {
   const settleProbes = Math.max(1, params.settle?.probes ?? 1);
   const settleDurationMs = (settleProbes - 1) * delayMs;
   const standardDeadlineMs = params.timeoutMs ?? attempts * delayMs;
+  const probeTimeoutMs = () =>
+    params.timeoutMs === undefined
+      ? undefined
+      : Math.max(1, params.timeoutMs + settleDurationMs - (performance.now() - startedAtMs));
   const updateInProgress = (params.env ?? process.env).OPENCLAW_UPDATE_IN_PROGRESS === "1";
 
   const probeContext = await resolveGatewayRestartProbeContext(params.env).catch(() => ({
@@ -352,10 +355,10 @@ export async function waitForGatewayHealthyRestart(params: {
     expectedVersion: params.expectedVersion,
     expectedBuildId: params.expectedBuildId,
     requirePluginHealth: params.requirePluginHealth,
-    includeUnknownListenersAsStale: params.includeUnknownListenersAsStale,
     probeContext,
     configuredProbe,
     probeHosts,
+    timeoutMs: probeTimeoutMs(),
     ...(params.signal ? { signal: params.signal } : {}),
   });
 
@@ -371,6 +374,7 @@ export async function waitForGatewayHealthyRestart(params: {
   let nextMigrationActivityPollMs = 0;
   let healthyStreak: { snapshot: GatewayRestartSnapshot; probes: number } | undefined;
   let updateStartupDeadlineMs: number | undefined;
+  let observedOwner: string | undefined;
 
   for (let attempt = 0; ; attempt += 1) {
     params.signal?.throwIfAborted();
@@ -431,9 +435,20 @@ export async function waitForGatewayHealthyRestart(params: {
     if (snapshot.staleGatewayPids.length > 0 && snapshot.runtime.status !== "running") {
       return withWaitContext(snapshot, "stale-pids", elapsedMs);
     }
-    // launchd KeepAlive can report a transient stopped state while its throttle window runs.
-    // Let the bounded standard deadline decide failure when the caller knows supervision persists.
+    const stoppedFree =
+      snapshot.runtime.status === "stopped" && snapshot.portUsage.status === "free";
+    const owner = stoppedFree
+      ? readGatewayOwnerLease({ env: params.env, port: params.port })
+      : undefined;
+    if (owner && owner.state !== "dead") {
+      observedOwner = owner.owner;
+    } else if (owner?.state === "dead" && owner.owner === observedOwner) {
+      return withWaitContext(snapshot, "stopped-free", elapsedMs);
+    }
+    // A previous crashed owner cannot describe replacement startup. Keep native
+    // startup grace for it and for published 2026.9.3 processes without owner rows.
     if (
+      (!owner || owner.state === "dead") &&
       !params.supervisorKeepsAlive &&
       shouldEarlyExitStoppedFree(snapshot, attempt, minAttemptForEarlyExit)
     ) {
@@ -441,7 +456,7 @@ export async function waitForGatewayHealthyRestart(params: {
       if (consecutiveStoppedFreeCount >= STOPPED_FREE_THRESHOLD) {
         return withWaitContext(snapshot, "stopped-free", elapsedMs);
       }
-    } else if (snapshot.runtime.status !== "stopped" || snapshot.portUsage.status !== "free") {
+    } else {
       consecutiveStoppedFreeCount = 0;
     }
 
@@ -492,10 +507,10 @@ export async function waitForGatewayHealthyRestart(params: {
       expectedVersion: params.expectedVersion,
       expectedBuildId: params.expectedBuildId,
       requirePluginHealth: params.requirePluginHealth,
-      includeUnknownListenersAsStale: params.includeUnknownListenersAsStale,
       probeContext,
       configuredProbe,
       probeHosts,
+      timeoutMs: probeTimeoutMs(),
       ...(params.signal ? { signal: params.signal } : {}),
     });
   }

@@ -148,6 +148,141 @@
     },
     "github": {}
   },
+  "runtimePlacementTimings": {
+    "blacksmith": [
+      {
+        "configs": [
+          "test/vitest/vitest.agents-core.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/agents/prepared-model-catalog-worker.integration.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 41
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.agents-core.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/agents/runtime-plugins.context-engine.integration.test.ts",
+          "src/agents/simple-completion-runtime.plugin-scope.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 12
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.commands.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/commands/doctor-config-preflight.process.test.ts",
+          "src/commands/doctor-config-preflight.refusal.process.test.ts",
+          "src/commands/doctor-config-preflight.v17-atomicity.process.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 79
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.commands.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/commands/doctor-plugin-install-config.process.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 43
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.gateway-server.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/gateway/server-sidecar-retention.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 14
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.gateway-server.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/gateway/server.config-patch.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 54
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.infra.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/infra/update-candidate-canary.integration.test.ts",
+          "src/infra/update-managed-service-handoff-lifecycle.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 265
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.plugin-sdk-light.config.ts",
+          "test/vitest/vitest.plugin-sdk.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/plugin-sdk/channel-entry-contract.lifecycle.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 10
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.runtime-config.config.ts"
+        ],
+        "env": {
+          "OPENCLAW_VITEST_MAX_WORKERS": "2"
+        },
+        "includePatterns": [
+          "src/config/config-startup-corpus.test.ts",
+          "src/config/state-startup-corpus.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 201
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.unit-fast.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/plugins/setup-registry.migrations.test.ts",
+          "src/plugins/source-checkout-runtime.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 12
+      },
+      {
+        "configs": [
+          "test/vitest/vitest.unit-src.config.ts"
+        ],
+        "env": {},
+        "includePatterns": [
+          "src/node-host/linux-node-plugin.integration.test.ts"
+        ],
+        "pretestBuildMode": "runtime",
+        "seconds": 13
+      }
+    ],
+    "github": []
+  },
   "repoE2eFileSeconds": {
     "extensions/browser/src/browser/client-fetch.attach-only.e2e.test.ts": 1,
     "extensions/browser/src/browser/extension-install.native-host.e2e.test.ts": 2,
@@ -360,7 +495,7 @@
     "test/skills-proposal-manual-target.e2e.test.ts": 2,
     "test/status-shared-state-readonly.e2e.test.ts": 83
   },
-  "source": "median of 3 successful CI and release-check runs: 33537556582, 33537739443, 33543106647",
+  "source": "median of 3 successful CI and release-check runs: 33537556582, 33537739443, 33543106647; runtime placement medians from successful compact jobs in runs 34668723570 and 34678360461 (the former workflow failed elsewhere)",
   "uiE2e": {
     "fileSeconds": {
       "ui/src/e2e/about.e2e.test.ts": 1,
@@ -708,6 +843,6 @@
     },
     "perFileOverheadSeconds": 0.8
   },
-  "updatedAt": "2026-09-01",
+  "updatedAt": "2026-09-12",
   "version": 1
 }

@@ -24,6 +24,7 @@ const operationalMetadataFailures = metadataBoundaries.flatMap((boundary) =>
 );
 
 const resolvedRedaction = { mode: "tools" as const, patterns: [/custom-secret-[a-z]+/g] };
+type RedactOptions = Parameters<typeof import("./redact.js").redactSensitiveLines>[1];
 type PositionalRead = (
   buffer: Buffer,
   offset: number,
@@ -32,10 +33,15 @@ type PositionalRead = (
 ) => Promise<{ bytesRead: number; buffer: Buffer }>;
 
 const { redactSensitiveLinesMock, resolveRedactOptionsMock } = vi.hoisted(() => ({
-  redactSensitiveLinesMock: vi.fn((lines: string[], options?: unknown) =>
-    options === resolvedRedaction
-      ? lines.map((line) => line.replace("custom-secret-abcdefghijklmnopqrstuvwxyz", "custom…wxyz"))
-      : lines,
+  redactSensitiveLinesMock: vi.fn(
+    (lines: string[], options?: RedactOptions, selectedLines?: readonly boolean[]) =>
+      lines
+        .filter((_, index) => selectedLines === undefined || selectedLines[index])
+        .map((line) =>
+          options?.patterns.some((pattern) => pattern.source === "custom-secret-[a-z]+")
+            ? line.replace("custom-secret-abcdefghijklmnopqrstuvwxyz", "custom…wxyz")
+            : line,
+        ),
   ),
   resolveRedactOptionsMock: vi.fn(() => resolvedRedaction),
 }));
@@ -44,8 +50,11 @@ vi.mock("./redact.js", async () => {
   const actual = await vi.importActual<typeof import("./redact.js")>("./redact.js");
   return {
     ...actual,
-    redactSensitiveLines: (lines: string[], options?: unknown) =>
-      redactSensitiveLinesMock(lines, options),
+    redactSensitiveLines: (
+      lines: string[],
+      options?: RedactOptions,
+      selectedLines?: readonly boolean[],
+    ) => redactSensitiveLinesMock(lines, options, selectedLines),
     resolveRedactOptions: () => resolveRedactOptionsMock(),
   };
 });
@@ -94,6 +103,7 @@ describe("readConfiguredLogTail", () => {
     expect(redactSensitiveLinesMock).toHaveBeenCalledWith(
       ["custom-secret-abcdefghijklmnopqrstuvwxyz", "second line"],
       resolvedRedaction,
+      [true, true],
     );
     expect(result.lines).toEqual(["custom…wxyz", "second line"]);
   });
@@ -119,6 +129,56 @@ describe("readConfiguredLogTail", () => {
     const result = await readConfiguredLogTail();
 
     expect(result.lines).toEqual(["old line", "recent one", "recent two"]);
+  });
+
+  it.each([
+    { name: "initial read", prior: "", visible: true },
+    { name: "continuation", prior: "seen\n", visible: true },
+    { name: "filtered read", prior: "", visible: false },
+  ])("does not skip regrowth after a truncated $name", async ({ prior, visible }) => {
+    const { readConfiguredLogTail } = await import("./log-tail.js");
+    const file = path.join(tempDirs.make("openclaw-log-tail-"), "configured.log");
+    const kept = "kept ✅\n";
+    const retired = "retired-record\n";
+    const arrived = "arrived-record\n";
+    const retainedBytes = Buffer.byteLength(prior + kept);
+    const sampledSize = retainedBytes + Buffer.byteLength(retired);
+    expect(Buffer.byteLength(arrived)).toBe(Buffer.byteLength(retired));
+    await fs.writeFile(file, prior + kept + retired);
+    setLoggerOverride({ file });
+
+    const realOpen = fs.open.bind(fs);
+    let truncated = false;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (!truncated && String(args[0]) === file && args[1] === "r") {
+        truncated = true;
+        // Schedule a real truncate after metadata sampling, before the native read.
+        await fs.truncate(file, retainedBytes);
+      }
+      return realOpen(...args);
+    });
+
+    const first = await readConfiguredLogTail(
+      { cursor: Buffer.byteLength(prior) },
+      visible ? undefined : () => false,
+    );
+    expect(truncated).toBe(true);
+    expect(first).toMatchObject({
+      lines: visible ? ["kept ✅"] : [],
+      cursor: retainedBytes,
+      size: sampledSize,
+      reset: false,
+    });
+
+    await fs.appendFile(file, arrived);
+    // Regrow to the sampled size, so the next read cannot recover by a shrink reset.
+    expect((await fs.stat(file)).size).toBe(sampledSize);
+    const next = await readConfiguredLogTail({ cursor: first.cursor });
+    expect(next).toMatchObject({
+      lines: ["arrived-record"],
+      cursor: sampledSize,
+      reset: false,
+    });
   });
 
   it("holds an unterminated record until a later read completes it", async () => {

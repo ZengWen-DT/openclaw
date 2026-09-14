@@ -4,19 +4,57 @@ import type { TranslationMap } from "../lib/types.ts";
 import * as agentEn from "./en-agents.ts";
 
 export const en: TranslationMap & {
+  board: TranslationMap & { widget: TranslationMap };
   browser: TranslationMap & { errors: TranslationMap };
+  chat: TranslationMap & {
+    backgroundTasks: TranslationMap;
+    messages: TranslationMap &
+      Record<
+        | "copySelection"
+        | "replyingTo"
+        | "message"
+        | "showLess"
+        | "showMore"
+        | "tooLargeToDisplay"
+        | "toolSender"
+        | "errorSender",
+        string
+      >;
+  };
   configPage: TranslationMap;
   connection: TranslationMap;
   configView: TranslationMap;
-  debug: TranslationMap & { overlay: TranslationMap };
+  debug: TranslationMap & {
+    lanes: TranslationMap & Record<"lane" | "active" | "queued" | "blocked", string>;
+    overlay: TranslationMap &
+      Record<
+        | "title"
+        | "eyebrow"
+        | "minimize"
+        | "expand"
+        | "lanes"
+        | "status"
+        | "activeRuns"
+        | "events"
+        | "cpu"
+        | "memory"
+        | "delayP99",
+        string
+      >;
+  };
   // Lazy en-devices.ts assigns into this namespace.
   devices: TranslationMap;
   desktop: TranslationMap &
-    Record<"title" | "openWindow" | "unavailable" | "toggle" | "reconnect", string>;
+    Record<"title" | "openWindow" | "unavailable" | "toggle" | "reconnect" | "connecting", string>;
   updates: TranslationMap;
   login: TranslationMap;
+  newSession: TranslationMap;
+  skillWorkshop: TranslationMap;
 } = {
   pluginUi: {
+    sessionRecentMessages: "Recent messages",
+    sessionHistoryUnavailable: "Session history could not be loaded. Try again.",
+    sessionHistoryEmpty: "No recent messages.",
     customize: "Customize UI",
     selectionScope: "Choose views for this browser window. Built-in views are always available.",
     builtin: "Built-in view",
@@ -520,11 +558,9 @@ export const en: TranslationMap & {
           "Request timed out after 30 seconds; the server may still have applied the change — check the profile before retrying.",
         operationFailed: "{prefix}: {error}",
         updateFailed: "Profile update failed",
-        updateFailedStatus: "Profile update failed ({status})",
         publishFailed: "Profile publish failed on all relays.",
         published: "Profile published to relays.",
         importFailed: "Profile import failed",
-        importFailedStatus: "Profile import failed ({status})",
         importedFromRelays: "Profile imported from relays. Review and publish.",
         imported: "Profile imported. Review and publish.",
       },
@@ -942,134 +978,32 @@ export const en: TranslationMap & {
   newSession: {
     title: "New session",
     hint: "Pick where this session works, then say what to do.",
-    agent: "Agent",
-    agents: "Agents",
-    where: "Where",
     environments: "Environments",
     gateway: "Gateway · local",
-    gatewayNamed: "Gateway · {name}",
-    cloudWorker: "Cloud · {profile}",
     cloudWorkerMachine: "{profile} · {machine}",
     cloudWorkerOsMachine: "{profile} · {os} · {machine}",
     cloudWorkerOs: "{profile} · {os}",
-    cloudWorkerProvider: "Cloud worker provider: {provider}",
     cloudRuntimeUnsupported: "The {runtime} runtime does not support cloud workers.",
     cloudProfileRuntimeUnsupported:
       "The {runtime} runtime cannot use this cloud worker. Choose a compatible cloud worker or run locally.",
     deviceRuntimeUnsupported: "This runtime does not support paired devices",
-    cloudRecoveryUnavailable:
-      "Cloud workers are unavailable because this connection does not support task recovery. Reconnect or update the Gateway.",
     placementStartFailed: "The session was created, but runner startup failed: {error}",
     placementReloadBlocked: "Recovery needs a reload. Unsaved starts will be lost.",
     discardUnsavedAndReload: "Discard unsaved starts and reload",
-    placementSyncsFolder: "Syncs {folder} to the selected runner",
-    placementClonesRepository:
-      "Clones {folder} on the selected runner. No Gateway checkout is created.",
-    folder: "Folder",
-    folderPlaceholder: "Agent workspace",
     yourDevices: "Your devices",
-    autoDevice: "Auto",
     autoDeviceSub: "Least-busy device",
     autoDeviceSubEligible: "First eligible device",
-    neverConnected: "Never connected",
-    offlineFor: "Offline for {duration}",
-    lastSeen: "Last seen {time}",
-    nodeUpdateRequired:
-      "Update required: run {updateCommand}, then reconnect. For a headless node, run {restartCommand}.",
-    nodeCommandPendingApproval:
-      "Ask an administrator to approve the pending {command} request, or pick another device.",
-    nodeCommandUndeclared:
-      "Make {command} available on this device, then reconnect, or pick another device.",
-    nodeCommandUnauthorized:
-      "Authorize {command} in the Gateway node command policy, or pick another device.",
-    capabilityCamera: "Camera",
-    capabilityLocation: "Location",
-    capabilityTalk: "Talk",
-    capabilityScreenCapture: "Screen capture",
-    capabilityCanvas: "Canvas",
-    capabilityVoice: "Voice",
-    environmentDisposable: "Disposable",
-    environmentPersistent: "Persistent",
-    projects: "Projects",
-    projectsAdminHint: "Admins can register projects from Browse folders",
-    projectSearchPlaceholder: "Search projects or paste a Git URL",
-    githubProjects: "GitHub",
-    githubTokenHint:
-      "No Control UI GitHub credential or shared Gateway environment token is configured; public GitHub results only.",
-    cloneProject: "Clone",
-    registerProject: "Register as project",
     cloud: "Cloud",
     machine: "Machine",
     operatingSystem: "Operating system",
-    machineShape: "{cpu} vCPU · {memory} GB",
-    machineCpu: "{cpu} vCPU",
-    machineMemory: "{memory} GB",
-    machineDefault: "Default",
-    recentFolders: "Recent",
     runsOn: "Runs on {place}",
     browse: "Browse folders",
-    browseRequiresAdmin:
-      "To browse outside agent workspaces, open Inbox, select Limited access, request admin, then approve in Devices.",
-    connectMachine: "Connect a device",
-    browserUp: "Parent folder",
-    browserUse: "Use this folder",
-    browserEmpty: "No subfolders",
-    browserNoMatches: "No matching folders",
-    browserLoadFailed: "Couldn't list that folder.",
-    hiddenFolder: "Hidden folder",
     worktree: "Worktree",
     checkingGit: "Checking Git availability…",
     gitCheckUnavailable: "Couldn't verify Git for this folder. Choose it again to retry.",
-    worktreeUnavailable: "Selected folder is not a Git checkout",
-    worktreeBaseRef: "From",
-    worktreeBranchesLimited: "Suggestions are limited. Enter any branch or commit.",
-    worktreeBranchesUnavailable: "Branch suggestions are unavailable. Enter a branch or commit.",
-    worktreeName: "Name",
-    worktreeNamePlaceholder: "Named from the session title",
-    worktreeBranchNote: "Creates branch openclaw/<name> in a separate checkout.",
-    worktreeNameInvalid: "Use lowercase letters, digits, and dashes.",
-    incognito: "Incognito",
-    incognitoDescription: "Keep this session only until the Gateway restarts",
-    draft: "Draft",
-    draftDescription: "Keep this session to yourself until you publish it",
-    messagePlaceholder: "What should this session work on?",
-    dictate: "Dictate",
-    readingAttachment: "Reading attachment",
-    start: "Start session",
-    startInTerminal: "Start in terminal",
-    nativeTerminalHint:
-      "Start the native CLI on the selected machine using its own account and configuration. This does not create an OpenClaw Chat.",
-    chooseNativeHost: "Choose a native CLI host",
-    nativeHostsUnavailable:
-      "No native CLI is available. Install it on the Gateway or connect a machine with CLI access, then reconnect to the Gateway.",
-    nativeTerminalPrompt: "Optional initial prompt for the native CLI",
-    terminalNodeFolder: "Existing absolute folder on this node",
-    terminalAttachmentsUnsupported:
-      "Remove attachments before starting a native CLI. Add files from the terminal after it opens.",
     starting: "Starting…",
     createFailed: "Couldn't create the session.",
-    createOutcomeUnknown:
-      "The Gateway changed while this session was starting. Check recent sessions before starting this task again.",
-    cliAgentsGroup: "CLI agents",
-    cliAgentsUnavailable: "CLI agents unavailable",
-    placementSetupInterrupted:
-      "This session's runner setup was interrupted. Check recent sessions before starting this task again.",
-    catalogUnavailable: "This session target is unavailable.",
-    placementNotReady: "The selected runner isn't ready yet. Try again in a moment.",
-    nodeUnavailable: "The selected device is unavailable. Pick another place.",
-    terminalCapabilityOverridesUnsupported:
-      "Clear session capability overrides before starting in a terminal.",
-    what: "What",
-    checkout: "Checkout",
-    checkoutCurrent: "Current checkout",
     checkoutCurrentNote: "Works in the selected folder on its current branch.",
-    checkoutWorktree: "New worktree",
-    checkoutWorktreeSub: "Isolated copy of the repo",
-    checkoutWorktreeFrom: "New worktree from {branch}",
-    checkoutRepository: "Remote checkout",
-    checkoutRepositoryFrom: "Remote checkout from {branch}",
-    checkoutRemoteLocked: "Devices and cloud run in a worktree",
-    local: "Local",
   },
   dashboardsPage: {
     emptyTitle: "No dashboards yet",
@@ -1151,6 +1085,7 @@ export const en: TranslationMap & {
     sessionState: "Session state",
     all: "All",
     sessionArchived: "Session archived",
+    archiving: "Archiving…",
     sessionsArchived: "Archived {count} sessions",
     deleteAllArchived: "Delete all archived…",
     deleteAllArchivedConfirm:
@@ -1305,11 +1240,17 @@ export const en: TranslationMap & {
     },
     iconEmojiSection: "Emoji",
     iconGlyphSection: "Icons",
+    noIcon: "No icon",
+    noColor: "No color",
     customEmojiCell: "Custom emoji…",
     customEmojiTitle: "Custom emoji",
     customEmojiSet: "Set",
     customEmojiHint: "Any emoji works. Press {shortcut} for the system emoji picker.",
     customEmojiHintNoShortcut: "Any emoji works.",
+    customIconCell: "Custom icon…",
+    customIconTitle: "Custom icon",
+    customIconHint: "Paste an emoji or SVG. Press {shortcut} for the system emoji picker.",
+    customIconHintNoShortcut: "Paste an emoji or SVG.",
     removeIcon: "Remove icon",
     pinSession: "Pin session",
     pinRootSessionsOnly: "Only root sessions can be pinned; pin the parent session instead.",
@@ -1378,6 +1319,10 @@ export const en: TranslationMap & {
     groupByPerson: "Person",
     showSessionPreview: "Show message preview",
     hideEmptyGroups: "Hide empty groups",
+    hideEmptyGroupsSelected: "Hide empty groups: {mode}",
+    emptyGroupsWhenFiltering: "When filtering",
+    emptyGroupsAlways: "Always",
+    emptyGroupsNever: "Never",
     showCronSessions: "Show automation sessions",
     showSystemSessions: "Show system sessions",
     groupByChannel: "Channel",
@@ -1611,8 +1556,24 @@ export const en: TranslationMap & {
     },
   },
   debug: {
+    lanes: {
+      lane: "Lane",
+      active: "Active",
+      queued: "Queued",
+      blocked: "Blocked",
+    },
     overlay: {
       title: "System busyness",
+      eyebrow: "Live diagnostics",
+      minimize: "Minimize system busyness",
+      expand: "Expand system busyness",
+      lanes: "Lanes",
+      status: "Event loop / status",
+      activeRuns: "Active runs",
+      events: "Events",
+      cpu: "CPU",
+      memory: "Memory",
+      delayP99: "Delay p99",
     },
   },
   configForm: {
@@ -1886,17 +1847,24 @@ export const en: TranslationMap & {
     autoSavePaused: "Autosave paused after reconnect",
     saveNow: "Save",
     autoSaveFailed: "Save failed",
+    recoveryNotRestored:
+      "Settings could not be restored. Your draft is kept. Check {path} before saving again.",
+    recoveryUnknown:
+      "Settings restoration could not be confirmed. Your draft is kept. Check {path} before saving again.",
+    recoveryBackup: "Inspect the recovery backup at {path}.",
+    recoveryReload: "Discard draft and reload",
     autoSaveConflict: "Settings changed elsewhere",
     retry: "Retry",
     applyChanges: "Apply changes",
     rawDiscard: "Discard",
     reloadBlocked: "Finish saving or discard pending config changes before reloading.",
-    rawDraftBlocksApply:
-      "Unsaved raw config edits — save or discard them in the Raw editor before restarting.",
+    rawDraftBlocksApply: "Save or discard edits in the Raw editor before applying changes.",
     rawDraftPendingFormTitle:
       "Unsaved raw config edits — save or discard them before switching to Form.",
     rawDraftBlocksFormEdit:
       "Unsaved raw config edits could not be parsed; resolve them in the Raw editor before changing settings.",
+    rawDraftUnverified:
+      "Cannot verify the raw draft against the saved configuration; reload and retry.",
     invalidConfig: "Your configuration is invalid. Some settings may not work as expected.",
     dismissWarning: "Don't remind again",
     viewPendingChangesRaw: "View pending changes",
@@ -2369,6 +2337,7 @@ export const en: TranslationMap & {
     unavailable: "Desktop viewing is unavailable for this connection.",
     toggle: "Toggle desktop panel",
     reconnect: "Reconnect",
+    connecting: "Connecting to desktop…",
   },
   routeTitles: {
     modelProviders: "Models",
@@ -2791,7 +2760,7 @@ export const en: TranslationMap & {
     operatorCommands: "MCP operator commands",
     operatorCommandsHint: "Status, diagnostics, auth, probing, and runtime reload.",
     runtimeHint:
-      "Edits save automatically; runtime changes apply after a gateway restart, and active agents rebuild MCP runtimes on next use.",
+      "Edits save automatically. With automatic reload enabled, MCP connections rebuild on next use.",
     toolFilter: "tool filter",
     parallel: "parallel",
     tlsVerifyOff: "TLS verify off",
@@ -2838,229 +2807,7 @@ export const en: TranslationMap & {
       ready: "Ready",
     },
   },
-  memoryPage: {
-    intro: "Choose how OpenClaw stores, searches, and maintains agent memory.",
-    tablistLabel: "Memory sections",
-    tabs: {
-      overview: "Overview",
-      memories: "Memories",
-      dreams: "Dreams",
-      settings: "Settings",
-    },
-    overview: {
-      hero: {
-        awake: "Memory is awake",
-        waking: "Waking memory…",
-        hibernating: "Memory is hibernating",
-        needsAttention: "Memory needs attention",
-        activeDescription: "{engine} · {mode}",
-        loadingDescription: "Checking this agent's memory engine and dream cycle.",
-        offDescription: "Choose a memory engine in Settings to wake it up.",
-        disabledDescription: "The selected memory engine is disabled. Re-enable it in Settings.",
-        gatewayOffline: "The gateway is offline, so memory status is unavailable.",
-        hybridSearch: "hybrid search",
-        keywordSearch: "keyword search (no embeddings)",
-        openSettings: "Open Settings",
-        retry: "Retry",
-        refresh: "Refresh status",
-      },
-      schedule: {
-        title: "Sleep schedule",
-        lightDescription:
-          "Sorts fresh short-term notes and stages promising candidates without changing long-term memory.",
-        remDescription:
-          "Reflects on themes and recurring ideas across recent activity to strengthen ranking without changing long-term memory.",
-        deepDescription:
-          "Scores staged candidates, promotes the keepers into long-term memory (MEMORY.md), and writes the dream diary.",
-        nextRun: "next {time}",
-        lastRun: "last {time}",
-        notScheduled: "Not scheduled",
-        learnMore: "How dreaming works",
-        openDocs: "Open dreaming guide",
-      },
-      activity: {
-        title: "Activity",
-        promotedToday: "Promoted today",
-        promotedTotal: "Promoted total",
-        shortTermCount: "Pending short-term entries",
-        phaseHitCount: "Phase signals",
-        lightPhaseHitCount: "Light-phase hits",
-        remPhaseHitCount: "REM-phase hits",
-      },
-      health: {
-        title: "Engine health",
-        provider: "Provider",
-        embeddings: "Embeddings",
-        runtime: "Embedding runtime",
-        healthy: "Ready",
-        unavailable: "Unavailable",
-        notChecked: "Not checked",
-        notCheckedDescription: "Embedding readiness has not been checked yet.",
-        checking: "Checking…",
-        test: "Test",
-        testing: "Testing…",
-      },
-      shortcuts: {
-        title: "Explore memory",
-        memories: "Search memories",
-        diary: "Read the dream diary",
-        settings: "Configure memory",
-      },
-    },
-    memories: {
-      searchLabel: "Search memories",
-      searchPlaceholder: "Search this agent's memories",
-      searchButton: "Search",
-      idle: "Search for a person, project, decision, or anything else this agent remembers.",
-      searching: "Searching memories…",
-      results: "{count} results",
-      empty: "No memories matched “{query}”.",
-      error: "Memory search failed: {message}",
-      retry: "Retry",
-      gatewayUpdateRequired: "Update the gateway to search memories from the Control UI.",
-      hybridSearch: "hybrid search",
-      keywordSearch: "keyword search",
-      lineRange: "lines {start}–{end}",
-      score: "score {score}",
-      sourceMemory: "memory",
-      sourceSessions: "sessions",
-      fileLoading: "Loading the full memory file…",
-      fileError: "Could not load this memory file: {message}",
-      fileUnsupported: "This memory file cannot be shown as text.",
-    },
-    engine: {
-      title: "Engine",
-      description:
-        "Exactly one memory plugin owns the memory slot. Selecting an engine enables it and disables the others.",
-      rowTitle: "Memory engine",
-      openClawMemory: "OpenClaw Memory",
-      off: "Off",
-      unavailable: "Unavailable",
-      autoHint: "No engine is pinned in config, so the slot falls back to its default owner.",
-      explicitHint: "This engine is pinned in config under plugins.slots.memory.",
-      offHint: "Memory is switched off in config: plugins.slots.memory is set to none.",
-      catalogUnavailable: "Connect to the gateway to change the memory engine.",
-      changeFailed: "Could not change the memory engine",
-      disabledTitle: "This engine is disabled",
-      disabledHint:
-        "The memory slot points at this plugin, but the plugin itself is disabled, so memory is not running.",
-      enable: "Enable",
-    },
-    addons: {
-      title: "Add-ons",
-      description:
-        "These plugins layer on top of the engine instead of competing for the slot, so any combination can run at once.",
-      activeMemory: {
-        title: "Active memory",
-      },
-      memoryWiki: {
-        title: "Memory wiki",
-      },
-      toggleAriaLabel: "Enable or disable {plugin}",
-      changeFailed: "Could not update {plugin}",
-      stateUnknown: "Unknown",
-      manage: "Enable or disable add-ons",
-      manageLink: "Open Plugins",
-    },
-    import: {
-      title: "Import",
-      description: "Bring existing memory from other assistants into an agent workspace.",
-      link: "Open Memory Import",
-    },
-    search: {
-      intro: "Embedding and retrieval defaults shared by every agent that has no memory override.",
-    },
-    dreaming: {
-      intro:
-        "Dreaming runs as one managed automation across every agent workspace, so these settings are global. They are owned by the {plugin} plugin.",
-      schedule: {
-        title: "Schedule",
-        description: "When the full sweep runs and which model narrates it.",
-      },
-      frequency: {
-        label: "Dreaming frequency",
-        help: "Cron cadence for the full dreaming sweep (light, REM, then deep). Leave empty for the plugin default.",
-        placeholder: "0 3 * * *",
-      },
-      timezone: {
-        label: "Timezone",
-        help: "IANA timezone used to interpret the cron cadence.",
-        placeholder: "Europe/Vienna",
-        default: "Gateway local timezone",
-      },
-      model: {
-        label: "Dreaming model",
-        help: "Provider/model override for dream diary narration. Requires subagent model overrides to be allowed.",
-        placeholder: "anthropic/claude-sonnet-4-6",
-        default: "Agent model",
-      },
-      verboseLogging: {
-        label: "Verbose logging",
-        help: "Log each dreaming phase in detail. Useful when tuning thresholds.",
-      },
-      storage: {
-        title: "Storage",
-        description: "Where promoted memories and dreaming reports are written.",
-        modeLabel: "Storage mode",
-        modeHelp: "Inline writes into the memory file; separate keeps a dedicated report file.",
-        modes: {
-          inline: "Inline",
-          separate: "Separate",
-          both: "Both",
-        },
-        separateReportsLabel: "Separate reports",
-        separateReportsHelp: "Keep dreaming reports out of the main memory file.",
-      },
-      phases: {
-        light: {
-          title: "Light phase",
-          description: "Cheap recent-activity pass that stages replay candidates.",
-        },
-        deep: {
-          title: "Deep phase",
-          description: "Scored promotion pass that graduates short-term entries into memory.",
-        },
-        rem: {
-          title: "REM phase",
-          description: "Pattern pass that looks for recurring themes across the lookback window.",
-        },
-      },
-      phaseFields: {
-        enabled: "Enabled",
-        enabledHelp: "Run this phase during the sweep.",
-        lookbackDays: "Lookback days",
-        lookbackDaysHelp: "How far back this phase reads. Leave empty for the plugin default.",
-        limit: "Limit",
-        limitHelp: "Maximum entries this phase processes per run.",
-        dedupeSimilarity: "Dedupe similarity",
-        dedupeSimilarityHelp: "Similarity above which two candidates are treated as duplicates.",
-        minScore: "Minimum score",
-        minScoreHelp: "Promotion score an entry must reach.",
-        minRecallCount: "Minimum recalls",
-        minRecallCountHelp: "How often an entry must be recalled before it can be promoted.",
-        minUniqueQueries: "Minimum unique queries",
-        minUniqueQueriesHelp: "How many distinct queries must have surfaced the entry.",
-        recencyHalfLifeDays: "Recency half-life (days)",
-        recencyHalfLifeDaysHelp: "How quickly older recall signals lose weight.",
-        maxAgeDays: "Maximum age (days)",
-        maxAgeDaysHelp: "Ignore short-term entries older than this.",
-        maxPromotedSnippetTokens: "Max promoted snippet tokens",
-        maxPromotedSnippetTokensHelp:
-          "Token budget for each promoted snippet. Provenance stays attached.",
-        minPatternStrength: "Minimum pattern strength",
-        minPatternStrengthHelp: "Strength a recurring pattern must reach to be reported.",
-      },
-      agentScope: {
-        rowTitle: "Agent",
-      },
-      unsupported: {
-        title: "Dreaming settings",
-        rowTitle: "Not available for this engine",
-        description:
-          "The {plugin} plugin owns the memory slot and its config schema has no dreaming section, so these settings cannot be stored. Switch the engine above to edit them.",
-      },
-    },
-  },
+  memoryPage: {},
   sessionsPage: {
     hubTablistLabel: "Session sections",
   },
@@ -3147,69 +2894,7 @@ export const en: TranslationMap & {
     gatewayVersionHint:
       "Reported by the active Gateway connection; separate from this Control UI build.",
   },
-  appsPage: {
-    heroTitle: "Take OpenClaw everywhere",
-    heroTagline:
-      "Companion apps for your phone, watch, desktop, and browser — plus plugins to extend what your agent can do.",
-    sectionMobile: "On your phone",
-    havePhone: "Already have the app?",
-    pairDevice: "Pair your device",
-    sectionWatch: "On your wrist",
-    sectionDesktop: "On your desktop",
-    sectionBrowser: "In your browser",
-    sectionCommunity: "Community",
-    badgeBundledIos: "Included with the iOS app",
-    badgeBundledAndroid: "Included with the Android app",
-    ctaAppStore: "App Store",
-    ctaPlayStore: "Google Play",
-    ctaDownload: "Download",
-    ctaOpenMac: "Open in Mac app",
-    ctaDocs: "Docs",
-    ctaSetupGuide: "Setup guide",
-    ctaChromeWebStore: "Chrome Web Store",
-    ctaOpenPlugins: "Open Plugins",
-    ctaBrowseClawHub: "Browse ClawHub",
-    linkDiscord: "Discord community",
-    linkDocs: "Docs",
-    cards: {
-      ios: {
-        title: "iPhone",
-        desc: "Chat, talk, approve actions, and share into OpenClaw from iOS.",
-      },
-      android: {
-        title: "Android",
-        desc: "Your Android phone as a full OpenClaw device — chat, camera, and Canvas.",
-      },
-      appleWatch: {
-        title: "Apple Watch",
-        desc: "Glanceable chats and quick replies from your wrist.",
-      },
-      wearOs: {
-        title: "Wear OS",
-        desc: "The Android companion extends OpenClaw to your watch.",
-      },
-      macos: {
-        title: "macOS",
-        desc: "Menu bar companion for your Gateway — notifications, approvals, quick chat.",
-      },
-      windows: {
-        title: "Windows",
-        desc: "The Windows companion connects your PC as an OpenClaw device.",
-      },
-      linux: {
-        title: "Linux",
-        desc: "Native desktop app — .deb and AppImage builds.",
-      },
-      chrome: {
-        title: "Chrome extension",
-        desc: "Let OpenClaw drive your existing Chrome — tabs, pages, and forms.",
-      },
-      plugins: {
-        title: "Plugins & ClawHub",
-        desc: "Extend OpenClaw with channels, tools, and skills from the community.",
-      },
-    },
-  },
+  appsPage: {},
   presence: {
     sharedOwner: {
       name: "Shared owner",
@@ -3265,6 +2950,13 @@ export const en: TranslationMap & {
     automationGroup: "{count} automation sessions",
     automation: "Automation",
     inspectRun: "Inspect run",
+    recap: "Session recap",
+    recapMissing: "No recap yet",
+    recapUpdating: "Updating recap…",
+    recapStale: "New activity since this recap",
+    recapUnavailable: "Recap unavailable",
+    recapRetry: "Retry recap",
+    recapUpdated: "Recap updated {time}",
     backToSessions: "Back to sessions",
     channelLabel: "Channel: {value}",
     agentLabel: "Agent: {value}",
@@ -3444,177 +3136,7 @@ export const en: TranslationMap & {
       unknown: "Task",
     },
   },
-  skillWorkshop: {
-    title: "Skill Workshop",
-    header: {
-      selfLearning: "Self-learning",
-      selfLearningAria: "Toggle autonomous self-learning",
-      weeklyReviewsPaused: "Weekly reviews paused. Enable cron in Automation settings.",
-      selfLearningTooltip:
-        "Capture corrections and review completed work as reusable skills. Automatic mode applies scanner-approved captures to Skills.",
-    },
-    sections: {
-      aria: "Workshop sections",
-      skills: "Skills",
-      suggestions: "Suggestions",
-    },
-    collection: {
-      search: "Search installed skills\u2026",
-      searchLabel: "Search installed skills",
-      refresh: "Refresh skills",
-      shelfLabel: "Installed skills",
-      count: "{count} installed",
-      countOne: "1 installed",
-      countFiltered: "{shown} of {total} installed",
-      countUnavailable: "Count unavailable",
-      loading: "Loading installed skills\u2026",
-      loadingSkill: "Loading {name}\u2026",
-      errorTitle: "Could not load installed skills",
-      errorBody: "Try again to reload the list.",
-      readErrorTitle: "Could not open {name}",
-      emptyTitle: "No skills installed yet",
-      emptyBody: "Apply a suggestion and it appears here as an installed skill.",
-      seeSuggestions: "See suggestions",
-      noMatchTitle: "No skills match that search",
-      noMatchBody: "Clear the search or try another word.",
-      clearSearch: "Clear search",
-      pickTitle: "Pick a skill",
-      pickBody: "Select a skill to see its instructions or changes.",
-      changes: "Instruction changes",
-      savedOn: "Changes since {date}",
-      changedSince: "Changed since {date}",
-      noChanges: "No instruction changes",
-      savedVersion: "Saved version → current",
-      savedNote:
-        "Compares saved instructions with the installed skill. Intermediate edits and supporting files are not shown.",
-      noSavedVersion: "No saved version is available to compare with this skill.",
-      savedVersionError: "Could not load saved versions. Refresh to try again.",
-      comparing: "Comparing saved instructions…",
-      unchanged: "The instructions match this saved version.",
-    },
-    recency: {
-      today: "Today",
-      yesterday: "Yesterday",
-      earlier: "Earlier",
-    },
-    previewContext: "in {slug}",
-    actions: {
-      close: "Close",
-      cancel: "Cancel",
-      previous: "Previous",
-      next: "Next",
-      apply: "Apply",
-      applying: "Applying\u2026",
-      evaluate: "Evaluate",
-      evaluating: "Evaluating\u2026",
-      evaluated: "Evaluated",
-      revise: "Revise",
-      opening: "Opening\u2026",
-      reject: "Reject",
-      rejecting: "Rejecting\u2026",
-      sending: "Sending\u2026",
-    },
-    notices: {
-      applied: "Applied",
-      confirmUnconfirmed:
-        "The proposal status did not confirm as expected after the action. Refresh the workshop and check before retrying.",
-      proposalChanged:
-        "Suggestion changed. Review the updated draft before choosing another action.",
-      rejected: "Rejected",
-      revisionRequested: "Revision requested",
-    },
-    revision: {
-      title: "{verb} suggestion",
-      description:
-        "Tell the agent what should change. The suggestion stays pending and the workshop creates a revised version.",
-      placeholder:
-        "Example: Make this use Gmail labels instead of unread search, and add a safer dry-run step.",
-      preparing: "Waiting for chat admission",
-      notAdmitted:
-        "Revision request was not admitted. Your instructions are still available; review the error and retry. {error}",
-      send: "Send revision",
-    },
-    queue: {
-      resize: "Resize list",
-      searchSuggestions: "Search suggestions\u2026",
-      searchHistory: "Search records\u2026",
-      suggestionsLabel: "Search suggestions",
-      historyLabel: "Search records",
-      loadError: "Could not load this list.",
-      loading: "Loading\u2026",
-      noMatch: "Nothing matches that search.",
-      noSuggestions: "No suggestions waiting.",
-      noRecords: "No records yet.",
-      noRecordsStatus: "No {status} records.",
-    },
-    detail: {
-      edited: "Edited {time}",
-      created: "Created {time}",
-      supportFiles: "{count} support files",
-      noSupportFiles: "0 support files",
-      loading: "Loading\u2026",
-      draftMissing:
-        "This suggestion's draft is missing. Reject it and ask your agent to create a new suggestion.",
-      supportFilesTitle: "Support files",
-      clickToPreview: "\u00b7 click to preview",
-    },
-    evaluation: {
-      title: "Evaluation",
-      version: "Suggestion {version}",
-      completedAt: "Completed {time}",
-      status: {
-        completed: "Completed",
-        skipped: "Skipped",
-        error: "Error",
-      },
-      decision: {
-        pass: "Pass",
-        revise: "Revise",
-        block: "Block",
-      },
-      severity: {
-        info: "Info",
-        warn: "Warning",
-        critical: "Critical",
-      },
-      evaluatorVersion: "Evaluator {version}",
-      mode: "Mode {mode}",
-      findings: "Findings",
-      metrics: "Metrics",
-      fileLine: "{file}:{line}",
-      errors: {
-        revisionHashUnavailable: "The current suggestion revision could not be identified.",
-        revisionChanged: "The suggestion revision changed during evaluation.",
-      },
-    },
-    empty: {
-      searchTitle: "Nothing matches that search",
-      searchBody: "Clear the search or try another word.",
-      pendingTitle: "No suggestions waiting",
-      pendingBody: "New suggestions appear here when they need review.",
-      defaultAgent: "Your agent",
-      noProposalsAria: "No Skill Workshop suggestions",
-      noProposalsTitle: "No suggestions yet",
-      noProposalsBody: "{agent} hasn\u2019t suggested any skills.",
-      noProposalsFooter: "New suggestions appear here for review.",
-    },
-    selfLearning: {
-      pitchTitle: "Turn on self-learning",
-      pitchBody:
-        "OpenClaw learns from completed work and improves reusable skills in the background. Reviews use your configured model.",
-      enable: "Enable self-learning",
-      enabling: "Enabling\u2026",
-      updateError: "Could not update the self-learning setting.",
-    },
-    learning: {
-      start: "Learn from past conversations",
-      starting: "Opening learning session\u2026",
-      title: "Learn from past conversations",
-      description:
-        "Open a session to find useful lessons and improve skills using your current learning mode.",
-      startFailed: "Could not start learning. Check your sessions before trying again.",
-    },
-  },
+  skillWorkshop: {},
   // Chat swarm summaries render before the lazy Activity catalog loads.
   // Keep their shared label in startup English; Activity replaces the full namespace on entry.
   activity: {
@@ -3753,6 +3275,8 @@ export const en: TranslationMap & {
       kindHtml: "HTML",
       kindPlugin: "Plugin",
       kindReport: "Report",
+      kindWebsite: "Website",
+      kindBrowserDashboard: "Browser dashboard",
       pluginLoading: "Loading plugin widget…",
       disabledPlugin: "Widget from disabled plugin {pluginId}",
     },
@@ -3940,6 +3464,8 @@ export const en: TranslationMap & {
   palette: {
     placeholder: "Search chats and commands…",
     noResults: "No results",
+    searchingSessions: "Searching sessions…",
+    searchingCommands: "Searching commands…",
     searchFailed: "Chat search failed — check the gateway logs and retry",
     modelSearchFailed: "Model search unavailable. Change your search to retry.",
     searchPartial: "Transcript search unavailable — showing chat titles and metadata",
@@ -4551,6 +4077,7 @@ export const en: TranslationMap & {
       runningSetup: "Running setup…",
       provisioningEnvironment: "Provisioning environment…",
       preparingContext: "Preparing this turn…",
+      memoryFlushing: "Saving conversation memory…",
       startingModel: "Waiting for a response…",
     },
     archivedSessionDisabled: "This session is archived. Unarchive it to continue the conversation.",
@@ -4713,6 +4240,7 @@ export const en: TranslationMap & {
       dismiss: "Dismiss {author}'s suggestion",
       typing: "{name} is typing…",
       typingMany: "{names} are typing…",
+      typingDraftState: "Typing · not sent",
       state: {
         pending: "Pending",
         accepted: "Accepted",
@@ -4831,6 +4359,8 @@ export const en: TranslationMap & {
       showMore: "Show {count} more",
       rateLimited:
         "GitHub API rate limit reached. Pull request status may be out of date until the limit resets.",
+      unavailable:
+        "GitHub status could not be refreshed. Showing the last known state; check GitHub for the latest.",
     },
     usageRemaining: "Usage Remaining",
     view: {
@@ -4970,6 +4500,9 @@ export const en: TranslationMap & {
       cliHarnessContext: {
         label: "System · injected context",
       },
+      claudeCliTaskNotification: {
+        label: "System · background task",
+      },
       showContent: "Show content",
     },
     progressLabels: {
@@ -5046,6 +4579,7 @@ export const en: TranslationMap & {
       sortBy: "Sort by",
       sortCreated: "Created",
       sortSessions: "Filter & sort",
+      sessionSources: "Session sources…",
       showOnlyPerson: "Show only {name}",
       showEveryone: "Show everyone",
       showAllSessions: "Show all sessions",
@@ -5053,7 +4587,10 @@ export const en: TranslationMap & {
       sessionMenu: "Actions for {session}",
       sessionMenuMany: "Actions for {count} sessions",
       toolActivity: "Using {tool}",
-      catalogDiscoveryHelp: "{error}. Configure native session discovery in Settings > Plugins.",
+      catalogDiscoveryHelp:
+        "{error}. Configure automatic session discovery in Settings > Appearance > Session sources.",
+      catalogPaginationFailed: "Session catalog returned a repeated page cursor",
+      catalogPageMissingHost: "Session catalog page did not include the requested host",
     },
     welcome: {
       hintBeforeShortcut: "Type a message below ·",
@@ -5080,6 +4617,11 @@ export const en: TranslationMap & {
     },
     queue: {
       connectionPending: "Finishing connection recovery. Try sending again when it is ready.",
+      editSourceChanged:
+        "This queued message changed while you were editing. Your edit is still here. Copy it, cancel the edit, and review the queue before trying again.",
+      editStorageFailed:
+        "Your edit could not be saved in this browser. Keep this tab open and copy your edit before freeing browser storage, then try again.",
+      full: "The message queue is full. Wait for a queued message to send or remove one, then try again.",
       initialTurnPending:
         "The initial message is unresolved. Reconnect if needed, then review it before sending another message.",
       notSent: "Not sent",
@@ -5189,35 +4731,13 @@ export const en: TranslationMap & {
     },
     messages: {
       copySelection: "Copy",
-      forkFromHere: "Fork from here",
-      reply: "Reply",
-      replyToMessage: "Reply to message",
       replyingTo: "Replying to {name}",
-      originalUnavailable: "The original message is unavailable.",
       message: "message",
-      currentMessage: "current message",
-      actions: "Message actions",
-      selectionActions: "Selection actions",
-      askInSideChat: "Ask in side chat",
-      addToChat: "Add to chat",
-      rewind: "Rewind",
-      rewindConfirm: "Rewind to before this message?",
-      dontAskAgain: "Don't ask again",
-      rewindToHere: "Rewind to here",
-      rewindUnavailable: "Rewind is unavailable while the agent is working",
-      forkUnavailable: "Fork is unavailable while the agent is working",
       showLess: "Show less",
       showMore: "Show more",
       tooLargeToDisplay: "This message is too large to display here.",
-      unknownDate: "Unknown date",
       toolSender: "Tool",
-      forwardedFrom: "From",
-      forwardedFromAgent: "Forwarded from {agentId}",
-      forwardedMessage: "Forwarded message",
-      fullContentLoadExhausted: "Could not load the full message.",
-      voiceNote: "Voice note",
-      duplicatesCollapsed: "{count} consecutive identical messages collapsed",
-      contextFor: "Message context for {timestamp}",
+      errorSender: "Error",
     },
     mediaPlayer: {
       play: "Play",
@@ -5262,6 +4782,7 @@ export const en: TranslationMap & {
       loadingModels: "Loading models…",
       modelsUnavailable: "Models unavailable",
       modelsRefreshFailed: "Some models could not be refreshed. Open Models to try again.",
+      checkingProviderModels: "{providers}: checking models…",
       noModelsAvailable: "No models available",
       emptyModelsAction: "Manage models",
       providerModels: "{provider} models",
@@ -5350,6 +4871,7 @@ export const en: TranslationMap & {
       nextMatch: "Next match",
       overwrite: "Overwrite",
       viewRawText: "View Raw Text",
+      viewSource: "Source",
       renderedMarkdown: "Rendered Markdown",
       renderedMarkdownHint: "Sanitized rich-text preview for quick reading.",
       noPreviewableMarkdown: "No previewable markdown content.",
@@ -5379,6 +4901,12 @@ export const en: TranslationMap & {
       expand: "Focus",
       expandPanel: "Expand {panel}",
       restore: "Restore split",
+      useViewAsDefault: "Use current view as default",
+      savingDefault: "Saving default…",
+      defaultSaved: "Dashboard default saved for future opens.",
+      defaultSaveFailed:
+        "Could not save the dashboard default. Check the connection and try again.",
+      defaultSaveError: "Could not save the dashboard default: {error}",
       swap: "Swap {main} and {side}",
       layout: "Layout",
       dockLeft: "Move side panel left",
@@ -5423,7 +4951,6 @@ export const en: TranslationMap & {
         "Use arrow keys or Home and End to choose a marker, Enter or Space to jump, and Escape to return to the conversation. Tab leaves the rail.",
     },
     pendingInputs: {
-      waitingForAgent: "Queued · waiting for the agent",
       waitingForWorkspaceSync: "Received · waiting for workspace sync",
       waitingForWorkerSetup: "Received · waiting for worker setup",
       resuming:
@@ -5473,7 +5000,9 @@ export const en: TranslationMap & {
       browserAnnotationRemoved: "Browser annotation removed.",
       browserAnnotationUndoUnavailable:
         "Undo is unavailable because the browser annotation limit has been reached.",
+      preparingAttachments: "Preparing attachments…",
       removeAttachment: "Remove attachment",
+      removeNamedAttachment: "Remove {name}",
       removeBrowserAnnotation: "Remove browser annotation: {name}",
       addAttachment: "Add attachment",
       attachPhoto: "Photo",
@@ -5528,7 +5057,7 @@ export const en: TranslationMap & {
         open: "Open context usage details",
         summary: "Session context usage: {used} of {limit} ({pct}%)",
         contextWindow: "Context window",
-        promptBudget: "Prompt budget (last run)",
+        promptBudget: "Prompt budget",
         latestRunTokens: "Latest run tokens",
         estimatedCost: "Est. cost",
         planUsage: "Plan usage",
@@ -5747,46 +5276,7 @@ export const en: TranslationMap & {
       workedFor: "Worked for {duration}",
       worked: "Worked",
     },
-    backgroundTasks: {
-      label: "Background tasks",
-      title: "Background tasks",
-      show: "Show background tasks",
-      collapse: "Collapse background tasks",
-      refresh: "Refresh background tasks",
-      loading: "Loading background tasks…",
-      running: "Running ({count})",
-      finished: "Finished ({count})",
-      statusRunningOne: "1 running task",
-      statusRunningMany: "{count} running tasks",
-      statusPreviewMore: "+{count} more",
-      stopTask: "Stop {title}",
-      now: "Now",
-      toolCallsOne: "1 tool call",
-      toolCallsMany: "{count} tool calls",
-      toolUseOne: "1 tool use",
-      toolUseMany: "{count} tool uses",
-      detailLoading: "Loading task details…",
-      detailFailed: "Could not load task details.",
-      detailRetry: "Try again",
-      transcriptLoading: "Loading task transcript…",
-      transcriptEmpty: "No transcript messages yet.",
-      transcriptFailed: "Could not load task transcript.",
-      taskDetailTitle: "Task details",
-      taskUnavailable: "This task is no longer available.",
-      prompt: "Prompt",
-      output: "Output",
-      promptUnavailable: "Prompt unavailable.",
-      outputPending: "No output yet.",
-      subagentActivity: {
-        label: "Subagent activity",
-        running: "Subagent",
-        finished: "Subagent finished",
-        failed: "Subagent failed",
-        cancelled: "Subagent cancelled",
-        openDetails: "Open subagent details for {title}",
-        moreWorking: "+{count} more working",
-      },
-    },
+    backgroundTasks: {},
     sessionDiff: {
       title: "Changes",
       show: "Show session changes",
@@ -5957,26 +5447,7 @@ export const en: TranslationMap & {
       active: "Active",
       paused: "Paused",
     },
-    list: {
-      viewLabel: "Automation views",
-      searchPlaceholder: "Search automations",
-      newTask: "New automation",
-      filters: "Filters",
-      shownOf: "{shown} of {total}",
-      emptyTitle: "No automations yet",
-      emptyHint: "Describe what OpenClaw should do and when — it runs on schedule.",
-      noMatching: "No automations match the current filters.",
-      loadMore: "Load more",
-      loading: "Loading...",
-      schedulerOff: "Scheduler disabled",
-      refresh: "Refresh",
-      refreshing: "Refreshing...",
-      paused: "Paused",
-      autoDisabledRunFailures: "Auto-disabled · {count} run failures",
-      autoDisabledScheduleErrors: "Auto-disabled · {count} schedule errors",
-      tasksTab: "Automations",
-      activityTab: "Run history",
-    },
+    list: {},
     suggestions: {
       title: "Starter automations",
       schedules: {

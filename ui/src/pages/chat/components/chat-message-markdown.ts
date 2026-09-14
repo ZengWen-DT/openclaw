@@ -5,6 +5,8 @@ import { CHAT_PENDING_INPUT_MESSAGE_PREFIX } from "../../../../../packages/gatew
 import { renderCopyAsMarkdownButton } from "../../../components/copy-button.ts";
 import { icons } from "../../../components/icons.ts";
 import { t } from "../../../i18n/index.ts";
+import { registerChatMessageMetadataEnglish } from "../../../i18n/locales/en-chat-message-metadata.ts";
+import { resolveMessageDisplayMarkdown } from "../../../lib/chat/message-display.ts";
 import {
   normalizeMessage,
   normalizeRoleForGrouping,
@@ -12,7 +14,8 @@ import {
 import { stripThinkingTags } from "../../../lib/strip-thinking-tags.ts";
 import { persistedMessageEntryId, type AssistantMessageExpansionState } from "../chat-thread.ts";
 import { extractMessageMediaText } from "./chat-message-media.ts";
-import { resolveMessageDisplayMarkdown } from "./chat-message-text.ts";
+
+registerChatMessageMetadataEnglish();
 
 export type MessageReplyTarget = {
   messageId: string;
@@ -22,6 +25,8 @@ export type MessageReplyTarget = {
 };
 
 export type MessageActionDetails = {
+  /** Source for context copy, independent of footer visibility and reply truncation. */
+  copyMarkdown?: string;
   markdown?: string;
   fullMessage?: { messageId: string; state: AssistantMessageExpansionState | undefined };
   replyTarget?: MessageReplyTarget;
@@ -100,15 +105,14 @@ export function resolveMessageActionDetails(
   const visibleMarkdown =
     role === "assistant" ? stripThinkingTags(expandedMarkdown) : expandedMarkdown;
   const markdown = role === "assistant" || pendingInput ? visibleMarkdown : undefined;
-  const replyText =
-    onReply && !pendingInput
-      ? truncateUtf16Safe(resolveMessageReplyText(message, normalizedMessage, visibleMarkdown), 500)
-      : "";
-  if (!markdown && !replyText && !fullMessage) {
+  const copyMarkdown = resolveMessageReplyText(message, normalizedMessage, visibleMarkdown);
+  const replyText = onReply && !pendingInput ? truncateUtf16Safe(copyMarkdown, 500) : "";
+  if (!copyMarkdown && !markdown && !replyText && !fullMessage) {
     return null;
   }
   const sourceMessageId = persistedMessageEntryId(message);
   return {
+    copyMarkdown,
     ...(markdown === undefined ? {} : { markdown }),
     fullMessage,
     ...(replyText

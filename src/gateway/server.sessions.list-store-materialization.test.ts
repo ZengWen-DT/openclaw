@@ -5,16 +5,14 @@
 import path from "node:path";
 import { expect, test, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import * as agentScope from "../agents/agent-scope.js";
 import * as sessionsConfig from "../config/sessions.js";
 import { canPrewarmCombinedSessionStoresForGateway } from "../config/sessions/combined-store-gateway.js";
 import * as sessionAccessor from "../config/sessions/session-accessor.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import * as agentDatabaseRegistry from "../state/openclaw-agent-db-registry.js";
-import {
-  OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP,
-  openOpenClawAgentDatabase,
-} from "../state/openclaw-agent-db.js";
+import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
 import { scheduleGatewayHandlerPrewarm } from "./server-startup-handler-prewarm.js";
 import type { SessionsListResult } from "./session-utils.types.js";
 import { testState, writeSessionStore } from "./test-helpers.js";
@@ -24,6 +22,8 @@ import {
   sessionStoreEntry,
   setupGatewaySessionsHandlerTestHarness,
 } from "./test/server-sessions.test-helpers.js";
+
+const EXPECTED_OPEN_HANDLE_CAP = 64;
 
 const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 
@@ -82,13 +82,45 @@ test("sessions.list reuses prepared store targets for sharing", async () => {
   }
 });
 
+test("sessions.list keeps roster enumeration bounded as ordinary rows grow", async () => {
+  await createSessionStoreDir();
+  testState.agentsConfig = { list: [{ id: "main", default: true }, { id: "work" }] };
+  const rosterReads: number[] = [];
+  for (const rows of [20, 200]) {
+    const entries: Record<string, ReturnType<typeof sessionStoreEntry>> = {
+      main: sessionStoreEntry("sess-main", { updatedAt: 1_781_000_000_001 }),
+    };
+    for (let index = 0; index < rows; index++) {
+      entries[`agent:main:ordinary-${index}`] = sessionStoreEntry(`ordinary-${index}`, {
+        updatedAt: 1_781_000_000_000 - index,
+      });
+    }
+    await writeSessionStore({ entries });
+    expect((await directSessionReq("sessions.list", LIST_PARAMS)).ok).toBe(true);
+    const roster = vi.spyOn(agentScope, "listAgentIds");
+    try {
+      const result = await directSessionReq<SessionsListResult>("sessions.list", LIST_PARAMS);
+      expect(result.ok).toBe(true);
+      expect(result.payload?.totalCount).toBe(rows + 1);
+      expect(result.payload?.sessions.map(({ key }) => key)).toEqual([
+        "agent:main:main",
+        ...Array.from({ length: Math.min(rows, 99) }, (_, index) => `agent:main:ordinary-${index}`),
+      ]);
+      rosterReads.push(roster.mock.calls.length);
+    } finally {
+      roster.mockRestore();
+    }
+  }
+  expect(rosterReads[1]).toBeLessThanOrEqual(rosterReads[0]!);
+});
+
 test("sessions.list keeps cold and warm transcript title batches valid beyond the database handle cap", async () => {
   const stateDir = process.env.OPENCLAW_STATE_DIR;
   if (!stateDir) {
     throw new Error("OPENCLAW_STATE_DIR is required for gateway session tests");
   }
   const agentIds = Array.from(
-    { length: OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP + 1 },
+    { length: EXPECTED_OPEN_HANDLE_CAP + 1 },
     (_, index) => `batch-agent-${index}`,
   );
   const storeTemplate = path.join(stateDir, "agents", "{agentId}", "sessions", "sessions.json");

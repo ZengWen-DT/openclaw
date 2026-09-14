@@ -137,6 +137,7 @@ jobs:
       checks_node_core_nondist_matrix: ${{ steps.manifest.outputs.checks_node_core_nondist_matrix }}
       run_checks_node_core_dist: ${{ steps.manifest.outputs.run_checks_node_core_dist }}
       run_check: ${{ steps.manifest.outputs.run_check }}
+      startup_corpus_node_revision: ${{ steps.manifest.outputs.startup_corpus_node_revision }}
       changed_core_test_paths_json: ${{ steps.manifest.outputs.changed_core_test_paths_json }}
       run_check_additional: ${{ steps.manifest.outputs.run_check_additional }}
       check_additional_matrix: ${{ steps.manifest.outputs.check_additional_matrix }}
@@ -1686,6 +1687,7 @@ jobs:
                   const patterns = plan.targets ?? plan.includePatterns;
                   if (patterns) {
                     return patterns.some((pattern) => [
+                      "src/agents/sessions/agent-session-runtime-projection.test.ts",
                       "src/agents/sessions/tools/index.test.ts",
                       "src/agents/sessions/tools/grep.byte-path.test.ts",
                       "src/agents/filesystem-tools-output-contract.test.ts",
@@ -1706,6 +1708,15 @@ jobs:
             );
           }
           const nodeTestDistShards = nodeTestShards.filter((shard) => shard.requires_dist);
+          // The required Node matrix can own PR corpus coverage on this exact
+          // tree; frozen/release targets retain their independent corpus step.
+          const startupCorpusNodeRevision =
+            isCanonicalRepository && eventName === "pull_request" && runNodeFull &&
+            !frozenTarget && !compatibilityTarget && !releaseGate &&
+            /^[0-9a-f]{40}$/u.test(checkoutRevision) && checkoutRevision === workflowRevision &&
+            typeof nodeTestPlan.hasCompleteStartupCorpusCoverage === "function" &&
+            nodeTestPlan.hasCompleteStartupCorpusCoverage(rawNodeTestShards)
+              ? checkoutRevision : "";
           // Targeted jobs cannot discover repository-scanning boundary tests
           // through imports. Keep the full boundary gate inside build-artifacts
           // when that lane runs; test-only targeted plans carry their own
@@ -1784,6 +1795,7 @@ jobs:
             checks_node_core_nondist_matrix: createMatrix(nodeTestNonDistShards),
             run_checks_node_core_dist: runNodeCoreDist,
             run_check: runNodeFull,
+            startup_corpus_node_revision: startupCorpusNodeRevision,
             changed_core_test_paths_json: changedCoreTestPaths ? JSON.stringify(changedCoreTestPaths) : "",
             run_check_additional: runNodeFull,
             check_additional_matrix: createMatrix(runNodeFull ? additionalChecks : []),
@@ -2126,10 +2138,9 @@ jobs:
       contents: read
     needs: [preflight]
     if: needs.preflight.outputs.run_build_artifacts == 'true'
-    # 32 vCPU: the dist build sits on the light-run critical path alongside
-    # check-lint/check-dependencies; tsdown parallelizes across the extra
-    # cores for roughly the same billed core-minutes.
-    runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1) && 'ubuntu-24.04' || (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
+    # Current targets fit the measured 16-class with serial SDK declarations.
+    # Keep frozen/unknown targets on their existing class; their compute was not proved.
+    runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1) && 'ubuntu-24.04' || (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && (needs.preflight.outputs.frozen_target == 'false' && 'blacksmith-16vcpu-ubuntu-2404' || 'blacksmith-32vcpu-ubuntu-2404') || 'ubuntu-24.04') }}
     timeout-minutes: ${{ (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 35 || 20 }}
     steps:
       - *linux_node_checkout_step
@@ -2622,7 +2633,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-chromium-1.62.1
+          key: ${{ runner.os }}-playwright-chromium-1.63.0
 
       - &install_playwright_chromium
         name: Install Playwright Chromium
@@ -2745,6 +2756,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # Publish only the synthetic desktop PiP fixture, never other desktop captures.
+      - name: Upload synthetic desktop Picture-in-Picture proof
+        if: always() && matrix.task == 'control-ui' && hashFiles('.artifacts/control-ui-e2e/desktop-picture-in-picture-*/native-pip-after-tab-switch.png') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: desktop-pip-proof-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/control-ui-e2e/desktop-picture-in-picture-*/desktop-before-pip.png
+            .artifacts/control-ui-e2e/desktop-picture-in-picture-*/native-pip-after-tab-switch.png
+          if-no-files-found: error
+          retention-days: 7
+
       # This fixture uses synthetic documents and a mocked Gateway; exclude other UI artifacts.
       - name: Upload synthetic widget prompt failure evidence
         if: failure() && hashFiles('.artifacts/control-ui-e2e/control-ui-authenticated-widget-sandbox-*/widget-prompt-failure.json') != ''
@@ -2775,7 +2798,8 @@ jobs:
     # The 32-class request can fit both staged SDK compilers; actual remaining
     # memory still gates overlap, with unchanged browser worker limits.
     runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1) && 'ubuntu-24.04' || (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
-    timeout-minutes: 20
+    # Hosted preparation and the complete suite need a larger job budget; test deadlines stay fixed.
+    timeout-minutes: ${{ (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1) || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.run_attempt > 1) || github.repository != 'openclaw/openclaw' || (github.event_name == 'pull_request' && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association))) && 40 || 20 }}
     steps:
       - *linux_node_checkout_step
       - name: Setup Node environment
@@ -2830,16 +2854,24 @@ jobs:
             fi
             config=test/vitest/vitest.ui-e2e.config.ts
           fi
+          # Frozen targets retain their own reporter implementation and defaults.
+          reporter_args=()
+          if [[ "$FROZEN_TARGET" != "true" ]]; then
+            reporter_args=(--reporter verbose --reporter github-actions --reporter default --reporter ./scripts/lib/vitest-resource-reporter.mts)
+          fi
           node scripts/run-vitest.mjs run \
             --config "$config" \
             --configLoader runner \
+            "${reporter_args[@]}" \
             ui/src/e2e/mcp-app-conformance.e2e.test.ts \
             ui/src/e2e/control-ui-auth-transports.e2e.test.ts \
             ui/src/e2e/usage-sessions-owner-attribution.e2e.test.ts \
             ui/src/e2e/profile-page.real-gateway.e2e.test.ts \
+            ui/src/e2e/quota-reset-status.real-gateway.e2e.test.ts \
             ui/src/e2e/logs-lifecycle.e2e.test.ts \
             ui/src/e2e/agent-file-lifecycle.real-gateway.e2e.test.ts \
             ui/src/e2e/chat-composer-websearch-kill-switch.real-gateway.e2e.test.ts \
+            ui/src/e2e/chat-flow.catalog-bootstrap.e2e.test.ts \
             ui/src/e2e/chat-agent-avatar.real-gateway.e2e.test.ts \
             ui/src/e2e/chat-loading-performance.real-gateway.e2e.test.ts \
             ui/src/e2e/chat-project-media.real-gateway.e2e.test.ts \
@@ -3090,10 +3122,15 @@ jobs:
           esac
 
       - name: Check startup corpus
-        # Full main Node coverage owns these files on the same checkout. PRs may
-        # select only changed tests; release gates also validate a separate merge tree.
-        if: matrix.task == 'baseline-ratchets' && !(github.repository == 'openclaw/openclaw' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.preflight.outputs.run_check == 'true')
-        run: node scripts/run-vitest.mjs run --config test/vitest/vitest.runtime-config.config.ts src/config/config-startup-corpus.test.ts src/config/state-startup-corpus.test.ts
+        # Main owns full coverage. PRs need an exact-tree coverage receipt from
+        # their admitted Node plan; release gates retain their separate merge tree.
+        if: matrix.task == 'baseline-ratchets' && !(github.repository == 'openclaw/openclaw' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.preflight.outputs.run_check == 'true') && !(github.repository == 'openclaw/openclaw' && github.event_name == 'pull_request' && needs.preflight.outputs.startup_corpus_node_revision && needs.preflight.outputs.startup_corpus_node_revision == needs.preflight.outputs.checkout_revision)
+        run: |
+          reporter_args=()
+          if [[ "${{ needs.preflight.outputs.frozen_target }}" != "true" ]]; then
+            reporter_args=(--reporter verbose --reporter github-actions --reporter ./scripts/lib/vitest-resource-reporter.mts)
+          fi
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.runtime-config.config.ts "${reporter_args[@]}" src/config/config-startup-corpus.test.ts src/config/state-startup-corpus.test.ts
 
   qa-smoke-ci-profile:
     permissions:
@@ -3435,7 +3472,7 @@ jobs:
         # Keep the runner toolchain owned by the workflow; cache publication is gated separately.
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.1"
           cache: false
 
       - name: Resolve docs i18n Go cache
@@ -3469,7 +3506,7 @@ jobs:
 
       - name: Verify docs i18n Go toolchain
         if: matrix.requires_go == true
-        run: test "$(go env GOVERSION)" = "go1.27.0"
+        run: test "$(go env GOVERSION)" = "go1.27.1"
 
       - name: Configure Node test resources
         # Scale the in-process Vitest worker budget with the cores the job

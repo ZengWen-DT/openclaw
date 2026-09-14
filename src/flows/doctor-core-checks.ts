@@ -175,6 +175,8 @@ async function collectGatewayDaemonFindingsWithRuntime(
 async function listGatewayCronJobsWithRuntime(
   ctx: HealthCheckContext,
 ): Promise<readonly CronJob[]> {
+  const { bindAgentToolGatewayRequest } = await import("../agents/tools/in-process-gateway.js");
+  const requestGateway = bindAgentToolGatewayRequest({ hostedOnly: true });
   if (
     (await hasActiveGatewayExecCredential({ cfg: ctx.cfg })) &&
     ctx.allowExecSecretRefs !== true
@@ -183,20 +185,20 @@ async function listGatewayCronJobsWithRuntime(
       "Gateway cron inventory skipped because credentials use an exec SecretRef; rerun doctor with --allow-exec.",
     );
   }
-  const { callGateway } = await import("../gateway/call.js");
   const jobs: CronJob[] = [];
   let offset = 0;
   let snapshotRevision: string | undefined;
   let total: number | undefined;
 
   while (total === undefined || offset < total) {
-    const page = await callGateway<CronListPageResult>({
+    const request = {
       method: "cron.list",
       params: { includeDisabled: true, limit: 200, offset },
       timeoutMs: 3000,
       config: ctx.cfg,
       deviceIdentity: null,
-    });
+    };
+    const page = await requestGateway<CronListPageResult>(request);
     const validPage =
       Array.isArray(page.jobs) &&
       typeof page.snapshotRevision === "string" &&
@@ -359,7 +361,8 @@ const skillWorkshopRelocationCheck: HealthCheck = {
       await import("../commands/doctor-skill-workshop-sqlite.js");
     const inspection = await inspectLegacySkillWorkshopMigration({
       config: ctx.cfg,
-      env: process.env,
+      env: ctx.env,
+      stateEnv: process.env,
     });
     const automationFindings = (inspection.automationReferences ?? []).map((reference) => ({
       checkId: SKILL_WORKSHOP_RELOCATION_CHECK_ID,
@@ -759,7 +762,17 @@ function createModelReferenceCheck(): HealthCheck {
             },
           ];
         }
-        if (inspection.status === "unknown-model" && inspection.active) {
+        // A provider that ships no catalog rows cannot confirm or deny a model
+        // id offline; the generic advisory would be unactionable there, so only
+        // a legacy-reference migration is still worth reporting.
+        if (inspection.status === "uncatalogued-provider" && !migrationFinding) {
+          return [];
+        }
+        if (
+          (inspection.status === "unknown-model" ||
+            inspection.status === "uncatalogued-provider") &&
+          inspection.active
+        ) {
           return [
             {
               checkId: "core/doctor/model-references",
@@ -885,9 +898,10 @@ const claudeCliCheck: HealthCheck = {
   },
 };
 
-function createSecurityCheck(deps: CoreHealthCheckDeps): HealthCheck {
+function createSecurityCheck(deps: CoreHealthCheckDeps): DoctorHealthCheck {
   return {
     id: "core/doctor/security",
+    updateReadiness: "post-plugin",
     kind: "core",
     description: "Security posture checks produce structured findings.",
     source: "doctor",
@@ -898,7 +912,7 @@ function createSecurityCheck(deps: CoreHealthCheckDeps): HealthCheck {
   };
 }
 
-function securityAuditFindingToHealthFinding(finding: SecurityAuditFinding): HealthFinding {
+export function securityAuditFindingToHealthFinding(finding: SecurityAuditFinding): HealthFinding {
   const detailLines = finding.detail.split("\n");
   const firstDetail = detailLines.shift() ?? "";
   const fixHint = [...detailLines, ...(finding.remediation?.split("\n") ?? [])].join("\n");
@@ -973,6 +987,18 @@ const legacyCronStoreCheck: DoctorHealthCheck = {
     const { collectLegacyCronStoreHealthFindings } =
       await import("../commands/doctor/cron/index.js");
     return collectLegacyCronStoreHealthFindings({ cfg: ctx.cfg });
+  },
+};
+
+const staleRuntimeBuildCheck: DoctorHealthCheck = {
+  id: "core/doctor/stale-runtime-build",
+  kind: "core",
+  description: "The loaded runtime was built from the checkout's current commit.",
+  source: "doctor",
+  async detect() {
+    const { collectStaleRuntimeBuildFindings } =
+      await import("../commands/doctor-stale-runtime-build.js");
+    return collectStaleRuntimeBuildFindings();
   },
 };
 
@@ -1460,6 +1486,7 @@ function createConvertedWorkflowChecks(deps: CoreHealthCheckDeps): readonly Doct
     removedWorkspacesStateCheck,
     legacyWhatsAppCrontabCheck,
     legacyCronStoreCheck,
+    staleRuntimeBuildCheck,
     codexSessionRoutesCheck,
     telegramGeneralTopicConversationsCheck,
     shellCompletionCheck,

@@ -22,7 +22,8 @@ export function createCatalogAttemptReporter(
   source: PreparedModelCatalogAttempt["source"],
   isCurrent: () => boolean,
 ): {
-  published: () => void;
+  started: (providers: readonly string[]) => void;
+  published: (providers?: readonly string[]) => void;
   failed: (error: unknown) => never;
   withRefreshStatus: (catalog: ModelCatalogSnapshot) => ModelCatalogSnapshot;
 } {
@@ -30,28 +31,51 @@ export function createCatalogAttemptReporter(
   const attempt: PreparedModelCatalogAttempt =
     owner.catalogAttempt && isDeepStrictEqual(owner.catalogAttempt.source, source)
       ? owner.catalogAttempt
-      : { source };
+      : { source, failedProviders: new Set() };
+  let pendingProviders: readonly string[] = [];
   return {
+    started: (providers) => {
+      pendingProviders = providers;
+      notifyPreparedModelRuntimePublication({ phase: "catalog-published" });
+    },
     withRefreshStatus: (catalog) => {
+      Object.defineProperty(catalog, "pendingProviders", {
+        enumerable: true,
+        configurable: true,
+        get: () => (pendingProviders.length ? pendingProviders : undefined),
+      });
       // Keep the status live on retained inventory without copying an error into its successor.
       Object.defineProperty(catalog, "refreshFailed", {
         enumerable: true,
+        configurable: true,
         get: () =>
-          attempt.error !== undefined ||
+          attempt.failedProviders.size > 0 ||
           catalog.providerOutcomes?.some((outcome) => outcome.status !== "ready") ||
           undefined,
       });
       return catalog;
     },
-    published: () => {
-      delete attempt.error;
+    published: (providers) => {
+      pendingProviders = providers
+        ? pendingProviders.filter((provider) => !providers.includes(provider))
+        : [];
+      if (providers) {
+        for (const provider of providers) {
+          attempt.failedProviders.delete(provider);
+        }
+      } else {
+        attempt.failedProviders.clear();
+      }
       owner.catalogAttempt = attempt;
       notifyPreparedModelRuntimePublication({ phase: "catalog-published" });
     },
     failed: (error) => {
       if (isCurrent() && !(error instanceof PreparedModelRuntimePublicationSupersededError)) {
         const attemptError = toStringifiedError(error);
-        attempt.error = attemptError;
+        for (const provider of pendingProviders.length ? pendingProviders : [undefined]) {
+          attempt.failedProviders.add(provider);
+        }
+        pendingProviders = [];
         owner.catalogAttempt = attempt;
         notifyPreparedModelRuntimePublication({ phase: "catalog-failed", error: attemptError });
       }

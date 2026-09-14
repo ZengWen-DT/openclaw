@@ -27,6 +27,30 @@ export function readUpdateRunRecord(db: DatabaseSync, runId: string): UpdateRunR
   return row ? decodeRun(row) : undefined;
 }
 
+export function getUpdateRun(
+  runId: string,
+  options: OpenClawStateDatabaseOptions = {},
+): UpdateRunRecord | undefined {
+  return withExistingOpenClawStateDatabaseArtifactPreservingReadOnly(
+    ({ db }) => (tableExists(db, "update_runs") ? readUpdateRunRecord(db, runId) : undefined),
+    options,
+  );
+}
+
+export function findActiveUpdateRun(
+  options: OpenClawStateDatabaseOptions = {},
+): UpdateRunRecord | undefined {
+  return withExistingOpenClawStateDatabaseArtifactPreservingReadOnly(
+    ({ db }) => readActiveUpdateRun(db),
+    options,
+  );
+}
+
+/** Read activity on the caller's connection so maintenance can fence its mutation. */
+export function readActiveUpdateRun(db: DatabaseSync): UpdateRunRecord | undefined {
+  return readRuns(db, { limit: 1, active: true })[0];
+}
+
 export async function getUpdateRunAsync(
   runId: string,
   options: OpenClawStateDatabaseOptions = {},
@@ -37,7 +61,7 @@ export async function getUpdateRunAsync(
   );
 }
 
-type ListInput = { limit?: number; active?: boolean; reason?: string };
+type ListInput = { limit?: number; active?: boolean; reason?: string; includeRunId?: string };
 
 function readRuns(db: DatabaseSync, input: ListInput): UpdateRunRecord[] {
   if (!tableExists(db, "update_runs")) {
@@ -52,13 +76,21 @@ function readRuns(db: DatabaseSync, input: ListInput): UpdateRunRecord[] {
   if (input.reason) {
     query = query.where("reason", "=", input.reason);
   }
-  return executeSqliteQuerySync(
+  const runs = executeSqliteQuerySync(
     db,
     query
       .orderBy("created_at_ms", "desc")
       .orderBy("run_id", "desc")
       .limit(Math.max(1, Math.min(100, Math.trunc(input.limit ?? 20)))),
   ).rows.map(decodeRun);
+  // Restoration must retain its captured owner even after that row becomes terminal.
+  if (input.includeRunId && !runs.some((run) => run.runId === input.includeRunId)) {
+    const captured = readUpdateRunRecord(db, input.includeRunId);
+    if (captured) {
+      runs.push(captured);
+    }
+  }
+  return runs;
 }
 
 export function listUpdateRuns(

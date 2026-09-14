@@ -6,6 +6,7 @@ import type { AuthenticatedGitHubIdentitySync } from "../github-user-identity.js
 import type { GatewayOperatorRoleActor } from "../operator-role-actor.js";
 import type { PluginNodeCapabilityClient } from "../plugin-node-capability.js";
 import type { WorkerConnectionIdentity } from "../worker-environments/connection-identity.js";
+import type { GatewayConnectionTransport } from "./connection-transport.js";
 
 export type GatewayWsBrowserOrigin = {
   requestHost?: string;
@@ -29,7 +30,9 @@ export type GatewayIngressWebSocket = WebSocket & {
  * Runtime WebSocket client state tracked by the gateway server.
  */
 export type GatewayWsClient = PluginNodeCapabilityClient & {
-  socket: WebSocket;
+  socket: GatewayConnectionTransport;
+  /** Physical WS liveness capability; absent on transports without ping/pong. */
+  webSocket?: Pick<WebSocket, "ping" | "once" | "off">;
   connect: ConnectParams;
   connId: string;
   /** Host-owned transport retirement notification; never accepted from wire params. */
@@ -48,6 +51,8 @@ export type GatewayWsClient = PluginNodeCapabilityClient & {
   /** Verified Tailscale provider identity; generic proxy identities must not infer this. */
   authenticatedUserIsTailscaleProvider?: boolean;
   authenticatedGitHubIdentitySync?: AuthenticatedGitHubIdentitySync;
+  /** Lifecycle-prepared canonical recipient; never a scope or authorization grant. */
+  preparedRecipientProfileId?: string;
   authenticatedUserProfile?: {
     profileId: string;
     displayName: string | null;

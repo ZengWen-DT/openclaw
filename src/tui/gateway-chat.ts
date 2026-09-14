@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { gatewayOriginScope } from "../../packages/gateway-client/src/gateway-origin-scope.js";
+import { startGatewayClientWhenEventLoopReady } from "../../packages/gateway-client/src/readiness.js";
 import {
   GATEWAY_CLIENT_CAPS,
   GATEWAY_CLIENT_MODES,
@@ -13,6 +14,7 @@ import {
 } from "../../packages/gateway-protocol/src/connect-error-details.js";
 import {
   type HelloOk,
+  type ArtifactsDownloadResult,
   MIN_CLIENT_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
   type CommandEntry,
@@ -33,14 +35,13 @@ import {
 import { GATEWAY_SERVER_CAPS } from "../../packages/gateway-protocol/src/server-capabilities.js";
 import { isRetryableGatewayStartupUnavailableError } from "../../packages/gateway-protocol/src/startup-unavailable.js";
 import { getRuntimeConfig } from "../config/config.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
 import { assertExplicitGatewayAuthModeWhenBothConfigured } from "../gateway/auth-mode-policy.js";
 import { buildGatewayConnectionDetails } from "../gateway/call.js";
 import {
   resolveGatewayClientBootstrap,
   resolveGatewayUrlOverride,
 } from "../gateway/client-bootstrap.js";
-import { startGatewayClientWhenEventLoopReady } from "../gateway/client-start-readiness.js";
 import { GatewayClient, GatewayClientRequestError } from "../gateway/client.js";
 import { resolveExplicitGatewayAuth } from "../gateway/credentials.js";
 import {
@@ -67,6 +68,8 @@ import type {
   TuiSessionCreateOptions,
   TuiSessionMutationResult,
   TuiChatSendResult,
+  TuiImageRequest,
+  TuiImageData,
 } from "./tui-backend.js";
 
 type GatewayConnectionOptions = {
@@ -382,6 +385,40 @@ export class GatewayChatClient implements TuiBackend {
         await sleep(resolveStartupRetryDelayMs(err), this.historyLifetime.signal);
       }
     }
+  }
+
+  async loadImage(opts: TuiImageRequest): Promise<TuiImageData> {
+    const { loadGatewayImage } = await import("./gateway-image-loader.js");
+    const signal = AbortSignal.any([opts.signal, this.historyLifetime.signal]);
+    const credentials = [
+      this.hello?.auth.deviceToken,
+      ...(this.hello?.auth.method === "password"
+        ? [this.connection.password, this.connection.token]
+        : [this.connection.token, this.connection.password]),
+    ].filter((value): value is string => Boolean(value));
+    return await loadGatewayImage({
+      request: { ...opts, signal },
+      connection: this.connection,
+      credentials: [...new Set(credentials)],
+      readMediaBasePath: async (requestSignal) => {
+        const snapshot = await this.client.request<Pick<ConfigFileSnapshot, "runtimeConfig">>(
+          "config.get",
+          {},
+          { signal: requestSignal },
+        );
+        return snapshot.runtimeConfig.gateway?.controlUi?.basePath ?? "";
+      },
+      downloadArtifact: (artifactId, requestSignal) =>
+        this.client.request<ArtifactsDownloadResult>(
+          "artifacts.download",
+          {
+            sessionKey: opts.sessionKey,
+            ...(opts.agentId ? { agentId: opts.agentId } : {}),
+            artifactId,
+          },
+          { signal: requestSignal },
+        ),
+    });
   }
 
   async listSessions(opts?: SessionsListParams) {

@@ -534,10 +534,12 @@ the command asks the owner to retry from a direct chat.
 /plugins install git:<repository>@<ref> --force
 ```
 
-`/plugins enable|disable` updates plugin config and hot-reloads the Gateway
-plugin runtime for new agent turns. `/plugins install` restarts managed
-Gateways automatically because plugin source modules changed. Trusted ClawHub
-and official-catalog installs do not need a provenance acknowledgement. Arbitrary npm,
+`/plugins enable|disable` and `/plugins install` apply through the running Gateway's
+plugin lifecycle and report the runtime application result without restarting it.
+New agent turns use the updated plugin runtime. See
+[Apply changes and inspect](/plugins/manage-plugins#apply-changes-and-inspect).
+
+Trusted ClawHub and official-catalog installs do not need a provenance acknowledgement. Arbitrary npm,
 git, archive, `npm-pack:`, and local path sources show a provenance warning and
 require a trailing `--force` after you review the source. This flag acknowledges
 the source and permits replacement of an existing install. It does not bypass
@@ -556,8 +558,9 @@ that reply, then rerun with `--accept-capabilities`:
 /plugins enable <plugin-id> --accept-capabilities
 ```
 
-Capability consent also applies to official external plugins and is separate
-from the source acknowledgement provided by `--force`.
+Bundled plugins and verified plugins from OpenClaw's official catalog are exempt
+from capability consent. Third-party capability consent is separate from the
+source acknowledgement provided by `--force`.
 
 ## `/trace`: plugin trace output
 

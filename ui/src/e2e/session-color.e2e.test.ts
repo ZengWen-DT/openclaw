@@ -28,7 +28,7 @@ suite.define(() => {
         sessionKey: key,
         methodResponses: {
           "sessions.list": sessionsListResponse([
-            sessionRow(key, "Keyboard appearance", Date.now()),
+            sessionRow(key, "Keyboard appearance", Date.now(), { icon: "🦞" }),
           ]),
           "sessions.patch": {},
         },
@@ -91,7 +91,7 @@ suite.define(() => {
                 .querySelector(".session-menu__appearance :focus")
                 ?.getAttribute("aria-label") ?? null,
           );
-        await expect.poll(focused).toBe("Default");
+        await expect.poll(focused).toBe("No color");
         await page.keyboard.press("Tab");
         await expect.poll(focused).toBe("Red");
         await page.keyboard.press("Enter");
@@ -124,11 +124,13 @@ suite.define(() => {
           )
           .toBe(true);
         await page.keyboard.press("Shift+Tab");
-        await page.keyboard.press("ArrowUp");
-        await page.keyboard.press("ArrowLeft");
-        await page.keyboard.press("ArrowLeft");
+        const iconCount = await picker.locator(".session-menu__icon-choice").count();
+        for (let index = 0; index < iconCount && (await focused()) !== "Custom icon…"; index += 1) {
+          await page.keyboard.press("ArrowRight");
+        }
+        await expect.poll(focused).toBe("Custom icon…");
         await page.keyboard.press("Enter");
-        const custom = picker.getByRole("textbox", { name: "Custom emoji", exact: true });
+        const custom = picker.getByRole("textbox", { name: "Custom icon", exact: true });
         await expect
           .poll(() => custom.evaluate((element) => element === document.activeElement))
           .toBe(true);
@@ -138,7 +140,7 @@ suite.define(() => {
         await waitForPatch(gateway, (params) => params.key === key && params.icon === "✨");
         await page.keyboard.press("Shift+Tab");
         await page.keyboard.press("Escape");
-        await expect.poll(focused).toBe("Custom emoji…");
+        await expect.poll(focused).toBe("Custom icon…");
         await page.keyboard.press("Tab");
         await expect
           .poll(() =>

@@ -18,6 +18,7 @@ import {
   readAgentRuntimeExecutionLineage,
   withAgentRuntimeExecutionLineage,
 } from "./agent-runtime-execution-lineage.js";
+import type { AgentRuntimeIdentityTokenParams } from "./agent-runtime-identity-token.js";
 
 const envSnapshot = captureEnv(["HOME", "OPENCLAW_HOME", "OPENCLAW_STATE_DIR"]);
 
@@ -96,6 +97,18 @@ function validateDelegatedAuthority(
   });
 }
 
+async function createIdentity(
+  runtimeToken: typeof import("./agent-runtime-identity-token.js"),
+  mode: "signed" | "direct",
+  params: AgentRuntimeIdentityTokenParams,
+) {
+  return mode === "direct"
+    ? runtimeToken.createAgentRuntimeIdentity(params)
+    : runtimeToken.verifyAgentRuntimeIdentityToken(
+        await runtimeToken.mintAgentRuntimeIdentityToken(params),
+      );
+}
+
 afterEach(() => {
   resetAgentRunRegistryForTest();
   closeOpenClawStateDatabaseForTest();
@@ -112,51 +125,121 @@ afterEach(() => {
 });
 
 describe("agent runtime identity token", () => {
-  it("rejects copied delegated authority after terminal, replacement, and restart boundaries", async () => {
+  it.each(["signed", "direct"] as const)(
+    "rejects %s delegated authority after terminal, replacement, and restart boundaries",
+    async (mode) => {
+      useTempHome();
+      const runtimeToken = await importRuntimeTokenModule();
+      const first = operationalRun("run-lifecycle");
+      const firstRun = first.operationalRunInstance;
+      const copied = await createIdentity(runtimeToken, mode, {
+        agentId: "main",
+        sessionKey: "session-1",
+        operationalRunInstance: firstRun,
+      });
+      expect(copied).toBeDefined();
+      expect(copied && validateDelegatedAuthority(runtimeToken, copied.delegatedAuthority)).toBe(
+        true,
+      );
+
+      releaseAgentRunDelegatedAuthority(first.delegatedAuthority);
+      expect(copied && validateDelegatedAuthority(runtimeToken, copied.delegatedAuthority)).toBe(
+        false,
+      );
+
+      const replacement = { instanceId: "instance-replacement", runId: firstRun.runId };
+      claimAgentRunDelegatedAuthority(replacement);
+      expect(copied && validateDelegatedAuthority(runtimeToken, copied.delegatedAuthority)).toBe(
+        false,
+      );
+
+      const replacementIdentity = await createIdentity(runtimeToken, mode, {
+        agentId: "main",
+        sessionKey: "session-1",
+        operationalRunInstance: replacement,
+      });
+      expect(
+        replacementIdentity &&
+          validateDelegatedAuthority(runtimeToken, replacementIdentity.delegatedAuthority),
+      ).toBe(true);
+
+      rotateAgentRunRegistryLifecycleGeneration();
+      expect(
+        replacementIdentity &&
+          validateDelegatedAuthority(runtimeToken, replacementIdentity.delegatedAuthority),
+      ).toBe(false);
+    },
+  );
+
+  it("creates direct identities without credentials and rejects inactive runs or expired context", async () => {
     useTempHome();
     const runtimeToken = await importRuntimeTokenModule();
-    const first = operationalRun("run-lifecycle");
-    const firstRun = first.operationalRunInstance;
-    const token = await runtimeToken.mintAgentRuntimeIdentityToken({
+    const run = operationalRun();
+    const params = {
       agentId: "main",
       sessionKey: "session-1",
-      operationalRunInstance: firstRun,
+      operationalRunInstance: run.operationalRunInstance,
+    };
+    await expect(runtimeToken.createAgentRuntimeIdentity(params)).resolves.toMatchObject({
+      kind: "agentRuntime",
+      ...params,
     });
-    const copied = await runtimeToken.verifyAgentRuntimeIdentityToken(token);
-    expect(copied).toBeDefined();
-    expect(copied && validateDelegatedAuthority(runtimeToken, copied.delegatedAuthority)).toBe(
-      true,
+    expect(readExecApprovalsSnapshot().exists).toBe(false);
+
+    await expect(
+      runtimeToken.createAgentRuntimeIdentity({
+        ...params,
+        messageActionContext: { expiresAtMs: Date.now() - 1 },
+      }),
+    ).resolves.toBeUndefined();
+
+    releaseAgentRunDelegatedAuthority(run.delegatedAuthority);
+    await expect(runtimeToken.createAgentRuntimeIdentity(params)).rejects.toThrow(
+      "requires active delegated run authority",
     );
-
-    releaseAgentRunDelegatedAuthority(first.delegatedAuthority);
-    expect(copied && validateDelegatedAuthority(runtimeToken, copied.delegatedAuthority)).toBe(
-      false,
-    );
-
-    const replacement = { instanceId: "instance-replacement", runId: firstRun.runId };
-    claimAgentRunDelegatedAuthority(replacement);
-    expect(copied && validateDelegatedAuthority(runtimeToken, copied.delegatedAuthority)).toBe(
-      false,
-    );
-
-    const replacementToken = await runtimeToken.mintAgentRuntimeIdentityToken({
-      agentId: "main",
-      sessionKey: "session-1",
-      operationalRunInstance: replacement,
-    });
-    const replacementIdentity =
-      await runtimeToken.verifyAgentRuntimeIdentityToken(replacementToken);
-    expect(
-      replacementIdentity &&
-        validateDelegatedAuthority(runtimeToken, replacementIdentity.delegatedAuthority),
-    ).toBe(true);
-
-    rotateAgentRunRegistryLifecycleGeneration();
-    expect(
-      replacementIdentity &&
-        validateDelegatedAuthority(runtimeToken, replacementIdentity.delegatedAuthority),
-    ).toBe(false);
   });
+
+  it.each(["signed", "direct"] as const)(
+    "redeems %s execution lineage once for the active parent",
+    async (mode) => {
+      useTempHome();
+      const runtimeToken = await importRuntimeTokenModule();
+      const lineage = await import("./agent-runtime-execution-lineage.js");
+      const run = operationalRun();
+      const parent = {
+        agentId: "main",
+        sessionKey: "session-1",
+        ...run,
+      };
+      const executionIdentity = createExecutionIdentityAdmissionToken("run-1");
+      const sessionSpawnContext = lineage.withAgentRuntimeExecutionLineage(
+        { inheritedToolPolicy: { version: 1, allow: ["read"], deny: ["exec"] } },
+        {
+          relation: "sessions_spawn",
+          requesterRef: "requester",
+          controllerRef: "controller",
+          depth: 1,
+          applicableGrantRefs: [],
+          localPolicyRefs: [],
+          runtimeAssuranceRefs: [],
+          targetPolicyRefs: [],
+          externalNativeActions: "observable",
+        },
+      );
+      const handoff = lineage.createAgentRuntimeExecutionLineageHandoff({
+        ...parent,
+        executionIdentity,
+        sessionSpawnContext,
+      });
+      expect(handoff).toBeDefined();
+      const params = { ...parent, executionLineageHandoffId: handoff!.id };
+      const identity = await createIdentity(runtimeToken, mode, params);
+      expect(identity).toMatchObject({ executionIdentity, sessionSpawnContext });
+      expect(lineage.consumeAgentRuntimeExecutionLineage(identity!)).toBe(true);
+      expect(lineage.consumeAgentRuntimeExecutionLineage(identity!)).toBe(false);
+      await expect(createIdentity(runtimeToken, mode, params)).resolves.toBeUndefined();
+    },
+  );
 
   it("persists the local signing secret so tokens verify across processes", async () => {
     useTempHome();
@@ -181,32 +264,37 @@ describe("agent runtime identity token", () => {
     });
   });
 
-  it("round-trips the authenticated plugin owner and turn-source route", async () => {
-    useTempHome();
-    const runtimeToken = await importRuntimeTokenModule();
-    const token = await runtimeToken.mintAgentRuntimeIdentityToken({
-      agentId: "main",
-      sessionKey: "session-1",
-      ...operationalRun(),
-      approvalOwnerPluginId: " codex ",
-      turnSourceChannel: " telegram ",
-      turnSourceTo: " chat-1 ",
-      turnSourceAccountId: " Work ",
-      turnSourceThreadId: " thread-1 ",
-    });
+  it.each(["signed", "direct"] as const)(
+    "preserves the %s plugin owner, turn-source route, and requesting UI",
+    async (mode) => {
+      useTempHome();
+      const runtimeToken = await importRuntimeTokenModule();
+      const identity = await createIdentity(runtimeToken, mode, {
+        agentId: "main",
+        sessionKey: "session-1",
+        ...operationalRun(),
+        approvalOwnerPluginId: " codex ",
+        turnSourceChannel: " telegram ",
+        turnSourceTo: " chat-1 ",
+        turnSourceAccountId: " Work ",
+        turnSourceThreadId: " thread-1 ",
+        gatewayUiCommandTarget: { connId: " ui-connection-1 ", profileId: " profile-1 " },
+      });
 
-    await expect(runtimeToken.verifyAgentRuntimeIdentityToken(token)).resolves.toMatchObject({
-      kind: "agentRuntime",
-      agentId: "main",
-      sessionKey: "session-1",
-      operationalRunInstance: operationalRun().operationalRunInstance,
-      approvalOwnerPluginId: "codex",
-      turnSourceChannel: "telegram",
-      turnSourceTo: "chat-1",
-      turnSourceAccountId: "work",
-      turnSourceThreadId: "thread-1",
-    });
-  });
+      expect(identity).toMatchObject({
+        kind: "agentRuntime",
+        agentId: "main",
+        sessionKey: "session-1",
+        operationalRunInstance: operationalRun().operationalRunInstance,
+        approvalOwnerPluginId: "codex",
+        turnSourceChannel: "telegram",
+        turnSourceTo: "chat-1",
+        turnSourceAccountId: "work",
+        turnSourceThreadId: "thread-1",
+        gatewayUiCommandTarget: { connId: "ui-connection-1", profileId: "profile-1" },
+      });
+    },
+  );
 
   it("round-trips explicit local turn provenance without inferring it from the session key", async () => {
     useTempHome();
@@ -259,6 +347,18 @@ describe("agent runtime identity token", () => {
     await expect(
       runtimeToken.verifyAgentRuntimeIdentityToken(withInvalidKnownField),
     ).resolves.toBeUndefined();
+
+    for (const gatewayUiCommandTarget of [
+      { connId: "" },
+      { connId: "ui-connection-1", profileId: 1 },
+    ]) {
+      const withInvalidUiTarget = rewriteSignedPayload(token, (payload) => {
+        payload.gatewayUiCommandTarget = gatewayUiCommandTarget;
+      });
+      await expect(
+        runtimeToken.verifyAgentRuntimeIdentityToken(withInvalidUiTarget),
+      ).resolves.toBeUndefined();
+    }
   });
 
   it("omits execution identity from a different operational run", async () => {
@@ -363,27 +463,30 @@ describe("agent runtime identity token", () => {
     nowSpy.mockRestore();
   });
 
-  it("round-trips final cron-cap capture provenance", async () => {
-    useTempHome();
-    const runtimeToken = await importRuntimeTokenModule();
-    const run = operationalRun();
-    const token = await runtimeToken.mintAgentRuntimeIdentityToken({
-      agentId: "main",
-      sessionKey: "agent:main:main",
-      operationalRunInstance: run.operationalRunInstance,
-      cronToolsAllowCapture: "final-executable-surface",
-      cronExecToolTarget: { host: "gateway", ask: "always" },
-    });
+  it.each(["signed", "direct"] as const)(
+    "preserves %s final cron-cap capture provenance",
+    async (mode) => {
+      useTempHome();
+      const runtimeToken = await importRuntimeTokenModule();
+      const run = operationalRun();
+      const identity = await createIdentity(runtimeToken, mode, {
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        operationalRunInstance: run.operationalRunInstance,
+        cronToolsAllowCapture: "final-executable-surface",
+        cronExecToolTarget: { host: "gateway", ask: "always" },
+      });
 
-    await expect(runtimeToken.verifyAgentRuntimeIdentityToken(token)).resolves.toMatchObject({
-      kind: "agentRuntime",
-      agentId: "main",
-      sessionKey: "agent:main:main",
-      operationalRunInstance: run.operationalRunInstance,
-      cronToolsAllowCapture: "final-executable-surface",
-      cronExecToolTarget: { host: "gateway", ask: "always" },
-    });
-  });
+      expect(identity).toMatchObject({
+        kind: "agentRuntime",
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        operationalRunInstance: run.operationalRunInstance,
+        cronToolsAllowCapture: "final-executable-surface",
+        cronExecToolTarget: { host: "gateway", ask: "always" },
+      });
+    },
+  );
 
   it("round-trips a signed private cron creator grant only with final provenance", async () => {
     useTempHome();
@@ -433,17 +536,28 @@ describe("agent runtime identity token", () => {
     expect(readExecApprovalsSnapshot().exists).toBe(false);
   });
 
-  it("rejects a token with a shortened signature", async () => {
+  it("rejects a shortened signature or a changed requesting UI", async () => {
     useTempHome();
     const runtimeToken = await importRuntimeTokenModule();
     const token = await runtimeToken.mintAgentRuntimeIdentityToken({
       agentId: "main",
       sessionKey: "session-1",
       ...operationalRun(),
+      gatewayUiCommandTarget: { connId: "ui-connection-1", profileId: "profile-1" },
     });
 
     await expect(
       runtimeToken.verifyAgentRuntimeIdentityToken(token.slice(0, -1)),
+    ).resolves.toBeUndefined();
+    const [payloadPart, signature] = token.split(".");
+    const payload = JSON.parse(Buffer.from(payloadPart!, "base64url").toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+    payload.gatewayUiCommandTarget = { connId: "another-connection", profileId: "profile-2" };
+    const changedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+    await expect(
+      runtimeToken.verifyAgentRuntimeIdentityToken(`${changedPayload}.${signature}`),
     ).resolves.toBeUndefined();
   });
 

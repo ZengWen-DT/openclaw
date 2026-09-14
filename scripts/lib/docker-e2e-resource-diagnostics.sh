@@ -37,25 +37,13 @@ docker_e2e_resource_limit_temp_dir() {
   return 127
 }
 
-docker_e2e_tee_bin() {
-  if command -v tee >/dev/null 2>&1; then
-    command -v tee
+docker_e2e_diagnostic_bin() {
+  if command -v "$1" >/dev/null 2>&1; then
+    command -v "$1"
     return
   fi
-  if [ -x /usr/bin/tee ]; then
-    printf '%s\n' /usr/bin/tee
-    return
-  fi
-  return 1
-}
-
-docker_e2e_tail_bin() {
-  if command -v tail >/dev/null 2>&1; then
-    command -v tail
-    return
-  fi
-  if [ -x /usr/bin/tail ]; then
-    printf '%s\n' /usr/bin/tail
+  if [ -x "/usr/bin/$1" ]; then
+    printf '%s\n' "/usr/bin/$1"
     return
   fi
   return 1
@@ -89,7 +77,7 @@ docker_e2e_docker_run_with_resource_diagnostics() {
     return
   fi
   local tee_bin=""
-  if ! tee_bin="$(docker_e2e_tee_bin)"; then
+  if ! tee_bin="$(docker_e2e_diagnostic_bin tee)"; then
     docker_e2e_remove_diagnostic_dir "$diagnostic_dir"
     docker_e2e_timeout_cmd \
       "$timeout_value" \
@@ -97,7 +85,7 @@ docker_e2e_docker_run_with_resource_diagnostics() {
     return
   fi
   local tail_bin=""
-  if ! tail_bin="$(docker_e2e_tail_bin)"; then
+  if ! tail_bin="$(docker_e2e_diagnostic_bin tail)"; then
     docker_e2e_remove_diagnostic_dir "$diagnostic_dir"
     docker_e2e_timeout_cmd \
       "$timeout_value" \
@@ -108,12 +96,8 @@ docker_e2e_docker_run_with_resource_diagnostics() {
   local stderr_fifo="${diagnostic_dir}/stderr.pipe"
   local capture_fifo="${diagnostic_dir}/capture.pipe"
   local mkfifo_bin=""
-  if command -v mkfifo >/dev/null 2>&1; then
-    mkfifo_bin="$(command -v mkfifo)"
-  elif [ -x /usr/bin/mkfifo ]; then
-    mkfifo_bin=/usr/bin/mkfifo
-  fi
-  if [ -z "$mkfifo_bin" ] || ! "$mkfifo_bin" "$stderr_fifo" "$capture_fifo"; then
+  if ! mkfifo_bin="$(docker_e2e_diagnostic_bin mkfifo)" ||
+    ! "$mkfifo_bin" "$stderr_fifo" "$capture_fifo"; then
     docker_e2e_remove_diagnostic_dir "$diagnostic_dir"
     docker_e2e_timeout_cmd \
       "$timeout_value" \

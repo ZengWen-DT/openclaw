@@ -222,10 +222,13 @@
   flex-shrink: 0;
 }
 
-.chat-tool-msg-summary__icon img {
+.chat-tool-activity-icon {
   width: 16px;
   height: 16px;
-  object-fit: contain;
+  background: currentColor;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
 }
 
 .chat-tool-msg-summary__icon svg {
@@ -555,6 +558,20 @@
 
 .chat-activity-group__body .chat-tool-msg-collapse.is-open {
   margin-bottom: 8px;
+}
+
+.chat-tool-children {
+  min-width: 0;
+  margin: 4px 0 8px 8px;
+  padding-left: 16px;
+  border-left: 1px solid var(--border);
+}
+
+.chat-tool-wrapper-details > summary {
+  padding: 8px 0;
+  color: var(--muted);
+  font-size: var(--control-ui-text-sm);
+  cursor: default;
 }
 
 .chat-tool-msg-body .chat-diff {
@@ -1075,11 +1092,10 @@
   overflow-y: auto;
 }
 
-/* Completed-turn work rollup: slim "Worked for X" disclosure standing in for
-   the turn's intermediate tool/commentary groups. Keep it equally separated
-   from the prompt and final reply. */
+/* Standalone work uses the same summary-to-reply gap as an inline run frame.
+   The preceding turn already owns the separation above the summary. */
 .chat-group--work {
-  padding-block: 9px;
+  padding-block: 0 var(--chat-run-block-gap);
 }
 
 @keyframes chat-work-settle-in {
@@ -1290,7 +1306,7 @@ openclaw-tooltip.chat-tasks-status__preview {
 
 .chat-subagent-activity__row {
   display: grid;
-  grid-template-columns: 18px auto minmax(0, 1fr);
+  grid-template-columns: 20px fit-content(40%) minmax(0, 1fr);
   align-items: center;
   gap: 7px;
   min-height: 22px;
@@ -1322,28 +1338,76 @@ openclaw-tooltip.chat-tasks-status__preview {
 }
 
 .chat-subagent-activity__indicator {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--muted);
+}
+
+.chat-subagent-activity__claw {
+  display: inline-flex;
+  color: inherit;
+}
+
+.chat-subagent-activity__claw > svg {
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+  stroke: none;
+}
+
+.chat-subagent-activity__indicator--running {
   color: var(--accent);
 }
 
-.chat-subagent-activity__indicator svg {
-  width: 15px;
-  height: 15px;
+.chat-subagent-activity__indicator--completed {
+  animation: chatSubagentCompleted 3s ease-out;
 }
 
-.chat-subagent-activity__indicator--finished {
-  color: var(--ok);
+.chat-subagent-activity__indicator--cancelled {
+  opacity: 0.55;
 }
 
-.chat-subagent-activity__indicator--failed {
+.chat-subagent-activity__badge {
+  position: absolute;
+  right: -2px;
+  bottom: -1px;
+  display: inline-flex;
+  padding: 1px;
+  border-radius: 50%;
+  background: var(--bg);
+  color: var(--warn);
+}
+
+.chat-subagent-activity__badge > svg {
+  width: 9px;
+  height: 9px;
+}
+
+.chat-subagent-activity__indicator--failed .chat-subagent-activity__badge {
   color: var(--destructive);
 }
 
 .chat-subagent-activity__label {
+  min-width: 0;
+  overflow: hidden;
   color: var(--text);
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+@keyframes chatSubagentCompleted {
+  0%,
+  50% {
+    color: var(--ok);
+  }
+
+  100% {
+    color: var(--muted);
+  }
 }
 
 .chat-subagent-activity__snippet--updated {
@@ -1466,16 +1530,6 @@ openclaw-tooltip.chat-tasks-status__preview {
   }
 }
 .chat-tool-failure {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 4px 8px 8px 28px;
-  color: var(--danger);
-  font-size: var(--control-ui-text-sm);
-  overflow-wrap: anywhere;
-}
-
-.chat-tool-failure__status {
   flex: none;
-  font-weight: 500;
+  white-space: nowrap;
 }

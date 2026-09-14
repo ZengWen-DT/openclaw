@@ -7,6 +7,7 @@ import { resetDiagnosticStabilityRecorderForTest } from "../logging/diagnostic-s
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { registerPluginHttpRoute } from "./http-registry.js";
+import { PluginInstance } from "./plugin-instance.js";
 import { createEmptyPluginRegistry } from "./registry.js";
 import { resetPluginRuntimeStateForTest } from "./runtime.js";
 import { listPluginServiceHealthFailures } from "./service-health.js";
@@ -16,6 +17,7 @@ import {
   type PluginServicesHandle,
 } from "./services.js";
 import { createRegistry, createServiceConfig } from "./services.test-support.js";
+import { createPluginRecord } from "./status.test-helpers.js";
 import type { OpenClawPluginService, OpenClawPluginServiceContext } from "./types.js";
 
 describe("plugin service reload", () => {
@@ -98,13 +100,7 @@ describe("plugin service reload", () => {
       entered.resolve();
       return release.promise;
     });
-    const registry = createEmptyPluginRegistry();
-    registry.services.push({
-      pluginId: "exporter",
-      origin: "workspace",
-      source: "test",
-      service: { id: "exporter", start, stop },
-    });
+    const registry = createRegistry([{ id: "exporter", start, stop }], "exporter");
     const handle = await startPluginServices({
       registry,
       config: configFor("https://first.example"),
@@ -243,19 +239,18 @@ describe("plugin service reload", () => {
   it("applies each queued service reload to the current service instance", async () => {
     const configs: OpenClawConfig[] = [];
     const stop = vi.fn();
-    const registry = createEmptyPluginRegistry();
-    registry.services.push({
-      pluginId: "exporter",
-      source: "test",
-      origin: "workspace",
-      service: {
-        id: "exporter",
-        start: (ctx) => {
-          configs.push(ctx.config);
+    const registry = createRegistry(
+      [
+        {
+          id: "exporter",
+          start: (ctx) => {
+            configs.push(ctx.config);
+          },
+          stop,
         },
-        stop,
-      },
-    });
+      ],
+      "exporter",
+    );
     const initial = configFor("https://initial.example");
     const first = configFor("https://first.example");
     const second = configFor("https://second.example");
@@ -274,13 +269,7 @@ describe("plugin service reload", () => {
     const stop = vi.fn(() => {
       throw new Error("cleanup refused");
     });
-    const registry = createEmptyPluginRegistry();
-    registry.services.push({
-      pluginId: "exporter",
-      origin: "workspace",
-      source: "test",
-      service: { id: "exporter", start, stop },
-    });
+    const registry = createRegistry([{ id: "exporter", start, stop }], "exporter");
     const handle = await startPluginServices({ registry, config: {} });
     handles.add(handle);
     await expect(handle.reload({}, new Set(["exporter"]))).rejects.toThrow();
@@ -303,13 +292,9 @@ describe("plugin service reload", () => {
         process.off(event, listener);
       });
       const queuedStart = vi.fn();
-      const registry = createEmptyPluginRegistry();
-      registry.services.push(
-        {
-          pluginId: "candidate",
-          origin: "workspace",
-          source: "test",
-          service: {
+      const registry = createRegistry(
+        [
+          {
             id: "held",
             start: async (context) => {
               contexts.push(context);
@@ -324,13 +309,9 @@ describe("plugin service reload", () => {
             },
             stop,
           },
-        },
-        {
-          pluginId: "candidate",
-          origin: "workspace",
-          source: "test",
-          service: { id: "queued", start: queuedStart },
-        },
+          { id: "queued", start: queuedStart },
+        ],
+        "candidate",
       );
       const startupTrace = createGatewayStartupTrace(createSubsystemLogger("test/service-startup"));
       const broadcastPluginEvent = vi.fn();
@@ -415,6 +396,76 @@ describe("plugin service reload", () => {
     },
   );
 
+  it("stops resources acquired by a managed service after its startup deadline", async () => {
+    vi.useFakeTimers();
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    const event = "plugin-managed-service-late-start";
+    const listener = () => {};
+    const before = process.listenerCount(event);
+    const registry = createEmptyPluginRegistry();
+    const record = createPluginRecord({ id: "candidate" });
+    registry.plugins.push(record);
+    const instance = new PluginInstance(record.id, { record, registry });
+    const dispatch = vi.fn();
+    const invoke = instance.wrap(dispatch);
+    let lateFailure: unknown;
+    const stop = vi.fn(() => {
+      process.off(event, listener);
+    });
+    registry.services.push({
+      pluginId: record.id,
+      origin: "workspace",
+      source: "test",
+      service: instance.wrap({
+        id: "late-start",
+        async start() {
+          entered.resolve();
+          await release.promise;
+          try {
+            invoke();
+          } catch (error) {
+            lateFailure = error;
+          }
+          process.on(event, listener);
+        },
+        stop,
+      }),
+    });
+    const startup = startPluginServices({
+      registry,
+      config: {},
+      throwOnStartError: true,
+      onHandle: (handle) => handles.add(handle),
+    }).catch((error: unknown) => error);
+    let retirement: Promise<unknown> | undefined;
+    try {
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(PLUGIN_SERVICE_REPLACEMENT_STOP_TIMEOUT_MS);
+      expect(await startup).toBeInstanceOf(AggregateError);
+      retirement = instance.dispose();
+      await vi.advanceTimersByTimeAsync(PLUGIN_SERVICE_REPLACEMENT_STOP_TIMEOUT_MS);
+      expect(() => instance.run(() => "retired dispatch")).toThrow("reloaded or disabled");
+      release.resolve();
+      await Promise.allSettled([...handles].map((handle) => handle.stop()));
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(lateFailure).toMatchObject({
+        message: expect.stringContaining("reloaded or disabled"),
+      });
+      expect(stop).toHaveBeenCalledOnce();
+      expect(process.listenerCount(event)).toBe(before);
+      await retirement;
+      expect(instance.lifecycle.signal.aborted).toBe(true);
+    } finally {
+      release.resolve();
+      await startup;
+      await Promise.allSettled([...handles].map((handle) => handle.stop()));
+      await retirement;
+      process.off(event, listener);
+      vi.useRealTimers();
+    }
+  });
+
   it.each([false, true])(
     "transfers an admitted reload restart with its handle (successor stopped=%s)",
     async (stopSuccessor) => {
@@ -432,16 +483,7 @@ describe("plugin service reload", () => {
         }),
       };
       const sibling = { id: "sibling", start: vi.fn(), stop: vi.fn() };
-      const registry = createEmptyPluginRegistry();
-      for (const entry of [service, sibling]) {
-        registry.services.push({
-          pluginId: "plugin:test",
-          service: entry,
-          source: "test",
-          origin: "workspace",
-          rootDir: "/plugins/test-plugin",
-        });
-      }
+      const registry = createRegistry([service, sibling]);
       const initialConfig: OpenClawConfig = {};
       const reloadConfig: OpenClawConfig = {};
       const successorConfig: OpenClawConfig = {};

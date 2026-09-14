@@ -29,8 +29,6 @@ import type {
 } from "../../plugins/session-catalog.js";
 import { getGatewayRestartDrainSignal } from "../../process/gateway-work-admission.js";
 import { authorizeGatewaySessionCreation } from "../operator-role-policy.js";
-import { projectSessionParticipant } from "../session-identity-projection.js";
-import type { SessionActorProfileIdentity } from "../session-utils-contracts.js";
 import { resolveAgentIdOrRespondError } from "./agent-id-shared.js";
 import { authorizeSessionCatalogThread } from "./session-catalog-authorization.js";
 import { continueAuthorizedSessionCatalog } from "./session-catalog-continue.js";
@@ -49,6 +47,7 @@ import {
   catalogRegistrationSnapshot,
   type CatalogRegistrationSnapshot,
 } from "./session-catalog-provider-access.js";
+import { readAuthorizedSessionCatalog } from "./session-catalog-read.js";
 import { catalogStartHandler } from "./session-catalog-terminal-start.js";
 import {
   filterSessionCatalogHost,
@@ -303,7 +302,7 @@ function catalogResult(
   error?: SessionCatalog["error"],
   createSession?: NonNullable<SessionCatalog["capabilities"]["createSession"]>,
 ): SessionCatalog {
-  const result: SessionCatalog = {
+  return {
     id: provider.id,
     label: provider.label,
     capabilities: {
@@ -315,11 +314,8 @@ function catalogResult(
     },
     ...(shareRoute ? { shareRoute } : {}),
     hosts,
+    ...(error ? { error } : {}),
   };
-  if (error) {
-    result.error = error;
-  }
-  return result;
 }
 
 export const sessionCatalogHandlers: GatewayRequestHandlers = {
@@ -361,6 +357,7 @@ export const sessionCatalogHandlers: GatewayRequestHandlers = {
     } else {
       selected = catalogRegistrations.providers;
     }
+    const providerAudiences = new Map(selected.map((provider) => [provider.id, provider.audience]));
     const config = context.getRuntimeConfig();
     const resolvedAgent = resolveAgentIdOrRespondError({
       rawAgentId: request.agentId,
@@ -381,18 +378,24 @@ export const sessionCatalogHandlers: GatewayRequestHandlers = {
       const requestEntries = createSessionCatalogRequestEntrySnapshot({
         cfg: currentConfig,
         fallbackAgentId: resolvedAgent.agentId,
+        sessionKeys: result.catalogs
+          .flatMap((catalog) => catalog.hosts)
+          .flatMap((host) => host.sessions)
+          .flatMap(({ sessionKey }) => (sessionKey ? [sessionKey] : [])),
       });
       return {
         catalogs: result.catalogs.map((catalog) => ({
           ...catalog,
           hosts: catalog.hosts.map((host) =>
             filterSessionCatalogHost(
-              requestEntries.projectHostSessions(host, result.instances),
+              requestEntries.projectHostSessions(
+                host,
+                result.instances,
+                providerAudiences.get(catalog.id),
+              ),
               visibility,
               {
-                audience: catalogRegistrations.providers.find(
-                  (provider) => provider.id === catalog.id,
-                )?.audience,
+                audience: providerAudiences.get(catalog.id),
                 requestEntries,
               },
             ),
@@ -481,11 +484,13 @@ export const sessionCatalogHandlers: GatewayRequestHandlers = {
     );
     subscribe(progress);
     const operation = (async () => {
-      const requestEntries = createSessionCatalogRequestEntrySnapshot({
-        cfg: config,
-        fallbackAgentId: resolvedAgent.agentId,
-      });
-      requestEntries.freeze();
+      const requestEntries = selected.some((provider) => provider.audience !== "session-viewers")
+        ? createSessionCatalogRequestEntrySnapshot({
+            cfg: config,
+            fallbackAgentId: resolvedAgent.agentId,
+          })
+        : undefined;
+      requestEntries?.freeze();
       const instances: SessionCatalogInstances = new Map();
       const listNodes = createSessionCatalogRequestNodeSnapshot();
       const catalogList = await Promise.all(
@@ -499,7 +504,7 @@ export const sessionCatalogHandlers: GatewayRequestHandlers = {
               }
             : undefined;
           const onHost = (host: SessionCatalog["hosts"][number]) => {
-            requestEntries.captureHostInstances(host, instances);
+            requestEntries?.captureHostInstances(host, instances);
             const catalog = catalogResult(provider, shareRoute, [host], undefined, createSession);
             // Progressive frames are an optimization. The final RPC response remains
             // authoritative when a slow client drops an intermediate host update.
@@ -514,13 +519,13 @@ export const sessionCatalogHandlers: GatewayRequestHandlers = {
                 limitPerHost: request.limitPerHost,
                 hostIds: request.hostIds,
                 ...(request.cursors !== undefined ? { cursors: request.cursors } : {}),
-                sessionEntries: requestEntries.sessionEntries,
+                sessionEntries: requestEntries?.sessionEntries,
                 listNodes,
                 ...lifetime,
               }),
             );
             for (const host of hosts) {
-              requestEntries.captureHostInstances(host, instances);
+              requestEntries?.captureHostInstances(host, instances);
             }
             return catalogResult(provider, shareRoute, hosts, undefined, createSession);
           } catch (error) {
@@ -580,23 +585,18 @@ export const sessionCatalogHandlers: GatewayRequestHandlers = {
       if (!authorization) {
         return;
       }
-      const { catalogId: _catalogId, ...providerRequest } = request;
-      const page = await provider.read({
-        ...providerRequest,
-        agentId: authorization.agentId,
-        allowProcessHomeFallback: authorization.allowProcessHomeFallback,
+      const result = await readAuthorizedSessionCatalog({
+        request,
+        provider,
+        ...authorization,
+        client,
+        context,
       });
-      const profiles = new Map<string, SessionActorProfileIdentity | undefined>();
-      respond(true, {
-        ...page,
-        items: page.items.map((item) =>
-          item.sender?.identity.type === "profile"
-            ? Object.assign({}, item, {
-                sender: projectSessionParticipant(item.sender.identity, profiles),
-              })
-            : item,
-        ),
-      });
+      if (!result.ok) {
+        respond(false, undefined, result.error);
+        return;
+      }
+      respond(true, result.page);
     } catch (error) {
       const details = catalogError(error);
       respond(

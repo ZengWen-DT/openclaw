@@ -158,16 +158,13 @@ describe("auth.test boot call", () => {
     const actualClient = await vi.importActual<typeof import("../client.js")>("../client.js");
     useSlackStartupAuthClientOnce(actualClient.createSlackStartupAuthClient);
     const globalFetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          bot_id: "BBOT",
-          is_enterprise_install: false,
-          ok: true,
-          team_id: "T1",
-          user_id: "UBOT",
-        }),
-        { headers: { "content-type": "application/json" }, status: 200 },
-      ),
+      Response.json({
+        bot_id: "BBOT",
+        is_enterprise_install: false,
+        ok: true,
+        team_id: "T1",
+        user_id: "UBOT",
+      }),
     );
     const monitor = startSlackMonitor(monitorSlackProvider);
     try {
@@ -342,7 +339,7 @@ describe("auth.test boot call", () => {
       expect(events).toContain("auth-settled");
       expect(events.indexOf("auth-settled")).toBeLessThan(events.indexOf("app-start"));
       expect(runtimeLog).toHaveBeenCalledWith(
-        expect.stringMatching(/slack auth\.test failed at boot .*timeout/i),
+        expect.stringMatching(/slack auth\.test failed at boot .*(?:timeout|timed out)/i),
       );
     } finally {
       monitor.controller.abort();

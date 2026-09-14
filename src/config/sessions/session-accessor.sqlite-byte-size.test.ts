@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { clearNodeSqliteKyselyCacheForDatabase } from "../../infra/kysely-sync.js";
 import { openNodeSqliteDatabase } from "../../infra/node-sqlite.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
@@ -13,11 +14,15 @@ import {
 } from "./session-accessor.sqlite-active-events.js";
 import type { SessionTranscriptReadScope } from "./session-accessor.sqlite-contract.js";
 import { readTranscriptRawDelta } from "./session-accessor.sqlite-delta.js";
-import { readRecentSessionTranscriptHistoryEvents } from "./session-accessor.sqlite-history-events.js";
+import {
+  readRecentSessionTranscriptHistoryEvents,
+  readTranscriptDisplayDelta,
+} from "./session-accessor.sqlite-history-events.js";
 import {
   shouldRebuildSessionTranscriptIndexSynchronously,
   SYNC_REBUILD_MAX_BYTES,
 } from "./session-transcript-index.js";
+import { transcriptMessage } from "./transcript-message.test-support.js";
 
 type SqliteInstruction = {
   opcode: string;
@@ -40,6 +45,7 @@ const readers: Array<
       ),
   ],
   ["raw delta", (scope) => readTranscriptRawDelta(scope, { maxBytes: 1024 })],
+  ["display delta", (scope) => readTranscriptDisplayDelta(scope, { maxBytes: 1024 })],
   [
     "visible delta",
     (scope) => readSessionTranscriptVisibleMessageDeltaCore(scope, { maxBytes: 1024 }),
@@ -88,19 +94,15 @@ it.each(readers)("sizes %s without reading transcript overflow payloads", async 
     };
     await persistSessionTranscriptTurn(scope, {
       messages: [
-        { eventId: "large", parentId: null, message: { role: "user", content: "🦞".repeat(4096) } },
-        {
-          eventId: "display",
-          parentId: "large",
-          message: {
-            role: "custom",
-            customType: "activity",
-            excludeFromContext: true,
-            display: true,
-            content: "🦞".repeat(4096),
-          },
-        },
-        { eventId: "small", parentId: "display", message: { role: "assistant", content: "done" } },
+        transcriptMessage("large", null, { role: "user", content: "🦞".repeat(4096) }),
+        transcriptMessage("display", "large", {
+          role: "custom",
+          customType: "activity",
+          excludeFromContext: true,
+          display: true,
+          content: "🦞".repeat(4096),
+        }),
+        transcriptMessage("small", "display", { role: "assistant", content: "done" }),
       ],
       touchSessionEntry: false,
     });
@@ -133,7 +135,7 @@ it.each(readers)("sizes %s without reading transcript overflow payloads", async 
       }
       if (
         query.includes("context_eligible") &&
-        statement.columns().some(({ name }) => name === "session_id")
+        statement.columns().some(({ name }) => name === "session_id" || name === "has_unclassified")
       ) {
         readinessQueries.push(query);
       }
@@ -206,37 +208,65 @@ it.each(["incoming", "stored"])(
   },
 );
 
-it.each([false, true])(
-  "keeps a contiguous usage tail with newest oversized=%s",
-  async (oversized) => {
-    await withOpenClawTestState({ label: "usage-tail-budget" }, async (state) => {
-      const scope = {
-        agentId: "main",
-        env: state.env,
-        sessionId: "usage-tail",
-        sessionKey: "agent:main:usage-tail",
-      };
+it.each(
+  [
+    { name: "usage", read: readRecentSessionTranscriptMessageEvents },
+    { name: "history", read: readRecentSessionTranscriptHistoryEvents },
+  ].flatMap((reader) =>
+    [false, true].map((oversized) => ({ name: reader.name, read: reader.read, oversized })),
+  ),
+)("bounds $name tail sizing with newest oversized=$oversized", async ({ read, oversized }) => {
+  await withOpenClawTestState({ label: "usage-tail-budget" }, async (state) => {
+    const scope = {
+      agentId: "main",
+      env: state.env,
+      sessionId: "usage-tail",
+      sessionKey: "agent:main:usage-tail",
+    };
+    await persistSessionTranscriptTurn(scope, {
+      messages: [
+        ...Array.from({ length: 1_000 }, (_, index) => `old-${index}`),
+        "large",
+        "new",
+      ].map((eventId, index, ids) => ({
+        eventId,
+        parentId: ids[index - 1] ?? null,
+        message: {
+          role: "assistant",
+          content:
+            eventId === "large" || (oversized && eventId === "new") ? "🦞".repeat(1024) : eventId,
+        },
+      })),
+      touchSessionEntry: false,
+    });
+    const options = { maxBytes: 1024, maxLines: 1_000, maxMessages: 1_000 };
+    read(scope, options);
+    const { db } = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
+    const counter = trackSqliteStatementExecutions(db, ["metadata"], (sql) =>
+      sql.includes("session_transcript_active_events") &&
+      sql.includes("message_position") &&
+      sql.includes("serialized_bytes")
+        ? "metadata"
+        : null,
+    );
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const page = read(scope, options);
+        expect(page.totalMessages).toBe(1_002);
+        expect(page.events).toEqual([
+          expect.objectContaining({ event: expect.objectContaining({ id: "new" }) }),
+        ]);
+      }
+      // Each read sizes the newest event and its rejecting predecessor, then releases
+      // its SQLite iterator so the same connection can commit the next transcript write.
+      expect(counter.rowCounts.metadata).toBeLessThanOrEqual(6);
       await persistSessionTranscriptTurn(scope, {
-        messages: ["old", "large", "new"].map((eventId, index, ids) => ({
-          eventId,
-          parentId: ids[index - 1] ?? null,
-          message: {
-            role: "assistant",
-            content:
-              eventId === "large" || (oversized && eventId === "new") ? "🦞".repeat(1024) : eventId,
-          },
-        })),
+        messages: [transcriptMessage("next", "new", { role: "user", content: "next" })],
         touchSessionEntry: false,
       });
-      const page = readRecentSessionTranscriptMessageEvents(scope, {
-        maxBytes: 1024,
-        maxLines: 10,
-        maxMessages: 10,
-      });
-      expect(page.totalMessages).toBe(3);
-      expect(page.events).toEqual([
-        expect.objectContaining({ event: expect.objectContaining({ id: "new" }) }),
-      ]);
-    });
-  },
-);
+      expect(read(scope, options).events.at(-1)?.event).toMatchObject({ id: "next" });
+    } finally {
+      counter.restore();
+    }
+  });
+});

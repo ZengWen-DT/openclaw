@@ -280,6 +280,13 @@ marks the call failed unless `ok` or `success` is explicitly `true`, even when
 uses one of those names belongs under a wrapper key, such as `{ card }`,
 instead of at the top level of `details`.
 
+For a tool-owned timeout, return `timedOut: true` and a positive integer
+`timeoutMs` in `details`. If the agent provides no final reply, OpenClaw includes
+that duration in the fallback warning without exposing raw error text. Return
+`partial: true` with a nonempty `results` array when usable partial results are
+available; the warning includes their count. These diagnostics do not turn an
+incomplete operation into a successful call.
+
 ## Configuration
 
 `configSchema` is optional. Omit it and OpenClaw applies a strict empty object
@@ -429,9 +436,10 @@ openclaw plugins install npm-pack:./openclaw-plugin-stock-quotes-0.1.0.tgz
 openclaw plugins inspect stock-quotes --runtime --json
 ```
 
-After installing, restart or reload the Gateway and ask the agent to use the
-tool. If the tool is not visible, inspect the plugin runtime and the effective
+Installation applies to a running local Gateway automatically; start the Gateway
+if it was stopped. Ask the agent to use the tool. If the tool is not visible, inspect the plugin runtime and the effective
 tool catalog before changing code (see [Troubleshooting](#troubleshooting)).
+After later source or manifest edits, use [plugin Reload](/cli/plugins#reload).
 
 ## Publish
 
@@ -498,7 +506,7 @@ Check these in order:
 2. `openclaw plugins validate --root <plugin-root> --entry ./dist/index.js`
 3. `openclaw.plugin.json` has `contracts.tools` with the expected tool names.
 4. `package.json` has `openclaw.extensions: ["./dist/index.js"]`.
-5. The Gateway was restarted or reloaded after installing the plugin.
+5. Installation reported successful runtime application; after source edits or a repaired activation failure, run `openclaw plugins reload <plugin-id>`.
 
 ## See also
 

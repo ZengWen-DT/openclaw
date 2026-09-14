@@ -9,11 +9,12 @@ title: "Update troubleshooting"
 Failed updates enter built-in triage after update recovery settles. In an
 interactive terminal, OpenClaw shows the selected agent, saved prompt path when
 available, and use of your own account/tokens, then asks before launching
-[triage](/cli/triage). Enter or `y` proceeds, `n` preserves diagnostics and prints
-handoff commands, and no answer within 30 seconds proceeds as Yes with a notice.
-With `--yes`, `--json`, or no interactive
-terminal, it prepares diagnostics and handoff commands without launching an
-agent. The original update failure and exit status remain authoritative;
+[triage](/cli/triage). Only an affirmative Yes proceeds. Enter, `n`, cancellation,
+or no answer within 30 seconds skips the launch and preserves diagnostics and
+a manual recovery command. Use `openclaw triage --agent codex` to choose another
+agent. With `--yes`, `--json`, or no interactive terminal, eligible failures can
+start one owned automatic repair; other failures retain diagnostics and handoff
+commands. See [automatic recovery](/cli/triage#automatic-failure-handoff). The original update failure and exit status remain authoritative;
 diagnostics do not turn a failed update into a successful one.
 
 In the Control UI, a failed attempt opens **Ask OpenClaw** with its recorded
@@ -68,7 +69,10 @@ localized guidance or executes an arbitrary command string.
 1. Select **Check status** when the Gateway restarted, disconnected, or did not
    report a final result. This reads `update.status`; it does not start another
    update. Recovery controls stay disabled while the check is pending, and a
-   rejected request appears as an error on the page.
+   rejected request appears as an error on the page or in the update dialog.
+   The dialog shows **Checking status…** while waiting and **Status refreshed.**
+   after a successful read, even when the recorded failure has not changed.
+   If the Gateway is disconnected, reconnect before checking or retrying.
 2. Open **View details** and address the recorded failing step. Diagnostic text
    is bounded and redacted for display; use Gateway logs when more context is
    required.

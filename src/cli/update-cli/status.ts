@@ -14,6 +14,7 @@ import {
   resolveUpdateChannelDisplay,
 } from "../../infra/update-channels.js";
 import { checkUpdateStatus, formatGitInstallLabel } from "../../infra/update-check.js";
+import { readUpdateRunReportHealth } from "../../infra/update-run-report-health.js";
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
 import { readUpdateRunStatus } from "../../infra/update-run-status.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -36,7 +37,7 @@ export async function updateStatusCommand(opts: UpdateStatusOptions): Promise<vo
 
   const update = await checkUpdateStatus({
     root,
-    timeoutMs: timeoutMs ?? 3500,
+    timeoutMs,
     fetchGit: true,
     useDetachedDevUpstream: configChannel === "dev",
     includeRegistry: true,
@@ -150,7 +151,12 @@ export async function updateStatusCommand(opts: UpdateStatusOptions): Promise<vo
           "Abandoned update detected; the Gateway will reconcile its recorded outcome. Run openclaw update repair to reconcile it now.",
         );
       }
-      const report = renderUpdateRunReport(run);
+      const report = renderUpdateRunReport(
+        run,
+        run.status === "failed"
+          ? { currentHealth: await readUpdateRunReportHealth(run.verification, { timeoutMs }) }
+          : {},
+      );
       if (!abandonedRun && !staleRun) {
         defaultRuntime.log(report.headline);
       }

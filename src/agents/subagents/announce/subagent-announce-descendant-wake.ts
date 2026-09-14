@@ -12,13 +12,13 @@ import {
   resolveSubagentAnnounceTimeoutMs,
 } from "./subagent-announce-delivery.js";
 import type {
-  callGateway,
+  callSubagentLifecycleGateway,
   dispatchGatewayMethodInProcess,
   getRuntimeConfig,
 } from "./subagent-announce.runtime.js";
 
 type DescendantWakeDeps = {
-  callGateway: typeof callGateway;
+  callGateway: typeof callSubagentLifecycleGateway;
   dispatchGatewayMethodInProcess: typeof dispatchGatewayMethodInProcess;
   getRuntimeConfig: typeof getRuntimeConfig;
   replaceSubagentRunAfterSteer: typeof import("../registry/subagent-registry-runtime.js").replaceSubagentRunAfterSteer;
@@ -152,7 +152,7 @@ export async function runDescendantWake(params: {
     await terminateUnownedWake();
     return false;
   }
-  const replaced = await params.deps.replaceSubagentRunAfterSteer({
+  const replaced = params.deps.replaceSubagentRunAfterSteer({
     previousRunId: params.runId,
     nextRunId: wakeRunId,
     lifecycleGeneration: wakeLifecycleGeneration,

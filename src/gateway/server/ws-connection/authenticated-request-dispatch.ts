@@ -2,7 +2,11 @@ import {
   GATEWAY_CLIENT_IDS,
   GATEWAY_CLIENT_MODES,
 } from "../../../../packages/gateway-protocol/src/client-info.js";
-import type { ConnectParams, ErrorShape } from "../../../../packages/gateway-protocol/src/index.js";
+import type {
+  ConnectParams,
+  ErrorShape,
+  ResponseFrame,
+} from "../../../../packages/gateway-protocol/src/index.js";
 import {
   ErrorCodes,
   errorShape,
@@ -17,6 +21,7 @@ import {
 } from "../../../infra/diagnostic-trace-context.js";
 import { runOutsideGatewayRootWorkAdmission } from "../../../process/gateway-work-admission.js";
 import { createLazyPromise } from "../../../shared/lazy-runtime.js";
+import { createExpectedProfileBinding } from "../../expected-profile.js";
 import type { GatewayRequestEntry } from "../../server-request-entry.js";
 import { classifyGatewayStaleInstall } from "../../stale-install.js";
 import { formatForLog, logWs } from "../../ws-log.js";
@@ -83,6 +88,7 @@ export function createGatewayAuthenticatedRequestDispatcher(params: {
     client: GatewayWsClient,
     frameBytes: number,
     admission?: "continuation",
+    sendResponse: (frame: ResponseFrame) => ReturnType<typeof send> = send,
   ): Promise<void> => {
     // After handshake, accept only req frames
     if (!validateRequestFrame(parsed)) {
@@ -101,6 +107,7 @@ export function createGatewayAuthenticatedRequestDispatcher(params: {
     const diagnostics = createGatewayRpcDiagnostics(req.method, getMethodRegistry, extraHandlers);
     logWs("in", "req", { connId, id: req.id, method: req.method });
     const context = buildRequestContext();
+    const expectedProfileBinding = createExpectedProfileBinding(req.expectedProfileId, client);
     const hasCurrentClientAuthority = () => {
       if (closeInvalidatedClient(client, req.method)) {
         return false;
@@ -123,7 +130,7 @@ export function createGatewayAuthenticatedRequestDispatcher(params: {
       }
       return true;
     };
-    const respond = (
+    const publishResponse = (
       ok: boolean,
       payload?: unknown,
       error?: ErrorShape,
@@ -136,13 +143,18 @@ export function createGatewayAuthenticatedRequestDispatcher(params: {
       try {
         let responseOk = ok;
         let responseError = error;
-        let sendResult = send({ type: "res", id: req.id, ok, payload, error });
+        let sendResult = sendResponse({ type: "res", id: req.id, ok, payload, error });
         if (sendResult.kind === "serialization") {
           const detail = formatForLog(sendResult.error);
           logGateway.error(`response serialization failed method=${req.method}: ${detail}`);
           responseOk = false;
           responseError = errorShape(ErrorCodes.UNAVAILABLE, "response serialization failed");
-          sendResult = send({ type: "res", id: req.id, ok: responseOk, error: responseError });
+          sendResult = sendResponse({
+            type: "res",
+            id: req.id,
+            ok: responseOk,
+            error: responseError,
+          });
         }
         diagnostics?.response(
           sendResult.kind === "sent" ? (responseOk ? "ok" : "error") : "unavailable",
@@ -189,6 +201,7 @@ export function createGatewayAuthenticatedRequestDispatcher(params: {
       }
     };
 
+    const respond = expectedProfileBinding?.guardResponse(publishResponse) ?? publishResponse;
     const agentRuntimeIdentity = client.internal?.agentRuntimeIdentity;
     const hasCurrentRuntimeAuthority = () => {
       if (
@@ -269,9 +282,13 @@ export function createGatewayAuthenticatedRequestDispatcher(params: {
             respondWithAuthority(
               false,
               undefined,
-              errorShape(ErrorCodes.UNAVAILABLE, "gateway request start capacity exceeded", {
-                retryable: true,
-              }),
+              errorShape(
+                ErrorCodes.UNAVAILABLE,
+                "The server is busy. Please try again in a moment.",
+                {
+                  retryable: true,
+                },
+              ),
             );
             return;
           }
@@ -296,6 +313,7 @@ export function createGatewayAuthenticatedRequestDispatcher(params: {
               client,
               isWebchatConnect: params.isWebchatConnect,
               hasCurrentClientAuthority,
+              expectedProfileBinding,
               extraHandlers,
               methodRegistry: getMethodRegistry?.(),
               context,

@@ -9,6 +9,7 @@ import {
   TSDOWN_NON_SDK_DTS_CONFIG_GROUPS,
   TSDOWN_PLUGIN_SDK_DTS_CONFIG_GROUPS,
 } from "../../scripts/lib/tsdown-config-groups.mts";
+import { runtimeProcessDeclarationEntries } from "../../scripts/lib/vitest-worker-declarations.mts";
 import { materializeDeclarationPackages } from "./declaration-fixture-packages.js";
 import { createScriptTestHarness } from "./test-helpers.js";
 
@@ -111,7 +112,6 @@ export function createFixture(
   for (const name of [
     ".bin",
     "@openclaw/fs-safe",
-    "@typescript/native-preview",
     "playwright-core",
     "tsx",
     ...(groups === TSDOWN_NON_SDK_DTS_CONFIG_GROUPS ? ["pretty-ms"] : []),
@@ -163,9 +163,11 @@ export function createFixture(
   });
   // These owners derive runtime inputs from import.meta.url; keep that graph inside the fixture.
   const runtimeEntryOwners = new Set([
-    "src/infra/runtime-process-entrypoints.ts",
+    ...Object.values(runtimeProcessDeclarationEntries),
     "src/infra/update-managed-service-handoff-runtime-assets.ts",
-    "extensions/memory-core/src/memory/manager-search-knn-entrypoint.ts",
+    "src/infra/update-managed-service-handoff-native-loader.ts",
+    "src/shared/freebsd-process-identity.ts",
+    "src/infra/node-runtime-executable.ts",
     "packages/normalization-core/src/mountinfo-path.ts",
     "packages/normalization-core/src/record-coerce.ts",
   ]);
@@ -185,6 +187,8 @@ export function createFixture(
     "extensions/browser/src/browser/playwright-core.runtime.ts",
     "src/infra/net/undici-dispatcher-options.ts",
     "packages/gateway-client/src/websocket.ts",
+    "src/gateway/desktop/node-stream-broker.ts",
+    "src/gateway/desktop/observe-bridge.ts",
     "src/gateway/server-runtime-state.ts",
     "src/realtime-transcription/websocket-session.ts",
   ]) {

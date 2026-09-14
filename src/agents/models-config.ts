@@ -30,11 +30,7 @@ import {
 } from "./agent-scope.js";
 import { resolveAuthProfileDatabasePath } from "./auth-profiles/sqlite.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
-import {
-  MODELS_JSON_STATE,
-  type ModelsJsonReadyResult,
-  type ModelsJsonReadyState,
-} from "./models-config-state.js";
+import { MODELS_JSON_STATE, type ModelsJsonReadyResult } from "./models-config-state.js";
 import { planOpenClawModelsJson, type PreparedModelsConfigContext } from "./models-config.plan.js";
 import { repairPluginModelCatalogTransportMetadata } from "./plugin-model-catalog-repair.js";
 import {
@@ -44,11 +40,7 @@ import {
   replacePersistedPluginModelCatalogs,
   type PersistedPluginModelCatalog,
 } from "./plugin-model-catalog.js";
-
-type PreparedOpenClawModelsJsonSource = ModelsJsonReadyResult & {
-  fingerprint: string;
-  workspaceDir?: string;
-};
+import type { ProviderCatalogInventoryCapture } from "./provider-model-membership.js";
 
 type ModelsConfigPluginMetadataSnapshot = Pick<
   PluginMetadataSnapshot,
@@ -68,6 +60,7 @@ type EnsureOpenClawModelsJsonOptions = {
 
 type PlanOpenClawModelsJsonSourceOptions = EnsureOpenClawModelsJsonOptions & {
   authStore?: AuthProfileStore;
+  providerCatalogInventory?: ProviderCatalogInventoryCapture;
 };
 
 type PlannedOpenClawModelsJsonSource = Readonly<{
@@ -280,18 +273,14 @@ function prepareModelsConfigContext(
   };
 }
 
-async function withModelsJsonWriteLock<T>(targetPath: string, run: () => Promise<T>): Promise<T> {
-  return await MODELS_JSON_STATE.writeQueue.enqueue(targetPath, run);
-}
-
 /** Ensures models.json and the agent SQLite catalog cache are current. */
-async function prepareOpenClawModelsJsonSource(
+export async function ensureOpenClawModelsJson(
   config?: OpenClawConfig,
   agentDirOverride?: string,
   options: EnsureOpenClawModelsJsonOptions = {},
-): Promise<PreparedOpenClawModelsJsonSource> {
+): Promise<ModelsJsonReadyResult> {
   const context = prepareModelsConfigContext(config, agentDirOverride, options);
-  const { agentDir, workspaceDir } = context;
+  const { agentDir } = context;
   const targetPath = path.join(agentDir, "models.json");
   const fingerprint = await buildModelsJsonFingerprint(context);
   const cacheKey = modelsJsonReadyCacheKey(targetPath, fingerprint);
@@ -299,14 +288,10 @@ async function prepareOpenClawModelsJsonSource(
   if (cached && !options.onProviderCatalogOutcome) {
     const settled = await cached;
     await ensureModelsFileModeForModelsJson(targetPath);
-    return {
-      ...settled.result,
-      fingerprint: settled.fingerprint,
-      ...(workspaceDir ? { workspaceDir } : {}),
-    };
+    return { ...settled };
   }
 
-  const pending: Promise<ModelsJsonReadyState> = withModelsJsonWriteLock(targetPath, async () => {
+  const pending = MODELS_JSON_STATE.writeQueue.enqueue(targetPath, async () => {
     // Ensure config env vars (e.g. AWS_PROFILE, AWS_ACCESS_KEY_ID) are
     // are available to provider discovery without mutating process.env.
     const existingModelsFile = await readExistingModelsFile(targetPath);
@@ -322,7 +307,7 @@ async function prepareOpenClawModelsJsonSource(
         agentDir,
         pluginCatalogWrites: plan.pluginCatalogWrites,
       });
-      return { fingerprint, result: { agentDir, wrote: wrotePluginCatalog } };
+      return { agentDir, wrote: wrotePluginCatalog };
     }
 
     if (plan.action === "noop") {
@@ -331,7 +316,7 @@ async function prepareOpenClawModelsJsonSource(
         pluginCatalogWrites: plan.pluginCatalogWrites,
       });
       await ensureModelsFileModeForModelsJson(targetPath);
-      return { fingerprint, result: { agentDir, wrote: wrotePluginCatalog } };
+      return { agentDir, wrote: wrotePluginCatalog };
     }
 
     await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
@@ -339,13 +324,14 @@ async function prepareOpenClawModelsJsonSource(
     const wroteRoot = existingRoot !== plan.contents;
     if (wroteRoot) {
       await privateFileStore(path.dirname(targetPath)).writeText("models.json", plan.contents);
+      MODELS_JSON_STATE.costCache.delete(agentDir);
     }
     await ensureModelsFileModeForModelsJson(targetPath);
     const wrotePluginCatalog = writePluginCatalogsForModelsJson({
       agentDir,
       pluginCatalogWrites: plan.pluginCatalogWrites,
     });
-    return { fingerprint, result: { agentDir, wrote: wroteRoot || wrotePluginCatalog } };
+    return { agentDir, wrote: wroteRoot || wrotePluginCatalog };
   });
   MODELS_JSON_STATE.readyCache.set(cacheKey, pending);
   try {
@@ -354,16 +340,9 @@ async function prepareOpenClawModelsJsonSource(
     const refreshedCacheKey = modelsJsonReadyCacheKey(targetPath, refreshedFingerprint);
     if (refreshedCacheKey !== cacheKey) {
       MODELS_JSON_STATE.readyCache.delete(cacheKey);
-      MODELS_JSON_STATE.readyCache.set(
-        refreshedCacheKey,
-        Promise.resolve({ fingerprint: refreshedFingerprint, result: settled.result }),
-      );
+      MODELS_JSON_STATE.readyCache.set(refreshedCacheKey, Promise.resolve(settled));
     }
-    return {
-      ...settled.result,
-      fingerprint: refreshedFingerprint,
-      ...(workspaceDir ? { workspaceDir } : {}),
-    };
+    return { ...settled };
   } catch (error) {
     if (MODELS_JSON_STATE.readyCache.get(cacheKey) === pending) {
       MODELS_JSON_STATE.readyCache.delete(cacheKey);
@@ -381,7 +360,10 @@ export async function planOpenClawModelsJsonSource(
   agentDirOverride?: string,
   options: PlanOpenClawModelsJsonSourceOptions = {},
 ): Promise<PlannedOpenClawModelsJsonSource> {
-  const context = prepareModelsConfigContext(config, agentDirOverride, options);
+  const context = {
+    ...prepareModelsConfigContext(config, agentDirOverride, options),
+    providerCatalogInventory: options.providerCatalogInventory,
+  };
   const { agentDir } = context;
   const existingModelsFile = await readExistingModelsFile(path.join(agentDir, "models.json"));
   const existingPluginCatalogs = loadPersistedPluginModelCatalogsReadOnly(agentDir);
@@ -402,14 +384,4 @@ export async function planOpenClawModelsJsonSource(
         ? existingPluginCatalogs
         : materializePlannedPluginCatalogs(plan.pluginCatalogWrites),
   };
-}
-
-/** Ensures models.json and the agent SQLite catalog cache are current. */
-export async function ensureOpenClawModelsJson(
-  config?: OpenClawConfig,
-  agentDirOverride?: string,
-  options: EnsureOpenClawModelsJsonOptions = {},
-): Promise<ModelsJsonReadyResult> {
-  const prepared = await prepareOpenClawModelsJsonSource(config, agentDirOverride, options);
-  return { agentDir: prepared.agentDir, wrote: prepared.wrote };
 }

@@ -1,3 +1,4 @@
+import { messageClientSourcesKey } from "../../../../src/chat/message-client-source.js";
 import {
   accumulatedStreamText,
   trimAccumulatedStreamPrefix,
@@ -17,7 +18,7 @@ import { getOrCreateSessionCacheValue, setSessionCacheValue } from "./session-ca
 export {
   isPendingSendMessage,
   persistedMessageEntryId,
-  readPendingSendFailure,
+  readPendingSendStatus,
 } from "./chat-thread-items.ts";
 export {
   assistantGroupCanOwnActiveRunStatus,
@@ -75,6 +76,8 @@ function sameMessageGroup(previous: MessageGroup, next: MessageGroup): boolean {
     previous.senderLabel === next.senderLabel &&
     previous.senderSession?.sessionKey === next.senderSession?.sessionKey &&
     previous.senderSession?.agentId === next.senderSession?.agentId &&
+    messageClientSourcesKey(previous.sourceClients ?? []) ===
+      messageClientSourcesKey(next.sourceClients ?? []) &&
     JSON.stringify(previous.sender) === JSON.stringify(next.sender) &&
     JSON.stringify(previous.replyToSender) === JSON.stringify(next.replyToSender) &&
     previous.isStreaming === next.isStreaming &&
@@ -87,7 +90,8 @@ function sameMessageGroup(previous: MessageGroup, next: MessageGroup): boolean {
         candidate !== undefined &&
         entry.key === candidate.key &&
         entry.message === candidate.message &&
-        entry.duplicateCount === candidate.duplicateCount
+        entry.duplicateCount === candidate.duplicateCount &&
+        entry.hasVisibleContent === candidate.hasVisibleContent
       );
     })
   );
@@ -206,6 +210,8 @@ function stabilizeChatItems(
         prior.senderLabel !== item.senderLabel ||
         prior.senderSession?.sessionKey !== item.senderSession?.sessionKey ||
         prior.senderSession?.agentId !== item.senderSession?.agentId ||
+        messageClientSourcesKey(prior.sourceClients ?? []) !==
+          messageClientSourcesKey(item.sourceClients ?? []) ||
         senderIdentityKey(prior.sender) !== senderIdentityKey(item.sender)
       ) {
         continue;
@@ -387,7 +393,7 @@ export function getExpandedUserMessages(sessionKey: string): Map<string, boolean
 export type AssistantMessageExpansionState =
   | { status: "loading"; revision: number }
   | { status: "error"; revision: number }
-  | { status: "loaded"; markdown: string; revision: number };
+  | { status: "loaded"; markdown: string; message?: unknown; revision: number };
 
 export function syncToolCardExpansionState(
   sessionKey: string,

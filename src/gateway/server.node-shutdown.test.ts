@@ -1,5 +1,6 @@
 import path from "node:path";
 import { expect, test, vi } from "vitest";
+import { WebSocket } from "ws";
 import { WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE } from "../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
 import { writeConfigFile } from "../config/config.js";
@@ -115,7 +116,7 @@ test.for(["direct", "restart"] as const)(
             }
             return result;
           });
-          kernel.registerGatewayLifetimeSidecars([{ stop: stopDependencies }]);
+          kernel.registerGatewayLifetimeSidecars({ stop: stopDependencies });
           node = await connectGatewayClient({
             url: `ws://127.0.0.1:${port}`,
             token: "secret",
@@ -163,6 +164,12 @@ test.for(["direct", "restart"] as const)(
               }
             },
           });
+          const ping = vi.spyOn(WebSocket.prototype, "ping");
+          await expect(
+            kernel.nodeRegistry.checkConnectivity(pairedNode.identity.deviceId),
+          ).resolves.toEqual({ ok: true });
+          expect(ping).toHaveBeenCalledOnce();
+          ping.mockRestore();
           await node.request("node.runnerInventory.update", {
             protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
             workerHost: {

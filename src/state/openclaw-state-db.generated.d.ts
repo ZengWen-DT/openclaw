@@ -1411,6 +1411,9 @@ export interface TaskRuns {
   detail_json: string | null;
   ended_at: number | null;
   error: string | null;
+  execution_owner_host: string | null;
+  execution_owner_pid: number | null;
+  execution_owner_start_identity: number | null;
   label: string | null;
   last_event_at: number | null;
   last_tool_name: string | null;
@@ -1698,6 +1701,21 @@ export interface WorktreeProvisionedFileChunks {
   worktree_id: string;
 }
 
+export interface WorktreeTemplates {
+  backend: string;
+  cache_key: string;
+  common_dir: string;
+  content_key: string;
+  created_at: number;
+  id: string;
+  last_used_at: number;
+  path: string;
+  repo_root: string;
+  source_commit: string;
+  status: string;
+  worktree_root: string;
+}
+
 export interface Worktrees {
   base_ref: string;
   branch: string;
@@ -1842,5 +1860,6 @@ export interface DB {
   workspace_path_aliases: WorkspacePathAliases;
   workspace_setup_state: WorkspaceSetupState;
   worktree_provisioned_file_chunks: WorktreeProvisionedFileChunks;
+  worktree_templates: WorktreeTemplates;
   worktrees: Worktrees;
 }

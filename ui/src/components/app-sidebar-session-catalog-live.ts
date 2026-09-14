@@ -88,10 +88,15 @@ function isSessionsCatalogHostEvent(value: unknown): value is SessionsCatalogHos
 
 /** Tracks one sidebar's progressive list streams and adaptive refresh lifecycle. */
 export class SessionCatalogLiveState {
+  refreshScope = {};
   timer: ReturnType<typeof globalThis.setTimeout> | null = null;
   requestGeneration: number | null = null;
   sawChange = false;
   refreshPending = false;
+  readonly discoveryPages = new Map<
+    string,
+    { headCursor: string; nextCursor: string; depth: number; cursors: Set<string> }
+  >();
 
   private activationTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   private activationQueueIfActive = false;
@@ -114,6 +119,7 @@ export class SessionCatalogLiveState {
   }
 
   clear() {
+    this.refreshScope = {};
     this.cancelScheduledRefreshes();
     this.requestGeneration = null;
     this.requestOwner = null;
@@ -124,7 +130,36 @@ export class SessionCatalogLiveState {
     this.presenceSignature = null;
     this.sawChange = false;
     this.refreshPending = false;
+    this.discoveryPages.clear();
     this.refetchOwner = null;
+  }
+
+  resumeDiscovery(catalogs: SessionCatalog[]): SessionCatalog[] {
+    const currentKeys = new Set<string>();
+    const result = catalogs.map((catalog) => ({
+      ...catalog,
+      hosts: catalog.hosts.map((host) => {
+        const key = sessionCatalogHostKey(catalog.id, host.hostId);
+        currentKeys.add(key);
+        const discovery = this.discoveryPages.get(key);
+        if (!discovery || host.error || catalog.error) {
+          return host;
+        }
+        // Recheck the head on every poll. A changed anchor or newly visible row
+        // starts fresh; empty prefixes only belong to the current finite sweep.
+        if (host.sessions.length > 0 || host.nextCursor !== discovery.headCursor) {
+          this.discoveryPages.delete(key);
+          return host;
+        }
+        return { ...host, nextCursor: discovery.nextCursor };
+      }),
+    }));
+    for (const key of this.discoveryPages.keys()) {
+      if (!currentKeys.has(key)) {
+        this.discoveryPages.delete(key);
+      }
+    }
+    return result;
   }
 
   mergeFinal(catalogs: SessionCatalog[], currentCatalogs: readonly SessionCatalog[]) {
@@ -314,8 +349,16 @@ export class SessionCatalogLiveState {
       );
     } else {
       const currentHost = currentCatalog.hosts.find((host) => host.hostId === freshHost.hostId);
+      const discovery = this.discoveryPages.get(hostKey);
+      if (
+        discovery &&
+        !freshHost.error &&
+        (freshHost.sessions.length > 0 || freshHost.nextCursor !== discovery.headCursor)
+      ) {
+        this.discoveryPages.delete(hostKey);
+      }
       const mergedHost =
-        (params.pageDepths.get(hostKey) ?? 0) > 0
+        (params.pageDepths.get(hostKey) ?? 0) > 0 || this.discoveryPages.has(hostKey)
           ? preserveExpandedCatalogHost(freshHost, currentHost)
           : freshHost;
       const hosts = currentHost
@@ -423,6 +466,8 @@ export async function refreshSessionCatalogsLive(params: {
   pageDepths: ReadonlyMap<string, number>;
   connected: () => boolean;
   applyFinal: (catalogs: SessionCatalog[], revisedCatalogIds: ReadonlySet<string>) => void;
+  /** Finish bounded discovery; true keeps the existing fast refresh cadence. */
+  continueRefresh: () => Promise<boolean>;
   applyError: (error: unknown) => void;
   refresh: () => void;
 }) {
@@ -434,6 +479,7 @@ export async function refreshSessionCatalogsLive(params: {
   const hadCatalogs = params.catalogs().length > 0;
   const previousMaterialSnapshot = sessionCatalogMaterialSnapshot(params.catalogs());
   let refetchOwner: symbol | null = null;
+  let continueSoon = false;
   const requestIsCurrent = () =>
     live.ownsRequest(requestOwner) &&
     generation === params.currentGeneration() &&
@@ -467,6 +513,9 @@ export async function refreshSessionCatalogsLive(params: {
       new Set([...params.catalogs(), ...catalogs].map((catalog) => catalog.id)),
     );
     live.markFinal({ catalogs, hadCatalogs, previousMaterialSnapshot, progressSequence });
+    live.endRefetch(refetchOwner);
+    refetchOwner = null;
+    continueSoon = await params.continueRefresh();
   } catch (error) {
     // A transient poll failure must not collapse already visible or expanded pages.
     if (revisionIsCurrent()) {
@@ -482,7 +531,7 @@ export async function refreshSessionCatalogsLive(params: {
     if (ownsRequest && requestIsCurrent() && params.connected()) {
       const delayMs = live.refreshPending
         ? 0
-        : live.sawChange
+        : live.sawChange || continueSoon
           ? SESSION_CATALOG_CHANGED_REFRESH_MS
           : SESSION_CATALOG_STABLE_REFRESH_MS;
       live.refreshPending = false;

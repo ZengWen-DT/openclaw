@@ -39,6 +39,7 @@ import {
   gatewayProbeResultWasRateLimited,
 } from "./gateway-health-auth-diagnostic.js";
 import { formatGatewayClosedDiagnostic, formatHealthCheckFailure } from "./health-format.js";
+import { formatSqliteWalHealthWarning } from "./sqlite-wal-health.js";
 import { formatTelemetryExporterSummary } from "./telemetry-exporter-summary.js";
 
 type GatewayMemoryProbe = {
@@ -133,6 +134,8 @@ export async function checkGatewayHealth(params: {
   cfg: OpenClawConfig;
   timeoutMs?: number;
 }): Promise<{ healthOk: boolean; authenticated: boolean; status?: StatusSummary }> {
+  const { bindAgentToolGatewayRequest } = await import("../agents/tools/in-process-gateway.js");
+  const requestGateway = bindAgentToolGatewayRequest({ hostedOnly: true });
   const timeoutMs =
     typeof params.timeoutMs === "number" && params.timeoutMs > 0 ? params.timeoutMs : 10_000;
   let healthOk = false;
@@ -153,6 +156,13 @@ export async function checkGatewayHealth(params: {
     noteCliGatewayVersionSkew(status);
     if (status.startupMigrationWarning) {
       note(sanitizeTerminalText(status.startupMigrationWarning), "Startup migration warnings");
+    }
+    const sqliteWalWarning = formatSqliteWalHealthWarning(status.sqliteWal);
+    if (sqliteWalWarning) {
+      note(sqliteWalWarning, "SQLite WAL");
+    }
+    if (status.startupRecoveryWarning) {
+      note(sanitizeTerminalText(status.startupRecoveryWarning), "Startup session recovery");
     }
     const secretDegradations = projectDoctorSecretRuntimeDegradations(status);
     if (secretDegradations.length > 0) {
@@ -181,7 +191,7 @@ export async function checkGatewayHealth(params: {
         timeoutMs: 6000,
         config: params.cfg,
       }),
-      callGateway({
+      requestGateway({
         method: "diagnostics.stability",
         params: { type: "telemetry.exporter", limit: 1000 },
         timeoutMs: Math.min(timeoutMs, 6000),
@@ -276,10 +286,12 @@ export async function probeGatewayMemoryStatus(params: {
   cfg: OpenClawConfig;
   timeoutMs?: number;
 }): Promise<GatewayMemoryProbe> {
+  const { bindAgentToolGatewayRequest } = await import("../agents/tools/in-process-gateway.js");
+  const requestGateway = bindAgentToolGatewayRequest({ hostedOnly: true });
   const timeoutMs =
     typeof params.timeoutMs === "number" && params.timeoutMs > 0 ? params.timeoutMs : 8_000;
   try {
-    const payload = await callGateway<DoctorMemoryStatusPayload>({
+    const payload = await requestGateway<DoctorMemoryStatusPayload>({
       method: "doctor.memory.status",
       params: { probe: false },
       timeoutMs,

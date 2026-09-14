@@ -258,7 +258,7 @@ describe("sessions page lifecycle", () => {
 
   it.each([
     ["green", "Green"],
-    [null, "Default"],
+    [null, "No color"],
   ] as const)("patches color %s from the sessions page menu", async (color, label) => {
     const row = {
       key: "agent:main:color",
@@ -664,6 +664,7 @@ describe("sessions page lifecycle", () => {
       message: 'Stop the cloud worker for "Cloud task"?',
       confirmLabel: "Stop worker",
       danger: true,
+      signal: expect.any(AbortSignal),
     });
     expect(request).toHaveBeenCalledWith(
       "sessions.reclaim",
@@ -712,6 +713,7 @@ describe("sessions page lifecycle", () => {
       message: 'Stop the cloud worker for "Cloud task"?',
       confirmLabel: "Stop worker",
       danger: true,
+      signal: expect.any(AbortSignal),
     });
     expect(request).toHaveBeenCalledWith(
       "sessions.reclaim",

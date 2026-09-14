@@ -90,6 +90,7 @@ import {
 import { resolveConversationCapabilityProfile } from "../conversation-capability-profile.js";
 import { resolveConversationToolPolicies } from "../conversation-tool-policy-pipeline.js";
 import { resolveDelegationCapability } from "../delegation-capability.js";
+import { mergeForcedEmbeddedAttemptToolsAllow } from "../embedded-agent-runner/run/attempt-tool-construction-plan.js";
 import type { DeferredEmbeddedRunLifecycleManager } from "../embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import type { RunEmbeddedAgentInternalParams } from "../embedded-agent-runner/run/internal-params.js";
 import { runEmbeddedAgent, type EmbeddedAgentRunResult } from "../embedded-agent.js";
@@ -620,6 +621,7 @@ export function runAgentAttempt(params: {
   suppressPromptPersistenceOnRetry?: boolean;
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
   assistantErrorTranscript?: RunEmbeddedAgentInternalParams["assistantErrorTranscript"];
+  authProfileFailurePolicy?: RunEmbeddedAgentInternalParams["authProfileFailurePolicy"];
   contextEngineLogicalTurnLease?: ContextEngineLogicalTurnLease;
   onUserMessagePersisted?: (message: Extract<AgentMessage, { role: "user" }>) => void;
   onContextEngineTurnCandidate?: (facts: ContextEngineTurnAttemptFacts) => void;
@@ -805,6 +807,16 @@ export function runAgentAttempt(params: {
         ? ["message"]
         : undefined
     : params.opts.toolsAllow;
+  // Collector output is mandatory result transport, even on a narrowed tool
+  // surface. The CLI grant is minted from this list and enforced exactly on the
+  // loopback server, so a plugin-launched or cron-continued collector needs the
+  // same forced merge the embedded runner applies before its own construction.
+  const cliRuntimeToolsAllow = mergeForcedEmbeddedAttemptToolsAllow(runtimeToolsAllow, {
+    forceToolNames:
+      params.opts.swarmCollector && params.opts.swarmOutputSchema
+        ? ["structured_output"]
+        : undefined,
+  });
   const disableTools =
     params.opts.modelRun === true ||
     (isSubagentAnnounceHandoff &&
@@ -880,18 +892,21 @@ export function runAgentAttempt(params: {
     harnessRuntime: agentHarnessPolicy.runtime,
     allowHarnessAuthProfileForwarding: !isCliExecutionProvider,
   });
-  const cliAuthProfileId = allowCliAuthProfileForwarding
-    ? resolveCliExecutionAuthProfileId({
-        cliExecutionProvider,
-        authProfileProvider: params.authProfileProvider,
-        config: params.cfg,
-        agentDir: params.agentDir,
-        selected: harnessAuthSelection,
-      })
-    : undefined;
-  const authProfileId = allowCliAuthProfileForwarding
-    ? cliAuthProfileId
-    : runtimeAuthPlan.forwardedAuthProfileId;
+  // Explicit pins keep synchronous validation; automatic selection needs the admitted binding.
+  const cliAuthNeedsSessionBinding =
+    allowCliAuthProfileForwarding &&
+    !isRawModelRun &&
+    (!harnessAuthSelection.authProfileId || harnessAuthSelection.authProfileIdSource === "auto");
+  const authProfileId =
+    allowCliAuthProfileForwarding && !cliAuthNeedsSessionBinding
+      ? resolveCliExecutionAuthProfileId({
+          cliExecutionProvider,
+          authProfileProvider: params.authProfileProvider,
+          config: params.cfg,
+          agentDir: params.agentDir,
+          selected: harnessAuthSelection,
+        })
+      : runtimeAuthPlan.forwardedAuthProfileId;
   const embeddedAgentProvider = resolveOpenAIRuntimeProvider({
     provider: params.providerOverride,
     harnessRuntime: agentHarnessPolicy.runtime,
@@ -930,8 +945,18 @@ export function runAgentAttempt(params: {
             throw createAgentRunSupersededAbortError();
           }
         }
-        const diagnosticOwner = params.deferredLifecycle?.handoffToCli();
         const cliSessionBinding = getCliSessionBinding(params.sessionEntry, cliExecutionProvider);
+        const cliAuthProfileId = cliAuthNeedsSessionBinding
+          ? resolveCliExecutionAuthProfileId({
+              cliExecutionProvider,
+              authProfileProvider: params.authProfileProvider,
+              config: params.cfg,
+              agentDir: params.agentDir,
+              selected: harnessAuthSelection,
+              sessionBinding: cliSessionBinding,
+            })
+          : authProfileId;
+        const diagnosticOwner = params.deferredLifecycle?.handoffToCli();
         const cliProcessCwd = params.cwd ? resolveUserPath(params.cwd) : params.workspaceDir;
         const cliContinuationBody = params.opts.execApprovalContinuationPromptRange
           ? resizeExecApprovalContinuationPrompt({
@@ -1106,7 +1131,11 @@ export function runAgentAttempt(params: {
                     return Boolean(claimed);
                   },
                   restoreCliSessionFork: async () => {
-                    const restored = await restoreCliSessionForkInStore(forkStoreParams);
+                    // Restoring the fork is current-owner cleanup, including after cancellation.
+                    const restored = await restoreCliSessionForkInStore({
+                      ...forkStoreParams,
+                      assertCommitAllowed: assertSettlementCurrent,
+                    });
                     if (restored) {
                       params.sessionEntry = restored;
                     }
@@ -1123,7 +1152,7 @@ export function runAgentAttempt(params: {
                   },
                 }
               : {}),
-            authProfileId,
+            authProfileId: cliAuthProfileId,
             bootstrapPromptWarningSignaturesSeen,
             bootstrapPromptWarningSignature,
             // Image discovery must use the original turn, before retry/history decoration.
@@ -1146,7 +1175,7 @@ export function runAgentAttempt(params: {
             approvalReviewerDeviceId: params.opts.approvalReviewerDeviceId,
             bashElevated: params.opts.bashElevated,
             toolsAllow: resolveCliRuntimeToolsAllow(
-              runtimeToolsAllow,
+              cliRuntimeToolsAllow,
               params.opts.toolsAllowIsDefault,
             ),
             // This loop is the command-origin sibling of the auto-reply fallback
@@ -1251,6 +1280,7 @@ export function runAgentAttempt(params: {
             shouldClearFailedCliSessionBinding({
               error: err,
               binding: failedCliSessionBinding,
+              bindingReplacedDuringRun: failedCliSessionId !== activeCliSessionBinding?.sessionId,
               hasNewGeneratedMediaTask: hasNewGeneratedMediaTaskForSessionKey(
                 params.sessionKey,
                 mediaTaskIdsBefore,
@@ -1405,6 +1435,7 @@ export function runAgentAttempt(params: {
     suppressNextUserMessagePersistence: params.suppressPromptPersistenceOnRetry === true,
     userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
     assistantErrorTranscript: params.assistantErrorTranscript,
+    authProfileFailurePolicy: params.authProfileFailurePolicy,
     contextEngineLogicalTurnLease: params.contextEngineLogicalTurnLease,
     onContextEngineTurnCandidate: params.onContextEngineTurnCandidate,
     onUserMessagePersisted: params.onUserMessagePersisted,

@@ -7,6 +7,7 @@ import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { icons } from "../../components/icons.ts";
 import type { ImageLightboxItem } from "../../components/image-lightbox.ts";
 import { t } from "../../i18n/index.ts";
+import { registerNewSessionSetupEnglish } from "../../i18n/locales/en-new-session-setup.ts";
 import "../../components/tooltip.ts";
 import type { ChatAttachment, HumanMention } from "../../lib/chat/chat-types.ts";
 import { updateHumanMentions, type HumanMentionInput } from "../../lib/chat/human-mentions.ts";
@@ -15,6 +16,7 @@ import {
   createChatAttachmentDropHandlers,
   handleChatAttachmentPaste,
   renderAttachmentPreview,
+  renderAttachmentReadStatus,
   renderChatAttachmentInputs,
 } from "../chat/components/chat-attachments.ts";
 import {
@@ -58,7 +60,10 @@ import {
 } from "./composer-capability-controls.ts";
 import type { NewSessionVisibility } from "./create-params.ts";
 
+registerNewSessionSetupEnglish();
+
 export type NewSessionComposerOptions = {
+  renderCritters: (floorEnabled: boolean) => TemplateResult | typeof nothing;
   attachmentLimits?: { maxBytes: number; maxImageBytes: number };
   attachments: ChatAttachment[];
   canSubmit: boolean;
@@ -118,12 +123,12 @@ function renderStartControl(options: NewSessionComposerOptions) {
       }"
       ?disabled=${!options.canSubmit && !reasonedBlock}
       aria-disabled=${String(!options.canSubmit)}
-      aria-busy=${String(options.submitting)}
+      aria-busy=${String(options.submitting || options.pendingAttachmentReads > 0)}
       aria-label=${startLabel}
       @click=${() => submitNewSession(options)}
     >
       ${
-        options.submitting
+        options.submitting || options.pendingAttachmentReads > 0
           ? icons.loader
           : options.nativeTerminal
             ? icons.squareTerminal
@@ -134,6 +139,8 @@ function renderStartControl(options: NewSessionComposerOptions) {
 }
 
 export class NewSessionComposerTextareaController {
+  // An opening gets one cast; typing and async picker updates never reroll it.
+  readonly critterVisit = Math.random();
   private textarea: HTMLTextAreaElement | null = null;
   private placeholderFrame: number | null = null;
   private placeholderStartedAt: number | null = null;
@@ -567,9 +574,18 @@ export function renderNewSessionComposer(options: NewSessionComposerOptions) {
           options.requestUpdate();
         }}
       >
+        ${options.renderCritters(
+          !composerLocked &&
+            visibleMessage.length === 0 &&
+            options.attachments.length === 0 &&
+            options.pendingAttachmentReads === 0 &&
+            !menuVisible &&
+            !options.textareaController.capabilityMenuOpen,
+        )}
         ${mentionMenu.render(mentionMenuHost, options.requestUpdate)}
         ${options.nativeTerminal ? nothing : renderChatAttachmentInputs(attachmentProps)}
         ${renderAttachmentPreview(attachmentProps)}
+        ${renderAttachmentReadStatus(options.pendingAttachmentReads)}
         ${renderSelectedHumanMentions(options.message, options.mentions, () =>
           options.onInput(options.message, []),
         )}
@@ -697,11 +713,6 @@ export function renderNewSessionComposer(options: NewSessionComposerOptions) {
             </div>
           </div>
         </div>
-        ${
-          options.pendingAttachmentReads > 0
-            ? html`<span class="sr-only" role="status">${t("newSession.readingAttachment")}</span>`
-            : nothing
-        }
       </div>
       ${
         options.blockedSubmitNotice

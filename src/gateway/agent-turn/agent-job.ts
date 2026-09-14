@@ -76,6 +76,7 @@ type DedupeObservation =
 
 type AgentJobState = {
   jobs: Map<string, AgentJobRecord>;
+  oldestCachedAt: number;
   runStarts: Map<string, number>;
   pendingErrors: Map<string, PendingAgentRunTerminal>;
   pendingTimeouts: Map<string, PendingAgentRunTerminal>;
@@ -87,6 +88,7 @@ const agentJobState = resolveGlobalSingleton<AgentJobState>(
   Symbol.for("openclaw.agentJobState"),
   () => ({
     jobs: new Map(),
+    oldestCachedAt: Infinity,
     runStarts: new Map(),
     pendingErrors: new Map(),
     pendingTimeouts: new Map(),
@@ -101,6 +103,7 @@ const agentJobState = resolveGlobalSingleton<AgentJobState>(
       clearTimeout(pending.timer);
     }
     state.jobs.clear();
+    state.oldestCachedAt = Infinity;
     state.runStarts.clear();
     state.pendingErrors.clear();
     state.pendingTimeouts.clear();
@@ -124,12 +127,18 @@ function nextAgentRunVersion(): number {
 }
 
 function pruneAgentRunCache(now = Date.now()) {
+  if (now - agentJobState.oldestCachedAt <= AGENT_RUN_CACHE_TTL_MS) {
+    return;
+  }
+  let oldestCachedAt = Infinity;
   for (const [runId, job] of agentJobs) {
     if (now - job.cachedAt <= AGENT_RUN_CACHE_TTL_MS) {
+      oldestCachedAt = Math.min(oldestCachedAt, job.cachedAt);
       continue;
     }
     agentJobs.delete(runId);
   }
+  agentJobState.oldestCachedAt = oldestCachedAt;
 }
 
 function enforceAgentRunCacheMaxEntries() {
@@ -214,6 +223,9 @@ function recordAgentRunSnapshot(
     cachedAt: entry.cachedAt,
     snapshotsBySource,
   });
+  // A lower bound remains safe when a write refreshes or eviction removes the oldest job.
+  // Recompute only once that bound can expire, without changing insertion-order eviction.
+  agentJobState.oldestCachedAt = Math.min(agentJobState.oldestCachedAt, entry.cachedAt);
   enforceAgentRunCacheMaxEntries();
   for (const waiter of agentRunWaiters.get(entry.runId) ?? []) {
     waiter();
@@ -481,6 +493,8 @@ export function setGatewayDedupeEntry(params: {
   dedupe: Map<string, DedupeEntry>;
   key: string;
   entry: DedupeEntry;
+  /** Admission owns a new attempt; retain request identity while retiring its old terminal. */
+  startNewAttempt?: true;
 }) {
   const existing = params.dedupe.get(params.key);
   const existingObservation = existing ? parseDedupeObservation(existing) : undefined;
@@ -496,6 +510,7 @@ export function setGatewayDedupeEntry(params: {
   if (
     existingOutcome &&
     isStickyAgentRunTerminalOutcome(existingOutcome) &&
+    !(params.startNewAttempt && incomingObservation.state === "active") &&
     (!incomingOutcome ||
       mergeAgentRunTerminalOutcome(existingOutcome, incomingOutcome) === existingOutcome)
   ) {
@@ -552,8 +567,16 @@ function getFreshestDedupeSnapshot(
 
 function getCanonicalAgentRunSnapshot(
   snapshotsBySource: Map<AgentJobSource, AgentRunSnapshot>,
+  source?: "chat",
 ): AgentRunSnapshot | undefined {
-  const dedupe = getFreshestDedupeSnapshot(snapshotsBySource);
+  const dedupe = source
+    ? snapshotsBySource.get(source)
+    : getFreshestDedupeSnapshot(snapshotsBySource);
+  // A chat waiter must observe completed delivery before consuming the same
+  // run's lifecycle outcome and reply. An agent dedupe cannot close that barrier.
+  if (source && !dedupe) {
+    return undefined;
+  }
   const lifecycle = snapshotsBySource.get("lifecycle");
   if (!dedupe || !lifecycle) {
     return dedupe ?? lifecycle;
@@ -570,11 +593,9 @@ function getAgentRunSnapshot(params: {
 }): AgentRunSnapshot | undefined {
   pruneAgentRunCache();
   const job = agentJobs.get(params.runId);
-  const snapshot = params.source
-    ? job?.snapshotsBySource.get(params.source)
-    : job
-      ? getCanonicalAgentRunSnapshot(job.snapshotsBySource)
-      : undefined;
+  const snapshot = job
+    ? getCanonicalAgentRunSnapshot(job.snapshotsBySource, params.source)
+    : undefined;
   return snapshot && snapshot.version > params.afterVersion ? snapshot : undefined;
 }
 

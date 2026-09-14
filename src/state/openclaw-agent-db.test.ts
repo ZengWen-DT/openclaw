@@ -32,6 +32,7 @@ import {
   claimOpenClawAgentDatabaseLease,
   releaseOpenClawAgentDatabaseLease,
 } from "./openclaw-agent-db-lease.js";
+import { withFreshOpenClawAgentDatabaseReadOnly } from "./openclaw-agent-db-readonly-open.js";
 import { withOpenClawAgentDatabaseReadOnly } from "./openclaw-agent-db-readonly.js";
 import {
   createOpenClawAgentDatabasePathMatcher,
@@ -238,9 +239,11 @@ function ensureV13WorkerAgentDatabaseTemplate(): string {
     ).toEqual([{ name: "session_entries" }, { name: "session_routes" }, { name: "sessions" }]);
     expect(
       verified
-        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'session_nodes'")
-        .get(),
-    ).toBeUndefined();
+        .prepare(
+          "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('session_nodes', 'session_pending_inputs', 'session_input_completions')",
+        )
+        .all(),
+    ).toEqual([]);
   } finally {
     verified.close();
   }
@@ -312,6 +315,7 @@ function downgradeCurrentAgentDatabaseToV13(databasePath: string): void {
       PRAGMA legacy_alter_table = OFF;
       DROP TABLE session_participants;
       DROP TABLE session_pending_inputs;
+      DROP TABLE session_input_completions;
       DROP INDEX IF EXISTS idx_agent_session_windows_updated_at;
       DROP INDEX IF EXISTS idx_agent_session_windows_created_at;
       DROP INDEX IF EXISTS idx_agent_session_windows_conversation;
@@ -676,6 +680,7 @@ function launchAgentSchemaOpener(params: {
 }) {
   const agentModuleUrl = new URL("./openclaw-agent-db.ts", import.meta.url).href;
   const stateModuleUrl = new URL("./openclaw-state-db.ts", import.meta.url).href;
+  const sqliteModuleUrl = new URL("../infra/node-sqlite.ts", import.meta.url).href;
   const child = spawn(
     process.execPath,
     [
@@ -684,7 +689,7 @@ function launchAgentSchemaOpener(params: {
       "--input-type=module",
       "-e",
       `
-        import { DatabaseSync } from "node:sqlite";
+        import { openNodeSqliteDatabase } from ${JSON.stringify(sqliteModuleUrl)};
         import {
           ensureOpenClawAgentDatabaseSchema,
         } from ${JSON.stringify(agentModuleUrl)};
@@ -692,7 +697,7 @@ function launchAgentSchemaOpener(params: {
           closeOpenClawStateDatabaseForTest,
         } from ${JSON.stringify(stateModuleUrl)};
 
-        const db = new DatabaseSync(process.env.OPENCLAW_AGENT_DB_RACE_PATH);
+        const db = openNodeSqliteDatabase(process.env.OPENCLAW_AGENT_DB_RACE_PATH);
         db.exec("PRAGMA busy_timeout = 5000;");
         const observedDb = new Proxy(db, {
           get(target, property) {
@@ -1235,7 +1240,7 @@ describe("openclaw agent database", () => {
     },
   );
 
-  it("preserves missing-table adaptation for borrowed and fresh read-only queries", () => {
+  it.each([false, true])("preserves missing-table adaptation (fresh-only: %s)", (freshOnly) => {
     const stateDir = createTempStateDir();
     const options = {
       agentId: "worker-1",
@@ -1245,8 +1250,11 @@ describe("openclaw agent database", () => {
     const owner = openOpenClawAgentDatabase(options);
     owner.db.exec("DROP TABLE session_nodes;");
     let readDb: DatabaseSync | undefined;
+    const readOnly = freshOnly
+      ? withFreshOpenClawAgentDatabaseReadOnly
+      : withOpenClawAgentDatabaseReadOnly;
     const read = (throwOnMissingTable = false) =>
-      withOpenClawAgentDatabaseReadOnly(
+      readOnly(
         ({ db }) => {
           readDb = db;
           return db.prepare("SELECT * FROM session_nodes").all();
@@ -1257,7 +1265,8 @@ describe("openclaw agent database", () => {
 
     expect(read()).toEqual({ found: false, reason: "table-missing" });
     expect(() => read(true)).toThrow(/no such table: session_nodes/);
-    expect(readDb).toBe(owner.db);
+    expect(readDb === owner.db).toBe(!freshOnly);
+    expect(readDb?.isOpen).toBe(!freshOnly);
     expect(owner.db.isOpen).toBe(true);
     expect(closeOpenClawAgentDatabaseByPath(databasePath)).toBe(true);
     expect(read()).toEqual({ found: false, reason: "table-missing" });
@@ -5028,7 +5037,7 @@ describe("openclaw agent database", () => {
     );
   });
 
-  it("rechecks integrity after a validated handle is physically reopened", () => {
+  it("retains integrity verification until the runtime lifecycle resets", () => {
     const stateDir = createTempStateDir();
     const env = { OPENCLAW_STATE_DIR: stateDir };
     const databasePath = openOpenClawAgentDatabase({ agentId: "worker-1", env }).path;
@@ -5036,6 +5045,8 @@ describe("openclaw agent database", () => {
     closeOpenClawStateDatabaseForTest();
     createUnsafeIndexDrift(databasePath);
 
+    expect(openOpenClawAgentDatabase({ agentId: "worker-1", env }).db.isOpen).toBe(true);
+    closeOpenClawAgentDatabasesForTest();
     expect(() => openOpenClawAgentDatabase({ agentId: "worker-1", env })).toThrow(
       /integrity_check failed.*missing from index unsafe_index_records_value/iu,
     );
@@ -5309,7 +5320,7 @@ describe("openclaw agent database", () => {
     {
       kind: "malformed ownership metadata",
       schema: "CREATE TABLE schema_meta (meta_key TEXT);",
-      expectedError: /no such column: role/,
+      expectedError: /no such column: (?:role\b|"role")/,
     },
   ])(
     "preserves the refusal for a populated v0 database with $kind",

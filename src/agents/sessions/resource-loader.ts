@@ -10,8 +10,8 @@ import chalk from "chalk";
 import { isPathInside } from "../../infra/path-guards.js";
 import type { Skill } from "../../skills/loading/session.js";
 import { loadSkills } from "../../skills/loading/session.js";
-import { CONFIG_DIR_NAME } from "../config.js";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.js";
+import { CONFIG_DIR_NAME } from "../package-metadata.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
@@ -27,11 +27,11 @@ import type {
   ExtensionRuntime,
   LoadExtensionsResult,
 } from "./extensions/types.js";
-import { DefaultPackageManager, type PathMetadata, type ResolvedPaths } from "./package-manager.js";
+import { DefaultPackageManager, type ResolvedPaths } from "./package-manager.js";
 import type { PromptTemplate } from "./prompt-templates.js";
 import { loadPromptTemplates } from "./prompt-templates.js";
 import { SettingsManager } from "./settings-manager.js";
-import { createSourceInfo, type SourceInfo } from "./source-info.js";
+import { createSourceInfo, type PathMetadata, type SourceInfo } from "./source-info.js";
 
 export interface ResourceExtensionPaths {
   skillPaths?: Array<{ path: string; metadata: PathMetadata }>;

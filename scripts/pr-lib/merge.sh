@@ -127,6 +127,7 @@ require_clawsweeper_review() {
 # The caller uses a conditional, so every fallible evidence operation is checked.
 mainline_drift_requires_sync() (
   set -o pipefail
+  export LC_ALL=C
   local mainline_base="$1"
   local prepared_head_sha="$2"
 
@@ -220,7 +221,7 @@ merge_verify() {
     echo "Note: docs/changelog-only follow-ups reuse prior gate results automatically."
 
     mark_pr_operation_side_effects_started
-    git fetch origin "pull/$pr/head" >/dev/null 2>&1 || true
+    fetch_pr_head "$pr" "$pr_head_sha" >/dev/null 2>&1 || true
     if GIT_NO_LAZY_FETCH=1 git cat-file -e "${PREP_HEAD_SHA}^{commit}" 2>/dev/null && GIT_NO_LAZY_FETCH=1 git cat-file -e "${pr_head_sha}^{commit}" 2>/dev/null; then
       echo "HEAD delta (expected...current):"
       git log --oneline --left-right "${PREP_HEAD_SHA}...${pr_head_sha}" | sed 's/^/  /' || true
@@ -315,7 +316,7 @@ merge_verify() {
   fi
 
   refresh_main_snapshot || return 1
-  git fetch origin "pull/$pr/head:pr-$pr" --force || return 1
+  fetch_pr_head "$pr" "$PREP_HEAD_SHA" "refs/heads/pr-$pr" || return 1
   if ! git merge-base --is-ancestor "$PR_MAIN_SHA" "refs/heads/pr-$pr"; then
     echo "PR branch is behind main."
     if mainline_drift_requires_sync \
@@ -358,18 +359,21 @@ prepare_squash_merge_body() {
     --no-show-signature --no-notes --no-color --no-decorate --encoding=UTF-8 \
     --format='%(trailers:key=Co-authored-by,only,unfold)' "$PR_MAIN_SHA..$source_head") || return 1
   # A merge commit can reflect whoever refreshed the branch, not a contributor.
-  # Preview credit must be backed by a published non-merge commit or explicit trailer.
+  # Preview credit needs a tree-changing non-merge commit, PR authorship, or explicit trailer.
   author_commits=$(git log --no-merges --reverse --no-show-signature --no-notes \
-    --no-color --no-decorate --format='%H' "$PR_MAIN_SHA..$PREP_HEAD_SHA") || return 1
+    --no-color --no-decorate --format='%H %T %P' "$PR_MAIN_SHA..$PREP_HEAD_SHA") || return 1
 
   local repo_nwo preview
   repo_nwo=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || return 1
   # A git identity alone cannot establish a human contributor. Resolve the
   # published commits through GitHub, which leaves unlinked authors null.
-  authors=$(printf '%s\n' "$author_commits" | while IFS= read -r oid; do
+  authors=$(printf '%s\n' "$author_commits" | while IFS=' ' read -r oid tree parent; do
     [ -n "$oid" ] || continue
+    parent_tree=""
+    [ -z "$parent" ] || parent_tree=$(git rev-parse "$parent^{tree}") || exit 1
     gh api "repos/$repo_nwo/commits/$oid" --jq \
-      '{name:.commit.author.name,email:.commit.author.email,user:(.author | if . == null then null else {login,type} end)}' || exit 1
+      '{name:.commit.author.name,email:.commit.author.email,user:(.author | if . == null then null else {login,type} end)}' |
+      jq --arg tree "$tree" --arg parentTree "$parent_tree" '. + {changesTree: ($tree != $parentTree)}' || exit 1
   done) || return 1
   authors=$(printf '%s\n' "$authors" | jq -s .) || return 1
   preview=$(gh_plain api graphql \

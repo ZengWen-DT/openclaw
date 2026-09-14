@@ -64,6 +64,7 @@ export function sidebarSessionAttentionPriority(attention: SidebarSessionAttenti
 
 export type SidebarRecentSession = {
   key: string;
+  agentId?: string;
   sessionId?: string;
   displayName?: string;
   incognito?: boolean;
@@ -121,6 +122,11 @@ export type SidebarRecentSession = {
   lastMessagePreview?: string;
   lastReadAt?: number;
   attention: SidebarSessionAttention;
+  /** Own attention remains distinct from the collapsed-tree projection. */
+  ownAttention?: SidebarSessionAttention;
+  childAttention?: readonly SidebarSessionAttention[];
+  unreadChildCount?: number;
+  queuedChildCount?: number;
   agentStatusNote?: string;
   observerDigest?: Pick<
     SessionObserverDigest,
@@ -186,6 +192,10 @@ export function rowDemandsVisibility(
         row.containsActiveDescendant ||
         row.hasActiveRun ||
         row.runningChildCount > 0 ||
+        row.failedChildCount > 0 ||
+        (row.workspaceConflictCount ?? 0) > 0 ||
+        row.unread ||
+        (row.unreadChildCount ?? 0) > 0 ||
         row.attention.kind !== "none";
 }
 
@@ -203,6 +213,7 @@ export type SidebarSessionGroupMenuState = {
 
 export type SidebarSessionSortMode = "created" | "updated" | "people";
 export type SidebarSessionStatusFilter = "active" | "archived" | "all";
+export type SidebarEmptyGroupsMode = "filtering" | "always" | "never";
 export type SidebarSessionOwnerFilter = {
   ownerId: string | null;
   involvingMe: boolean;
@@ -245,6 +256,10 @@ export type SidebarSessionMutationScope = {
 
 export type SidebarSessionMutationResult = "completed" | "failed" | "stale";
 
+export type SidebarCatalogSessionMutationScope = SidebarSessionMutationScope & {
+  catalogGeneration: number;
+};
+
 export type SidebarSessionPatch = {
   archived?: boolean;
   pinned?: boolean;
@@ -271,7 +286,6 @@ const SIDEBAR_SESSION_CATALOG_GROUPING_STORAGE_KEY = "openclaw:sidebar:sessions:
 const SIDEBAR_SESSION_SHOW_PREVIEW_STORAGE_KEY = "openclaw:sidebar:sessions:show-preview";
 const SIDEBAR_SESSION_SHOW_CRON_STORAGE_KEY = "openclaw:sidebar:sessions:show-cron";
 const SIDEBAR_SESSION_SHOW_SYSTEM_STORAGE_KEY = "openclaw:sidebar:sessions:show-system";
-const SIDEBAR_SESSION_HIDE_EMPTY_GROUPS_STORAGE_KEY = "openclaw:sidebar:sessions:hide-empty-groups";
 const SIDEBAR_SESSION_STATUS_FILTER_STORAGE_KEY = "openclaw:sidebar:sessions:status-filter";
 const SIDEBAR_SESSION_SORT_MODE_STORAGE_KEY = "openclaw:sidebar:sessions:sort-mode";
 const SIDEBAR_SESSION_COLLAPSED_SECTIONS_STORAGE_KEY =
@@ -304,10 +318,6 @@ export function loadStoredSidebarSessionsShowPreview(): boolean {
 
 export function loadStoredSidebarSessionsShowSystem(): boolean {
   return getSafeLocalStorage()?.getItem(SIDEBAR_SESSION_SHOW_SYSTEM_STORAGE_KEY) === "true";
-}
-
-export function loadStoredSidebarSessionsHideEmptyGroups(): boolean {
-  return getSafeLocalStorage()?.getItem(SIDEBAR_SESSION_HIDE_EMPTY_GROUPS_STORAGE_KEY) === "true";
 }
 
 export function loadStoredSidebarSessionStatusFilter(): SidebarSessionStatusFilter {
@@ -397,10 +407,6 @@ export function storeSidebarSessionsShowPreview(show: boolean) {
 
 export function storeSidebarSessionsShowSystem(show: boolean) {
   getSafeLocalStorage()?.setItem(SIDEBAR_SESSION_SHOW_SYSTEM_STORAGE_KEY, String(show));
-}
-
-export function storeSidebarSessionsHideEmptyGroups(hide: boolean) {
-  getSafeLocalStorage()?.setItem(SIDEBAR_SESSION_HIDE_EMPTY_GROUPS_STORAGE_KEY, String(hide));
 }
 
 export function storeSidebarSessionStatusFilter(value: SidebarSessionStatusFilter) {

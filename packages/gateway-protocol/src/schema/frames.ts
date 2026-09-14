@@ -3,7 +3,12 @@ import type { Static } from "typebox";
 import { Type } from "typebox";
 import { closedObject } from "./closed-object.js";
 import { ControlUiPluginTabSchema, ControlUiPluginWidgetKindSchema } from "./plugins.js";
-import { GatewayClientIdSchema, GatewayClientModeSchema, NonEmptyString } from "./primitives.js";
+import {
+  GatewayClientIdSchema,
+  GatewayClientModeSchema,
+  NonEmptyString,
+  UserProfileIdSchema,
+} from "./primitives.js";
 import { SessionVisibilitySchema } from "./sessions-sharing-values.js";
 import { SnapshotSchema, StateVersionSchema } from "./snapshot.js";
 import { WorkerAdmissionHandshakeSchema } from "./worker-admission.js";
@@ -54,6 +59,20 @@ export const ConnectParamsSchema = closedObject({
   pathEnv: Type.Optional(Type.String()),
   role: Type.Optional(NonEmptyString),
   scopes: Type.Optional(Type.Array(NonEmptyString)),
+  /** Initial catalog read scope; method authorization still owns access. */
+  modelCatalog: Type.Optional(
+    Type.Union([
+      closedObject({
+        agentId: Type.Optional(NonEmptyString),
+        sessionKey: Type.Optional(NonEmptyString),
+      }),
+      closedObject({
+        agentId: Type.Optional(NonEmptyString),
+        shortId: NonEmptyString,
+        slugHint: Type.Optional(NonEmptyString),
+      }),
+    ]),
+  ),
   device: Type.Optional(
     closedObject({
       id: NonEmptyString,
@@ -168,6 +187,7 @@ export const RequestFrameSchema = closedObject({
   method: NonEmptyString,
   params: Type.Optional(Type.Unknown()),
   traceparent: Type.Optional(Type.String({ maxLength: 128 })),
+  expectedProfileId: Type.Optional(UserProfileIdSchema),
 });
 
 /** Server response frame envelope paired with a prior request id. */
@@ -186,6 +206,7 @@ export const EventFrameSchema = closedObject({
   payload: Type.Optional(Type.Unknown()),
   seq: Type.Optional(Type.Integer({ minimum: 0 })),
   stateVersion: Type.Optional(StateVersionSchema),
+  recipientProfileId: Type.Optional(UserProfileIdSchema),
 });
 
 // Discriminated union of all top-level frames. Using a discriminator makes

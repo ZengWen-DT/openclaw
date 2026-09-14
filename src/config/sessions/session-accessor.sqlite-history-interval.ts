@@ -4,6 +4,10 @@ import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
+import {
+  resolveHistoryAnchorPageRange,
+  type TranscriptAnchorPageOptions,
+} from "../../sessions/transcript-anchor-page.js";
 import type { SessionTranscriptMessageAnchorPage } from "./session-accessor.sqlite-active-events.js";
 import {
   getActiveTranscriptKysely,
@@ -47,10 +51,19 @@ function selectHistoricalDisplayEvents(
 ) {
   return getActiveTranscriptKysely(projection.database)
     .selectFrom("session_transcript_active_events as active")
-    .innerJoin("transcript_event_identities as identity", (join) =>
-      join
-        .onRef("identity.session_id", "=", "active.session_id")
-        .onRef("identity.seq", "=", "active.event_seq"),
+    .innerJoin(
+      // Without statistics, the covering event-type index can scan the session for every row.
+      getActiveTranscriptKysely(projection.database)
+        .selectFrom("transcript_event_identities")
+        .select(["session_id", "seq", "event_type"])
+        .modifyEnd(
+          /* kysely-allow-raw: pin the canonical sequence lookup to avoid quadratic cold-history joins. */ sql`INDEXED BY idx_agent_transcript_event_identity_sequence`,
+        )
+        .as("identity"),
+      (join) =>
+        join
+          .onRef("identity.session_id", "=", "active.session_id")
+          .onRef("identity.seq", "=", "active.event_seq"),
     )
     .innerJoin("transcript_events as event", (join) =>
       join
@@ -115,14 +128,11 @@ function readDisplayableActiveEventById(projection: CurrentTranscriptProjection,
 function countHistoricalDisplayEvents(
   projection: CurrentTranscriptProjection,
   interval: ClosedResetInterval,
-  beforeActivePosition?: number,
+  beforeActivePosition: number,
 ): number {
-  let query = selectHistoricalDisplayEvents(projection, interval).select((eb) =>
-    eb.fn.countAll<number>().as("event_count"),
-  );
-  if (beforeActivePosition !== undefined) {
-    query = query.where("active.active_position", "<", beforeActivePosition);
-  }
+  const query = selectHistoricalDisplayEvents(projection, interval)
+    .select((eb) => eb.fn.countAll<number>().as("event_count"))
+    .where("active.active_position", "<", beforeActivePosition);
   const row = executeSqliteQueryTakeFirstSync(projection.database.db, query);
   return row?.event_count ?? 0;
 }
@@ -133,22 +143,38 @@ function readHistoricalDisplayEventRange(
   interval: ClosedResetInterval,
   start: number,
   count: number,
+  anchor: { activePosition: number; displayPosition: number },
 ): SessionTranscriptMessageEvent[] {
   if (count <= 0) {
     return [];
   }
-  const rows = executeSqliteQuerySync(
+  const query = selectHistoricalDisplayEvents(projection, interval).select([
+    "active.event_seq",
+    "event.event_json",
+  ]);
+  const olderCount = anchor.displayPosition - start;
+  // The anchor already identifies the physical position; visit only its selected neighbors.
+  const older =
+    olderCount === 0
+      ? []
+      : executeSqliteQuerySync(
+          projection.database.db,
+          query
+            .where("active.active_position", "<", anchor.activePosition)
+            .orderBy("active.active_position", "desc")
+            .limit(olderCount),
+        ).rows;
+  const newer = executeSqliteQuerySync(
     projection.database.db,
-    selectHistoricalDisplayEvents(projection, interval)
-      .select(["active.event_seq", "event.event_json"])
+    query
+      .where("active.active_position", ">=", anchor.activePosition)
       .orderBy("active.active_position", "asc")
-      .offset(start)
-      .limit(count),
+      .limit(count - olderCount),
   ).rows;
   return positionTranscriptDisplayEvents(
     projection,
     displaySource,
-    rows.map((row, index) => ({
+    [...older.toReversed(), ...newer].map((row, index) => ({
       event: parseStoredTranscriptEvent(row.event_json),
       eventSeq: row.event_seq,
       seq: start + index + 1,
@@ -191,7 +217,7 @@ export function resolveHistoricalHistoryEventById(
 export function readHistoricalHistoryAnchorPage(
   projection: CurrentTranscriptProjection,
   displaySource: string | undefined,
-  options: { maxMessages: number; messageId: string },
+  options: TranscriptAnchorPageOptions,
 ): SessionTranscriptMessageAnchorPage | undefined {
   const row = readDisplayableActiveEventById(projection, options.messageId);
   if (!row) {
@@ -201,29 +227,31 @@ export function readHistoricalHistoryAnchorPage(
   if (!interval) {
     return undefined;
   }
-  const total = countHistoricalDisplayEvents(projection, interval);
-  const anchorPosition = countHistoricalDisplayEvents(projection, interval, row.active_position);
-  const pageSize = Math.max(
-    1,
-    Math.floor(Number.isFinite(options.maxMessages) ? options.maxMessages : 1),
+  const counts = executeSqliteQueryTakeFirstSync(
+    projection.database.db,
+    selectHistoricalDisplayEvents(projection, interval).select((eb) => [
+      eb.fn.countAll<number>().as("total"),
+      eb.fn
+        .countAll<number>()
+        .filterWhere("active.active_position", "<", row.active_position)
+        .as("before_anchor"),
+    ]),
   );
-  const newerMessages = Math.floor(pageSize / 2);
-  const olderMessages = pageSize - newerMessages - 1;
-  const latestStart = Math.max(0, total - pageSize);
-  const start = Math.min(Math.max(0, anchorPosition - olderMessages), latestStart);
-  const endExclusive = Math.min(total, start + pageSize);
-  const readStart = Math.max(0, start - 1);
+  const total = counts?.total ?? 0;
+  const anchorPosition = counts?.before_anchor ?? 0;
+  const range = resolveHistoryAnchorPageRange(total, anchorPosition, options);
   return {
     events: readHistoricalDisplayEventRange(
       projection,
       displaySource,
       interval,
-      readStart,
-      endExclusive - readStart,
+      range.readStart,
+      range.endExclusive - range.readStart,
+      { activePosition: row.active_position, displayPosition: anchorPosition },
     ),
     found: true,
-    hasOverreadContext: readStart < start,
-    offset: total - endExclusive,
+    hasOverreadContext: range.hasOverreadContext,
+    offset: range.offset,
     displaySource,
     totalMessages: total,
   };

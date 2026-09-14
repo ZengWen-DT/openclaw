@@ -38,6 +38,9 @@
         "./packages/ai/src/internal/google-model-family.ts"
       ],
       "@openclaw/ai/internal/openai": ["./packages/ai/src/internal/openai.ts"],
+      "@openclaw/ai/internal/openai-completions-compat": [
+        "./packages/ai/src/internal/openai-completions-compat.ts"
+      ],
       "@openclaw/ai/internal/openai-responses-payload-policy": [
         "./packages/ai/src/internal/openai-responses-payload-policy.ts"
       ],
@@ -221,6 +224,9 @@
       ],
       "@openclaw/normalization-core/utf16-slice": [
         "./packages/normalization-core/src/utf16-slice.ts"
+      ],
+      "@openclaw/normalization-core/home-dir": [
+        "./packages/normalization-core/src/home-dir.ts"
       ],
       "@openclaw/normalization-core/*": ["./packages/normalization-core/src/*"],
       "@openclaw/retry": ["./packages/retry/src/index.ts"],

@@ -2,7 +2,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { err, ok, type Result } from "@openclaw/normalization-core/result";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { listAgentIds } from "../agents/agent-scope.js";
-import { listSubagentRunsForController } from "../agents/subagents/registry/subagent-registry-read.js";
+import { listSubagentSessionListRunsForControllers } from "../agents/subagents/registry/subagent-registry-read.js";
 import {
   isConfiguredSessionStoreAgentId,
   resolveAgentMainSessionKey,
@@ -147,6 +147,7 @@ type GatewaySessionStoreLookupParams = {
   projection?: SessionEntryListScope["projection"];
   readOnly?: boolean;
   exactRead?: boolean;
+  listCandidatesOnly?: boolean;
   deferCanonicalValidation?: boolean;
   includeStoreChildEntries?: boolean;
   store?: Record<string, SessionEntry>;
@@ -195,6 +196,7 @@ function prepareGatewaySessionStoreLookup(
     options: {
       readOnly: configured ? params.readOnly : true,
       ...(params.exactRead ? { exactKeys: scanTargets } : {}),
+      ...(params.listCandidatesOnly ? { listKeys: scanTargets } : {}),
       ...(params.projection ? { projection: params.projection } : {}),
       ...(params.storeCache ? { cache: params.storeCache } : {}),
     },
@@ -289,6 +291,7 @@ function prepareExplicitDeletedLegacyMainStoreTarget(
       options: {
         readOnly: true,
         ...(params.exactRead ? { exactKeys: lookupSeeds } : {}),
+        ...(params.listCandidatesOnly ? { listKeys: lookupSeeds } : {}),
         ...(params.projection ? { projection: params.projection } : {}),
         ...(params.storeCache ? { cache: params.storeCache } : {}),
       },
@@ -377,6 +380,7 @@ function prepareGatewaySessionStoreTarget(
         // Arbitrary stale keys must not materialize process-lifetime incognito state.
         readOnly: true,
         ...(params.exactRead ? { exactKeys: [canonicalKey] } : {}),
+        ...(params.listCandidatesOnly ? { listKeys: [canonicalKey] } : {}),
         ...(params.projection ? { projection: params.projection } : {}),
         ...(params.storeCache ? { cache: params.storeCache } : {}),
       },
@@ -585,9 +589,9 @@ function includeDirectChildEntries(
       })) {
         target.store[sessionKey] = entry;
       }
-      for (const { childSessionKey } of listSubagentRunsForController(parentKey)) {
-        childKeys.add(childSessionKey);
-      }
+    }
+    for (const { childSessionKey } of listSubagentSessionListRunsForControllers([...parentKeys])) {
+      childKeys.add(childSessionKey);
     }
     // Retained runs are discovery hints, not existence: deduplicate and batch exact reads.
     const targets = [...childKeys].filter((key) => !target.store[key]).map((key) => ({ key }));
@@ -614,7 +618,7 @@ export function resolveGatewaySessionStoreTarget(params: {
   clone?: boolean;
   store?: Record<string, SessionEntry>;
 }): GatewaySessionStoreTarget {
-  // Only keys and store metadata escape; omit large prompt snapshots without changing read mode.
+  // Keep listing validation and read mode while avoiding unrelated entry clones.
   const {
     store: _store,
     readSource: _readSource,
@@ -622,6 +626,7 @@ export function resolveGatewaySessionStoreTarget(params: {
   } = resolveGatewaySessionStoreTargetWithStore({
     ...params,
     projection: "list",
+    listCandidatesOnly: true,
   });
   return target;
 }

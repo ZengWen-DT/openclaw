@@ -19,6 +19,7 @@ import { listCliRuntimeModelBackendBindings } from "./cli-backends.js";
 import { resolveAgentHarnessAvailabilityDecision } from "./harness/availability.js";
 import { resolveAgentHarnessPolicy } from "./harness/policy.js";
 import { buildAgentHarnessSupportContext, resolveAutoAgentHarnessId } from "./harness/support.js";
+import { resolveLegacyInheritedAuthDir } from "./legacy-inherited-auth-dir.js";
 import {
   createModelAuthAvailabilityResolver,
   type ModelAuthAvailabilityResolver,
@@ -66,6 +67,10 @@ function createModelsListAuthResolver(params: {
     agentId: params.agentId,
     authStore: params.preparedAuthStore,
     agentDir,
+    preparedCliRuntimeAuthDirectories: {
+      agentDir,
+      inheritedAuthDir: resolveLegacyInheritedAuthDir(params.cfg),
+    },
     workspaceDir: params.workspaceDir,
     env: process.env,
     metadataSnapshot: params.metadataSnapshot,
@@ -229,7 +234,7 @@ export function createModelCatalogDecisions(params: ModelCatalogDecisionParams) 
         ...loadManifestModelCatalog({ config: params.cfg, metadataSnapshot }),
       ].filter((entry) => personalProviders.has(normalizeProviderId(entry.provider)))
     : [];
-  const snapshot = personalStaticEntries.length
+  let snapshot = personalStaticEntries.length
     ? {
         ...params.snapshot,
         entries: dedupeModelCatalogEntries([...params.snapshot.entries, ...personalStaticEntries]),
@@ -248,6 +253,23 @@ export function createModelCatalogDecisions(params: ModelCatalogDecisionParams) 
       ? (authStore.profiles[selectedProfileId]?.provider ??
         params.cfg.auth?.profiles?.[selectedProfileId]?.provider)
       : undefined);
+  if (
+    snapshot.pendingProviders?.length &&
+    (selectedProfileId || preferredProfilesByProvider.size)
+  ) {
+    const authProvider = (provider: string) =>
+      resolveProviderIdForAuth(provider, { config: params.cfg, metadataSnapshot });
+    // Shared discovery does not describe a selected account's inventory.
+    snapshot = {
+      ...snapshot,
+      pendingProviders: snapshot.pendingProviders.filter(
+        (provider) =>
+          !preferredProfilesByProvider.has(normalizeProviderId(provider)) &&
+          (!selectedProfileId ||
+            (profileProvider && authProvider(provider) !== authProvider(profileProvider))),
+      ),
+    };
+  }
   const nativeEvaluator = prepareModelCatalogView({
     ...params,
     snapshot,

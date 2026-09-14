@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { convertPathToPattern } from "tinyglobby";
 import { expect, it, vi, type TestContext } from "vitest";
 import type { VitestWorkerManifest } from "../../scripts/lib/vitest-worker-artifacts.mts";
@@ -70,6 +70,20 @@ function createWorkerArtifactFixtures({
       return completion;
     }
 
+    function runtime(args: string[], cwd = root, env = process.env) {
+      const completion = fixtureLifetime.track(
+        runNodeScript(args, env, undefined, {
+          cwd,
+          signal: commandSignal,
+          maxBuffer: 2 * 1024 * 1024,
+          requireProcessTreeExit: process.platform !== "win32",
+          executable: process.execPath,
+        }).then((result) => ({ ...result, code: result.status })),
+      );
+      commands.push(completion);
+      return completion;
+    }
+
     function startBorrower(owner: VitestWorkerRun, args: string[], nodeArgs: string[] = []) {
       commandSignal.throwIfAborted();
       const logs = fixtureDirectory();
@@ -132,7 +146,7 @@ function createWorkerArtifactFixtures({
       );
     }
 
-    return { node, startBorrower, prepareWorkers, observeChild };
+    return { node, runtime, startBorrower, prepareWorkers, observeChild };
   }
 
   return { fixtureLifetime, fixtureDirectory, createFixtureCommands };
@@ -158,6 +172,38 @@ export function createWorkerArtifactTest() {
     return () => vi.resetConfig();
   });
   return test;
+}
+
+/** Reuse the shutdown fixture's executable boundary, keeping real owners and IPC. */
+export function createControlledWorkerCompiler(directory: string, env: NodeJS.ProcessEnv) {
+  const input = writeFixture(directory, "worker-input.mjs", "export const fixture = true;\n");
+  const receipt = path.join(directory, "fixture-compilers.jsonl");
+  const compiler = fileURLToPath(new URL("./fixtures/vitest-worker-compiler.mjs", import.meta.url));
+  const preload = writeFixture(
+    directory,
+    "compiler-preload.mjs",
+    `
+    import cp from 'node:child_process';
+    import {syncFixtureBuiltinExports} from ${JSON.stringify(new URL("./fixtures/ci-fixture-runtime.cjs", import.meta.url).href)};
+    const spawn = cp.spawn;
+    cp.spawn = (bin, args, options) => args[0] === ${JSON.stringify(path.join(root, "scripts/lib/vitest-worker-compiler.mts"))}
+      ? spawn(bin, [${JSON.stringify(compiler)}, args[1], ${JSON.stringify(input)}, ${JSON.stringify(receipt)}], options)
+      : spawn(bin, args, options);
+    syncFixtureBuiltinExports(["node:child_process"]);
+  `,
+  );
+  return {
+    env: {
+      ...env,
+      NODE_OPTIONS: `${env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}`.trim(),
+    },
+    read: (): Array<{ pid: number; directory: string; inputs: number; outputs: number }> =>
+      fs
+        .readFileSync(receipt, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line)),
+  };
 }
 
 export function writeFixture(directory: string, name: string, source: string) {
@@ -254,7 +300,7 @@ export function workerProbe(
       const launcherArgv = inject('launcherArgv');
       expect(path.isAbsolute(launcherArgv[1])).toBe(true);
       expect(path.basename(launcherArgv[1])).toBe('vitest.mjs');
-      expect(Object.values(runtimeProcessBuildEntries)).toHaveLength(Object.keys(runtimeProcessEntrypoints).length + 1);
+      expect(Object.values(runtimeProcessBuildEntries)).toHaveLength(Object.keys(runtimeProcessEntrypoints).length + 4);
       for (const source of Object.values(runtimeProcessBuildEntries)) {
         expect(source).not.toContain('/dist/');
         expect(source).toMatch(/\\.ts$/);

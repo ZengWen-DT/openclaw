@@ -26,12 +26,14 @@ export function createMockTarStream(
       if (params.error) {
         throw params.error;
       }
-      yield params.contents ?? "archive-bytes";
+      yield Buffer.from(params.contents ?? "archive-bytes");
+      yield Buffer.alloc(1024);
     })(),
   );
 }
 
-vi.mock("tar", () => ({
+vi.mock("tar", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("tar")>()),
   c: backupTestMocks.tarCreateMock,
 }));
 
@@ -48,7 +50,7 @@ export async function resetBackupTempHome(tempHome: { home: string }) {
 export async function mockStateOnlyBackupPlan(stateDir: string) {
   await fs.writeFile(
     path.join(stateDir, "openclaw.json"),
-    JSON.stringify({ agents: { ownership: "explicit", entries: {} } }),
+    JSON.stringify({ agents: { ownership: "explicit", entries: { main: {} } } }),
     "utf8",
   );
   const plan = await backupShared.resolveBackupPlanFromDisk({

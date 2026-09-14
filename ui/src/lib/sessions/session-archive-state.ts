@@ -1,4 +1,5 @@
 import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
+import { projectSessionResultRows } from "./reconcile.ts";
 import type { SessionArchiveVisibility } from "./session-capability.ts";
 
 type ConfirmedArchiveState = Pick<
@@ -11,7 +12,7 @@ export function createSessionArchiveState(
   onChange: () => void,
 ) {
   const confirmed = new Map<string, ConfirmedArchiveState>();
-  const pending = new Set<string>();
+  const pending = new Map<string, { sessionId: string | undefined; token: symbol }>();
   const clear = (key: string) => {
     confirmed.delete(key.trim());
     pending.delete(key.trim());
@@ -28,10 +29,15 @@ export function createSessionArchiveState(
         return;
       }
       if (!archived) {
-        clear(normalizedKey);
+        // A worker-status event can still describe the unarchived session
+        // while its archive request waits for cleanup.
+        confirmed.delete(normalizedKey);
         return;
       }
       const previous = confirmed.get(normalizedKey);
+      if (pending.get(normalizedKey)?.sessionId === row?.sessionId) {
+        pending.delete(normalizedKey);
+      }
       confirmed.set(normalizedKey, {
         archivedAt: row?.archivedAt ?? previous?.archivedAt,
         archivedBy: row?.archivedBy ?? previous?.archivedBy,
@@ -43,7 +49,6 @@ export function createSessionArchiveState(
       if (!result || confirmed.size === 0) {
         return result;
       }
-      let changed = false;
       const sessions = result.sessions.map((row) => {
         const archive = confirmed.get(row.key);
         if (!archive) {
@@ -60,7 +65,6 @@ export function createSessionArchiveState(
         if (row.archived === true) {
           return row;
         }
-        changed = true;
         return {
           ...row,
           archived: true,
@@ -69,35 +73,42 @@ export function createSessionArchiveState(
           ...(archive.archiveReason ? { archiveReason: archive.archiveReason } : {}),
         };
       });
-      return changed ? { ...result, sessions } : result;
+      return projectSessionResultRows(result, sessions);
     },
     visibility: (key: string): SessionArchiveVisibility | undefined => {
       const normalizedKey = key.trim();
-      if (pending.has(normalizedKey)) {
+      const pendingArchive = pending.get(normalizedKey);
+      const row = publishedRow(normalizedKey);
+      if (pendingArchive && (!row || row.sessionId === pendingArchive.sessionId)) {
         return "pending";
       }
       const archive = confirmed.get(normalizedKey);
       if (!archive) {
         return undefined;
       }
-      const row = publishedRow(normalizedKey);
       // Share the archive confirmation with event-driven actions, but never
       // hide a same-key replacement whose durable identity does not match.
       return archive.sessionId && row && archive.sessionId !== row.sessionId
         ? undefined
         : "archived";
     },
-    setPending: (key: string, active: boolean) => {
+    beginPending: (key: string, sessionId: string | undefined): (() => void) | null => {
       const normalizedKey = key.trim();
-      if (!normalizedKey || pending.has(normalizedKey) === active) {
-        return;
+      const current = pending.get(normalizedKey);
+      if (!normalizedKey || (current && current.sessionId === sessionId)) {
+        return null;
       }
-      if (active) {
-        pending.add(normalizedKey);
-      } else {
-        pending.delete(normalizedKey);
-      }
+      const token = Symbol("session-archive");
+      pending.set(normalizedKey, { sessionId, token });
       onChange();
+      return () => {
+        // A reconnect or same-key replacement can begin a newer archive.
+        if (pending.get(normalizedKey)?.token !== token) {
+          return;
+        }
+        pending.delete(normalizedKey);
+        onChange();
+      };
     },
   };
 }

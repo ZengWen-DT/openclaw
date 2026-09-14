@@ -428,15 +428,26 @@ export function persistChatComposerState(
   return persistChatComposerStateResult(state, sessionKey, options) === "persisted";
 }
 
+export type ChatQueueAdmissionResult = "admitted" | "source-changed" | "full" | "storage-failed";
+
 export function admitStoredChatComposerQueueItem(
   state: ChatComposerScope,
   captured: ReturnType<typeof captureChatOutboxAdmission>,
   item: ChatQueueItem,
   replaces?: StoredChatQueueReplacement,
 ): boolean {
+  return admitStoredChatComposerQueueItemResult(state, captured, item, replaces) === "admitted";
+}
+
+export function admitStoredChatComposerQueueItemResult(
+  state: ChatComposerScope,
+  captured: ReturnType<typeof captureChatOutboxAdmission>,
+  item: ChatQueueItem,
+  replaces?: StoredChatQueueReplacement,
+): ChatQueueAdmissionResult {
   const storage = getSafeSessionStorage();
   if (!storage || !captured.scope.sessionKey.trim()) {
-    return false;
+    return "storage-failed";
   }
   try {
     const target = storageTargetForGateway(state.settings?.gatewayUrl);
@@ -444,7 +455,7 @@ export function admitStoredChatComposerQueueItem(
     const scope = captured.scope;
     const serialized = serializeQueueItemForScope(item, scope);
     if (!serialized) {
-      return false;
+      return "storage-failed";
     }
     const migrated = resolvePendingComposerSessions(store, state);
     const storeSessionKey = storedChatOutboxScopeKey(scope);
@@ -461,22 +472,22 @@ export function admitStoredChatComposerQueueItem(
           entry.id === replaces.id && queueItemVersionMatches(entry, replaces.expected, scope),
       )
     ) {
-      return false;
+      return "source-changed";
     }
     const queue = storedQueue.filter((entry) => entry.id !== replaces?.id);
     const existing = queue.find((entry) => entry.id === serialized.id);
     if (existing) {
       if (!queueItemsEqual(existing, serialized, scope)) {
-        return false;
+        return "storage-failed";
       }
       if (migrated) {
         writeStore(storage, target, store);
         notifyStoredChatOutboxChanges();
       }
-      return true;
+      return "admitted";
     }
     if (queue.length >= MAX_STORED_QUEUE_ITEMS) {
-      return false;
+      return "full";
     }
     writeStoredComposerSession(store, storeSessionKey, session, [...queue, serialized]);
     if (captured.awaitingDefaults) {
@@ -489,9 +500,9 @@ export function admitStoredChatComposerQueueItem(
     // Verify the captured write before subscribers can change defaults or drain it.
     const admitted = Boolean(persisted && queueItemsEqual(persisted, serialized, scope));
     notifyStoredChatOutboxChanges();
-    return admitted;
+    return admitted ? "admitted" : "storage-failed";
   } catch {
-    return false;
+    return "storage-failed";
   }
 }
 
@@ -1093,18 +1104,37 @@ export class ChatComposerPersistence {
       this.persistSnapshot(state, snapshot);
       return;
     }
-    const baseline = this.snapshot(state, this.latestDraftRevision, this.committedDraftRevision);
-    const restoreRevision = this.forceDurableOwnerRestore ? 0 : this.latestDraftRevision;
     this.durablePersistence.restore(
-      {
-        scope,
-        latestRevision: restoreRevision,
-        signature: chatAttachmentDraftSignature(
-          state.chatMessage,
-          state.chatAttachments ?? [],
-          state.chatGoalDraftMode,
-          state.chatMentions,
-        ),
+      scope,
+      () => {
+        const baseline = this.snapshot(
+          state,
+          this.latestDraftRevision,
+          this.committedDraftRevision,
+        );
+        return {
+          latestRevision: this.forceDurableOwnerRestore ? 0 : this.latestDraftRevision,
+          signature: chatAttachmentDraftSignature(
+            state.chatMessage,
+            state.chatAttachments ?? [],
+            state.chatGoalDraftMode,
+            state.chatMentions,
+          ),
+          onCurrentWins: (storedRevision) => {
+            this.forceDurableOwnerRestore = false;
+            if (
+              baseline.durable &&
+              (state.chatMessage ||
+                state.chatGoalDraftMode ||
+                (state.chatAttachments?.length ?? 0) > 0)
+            ) {
+              this.durablePersistence.persist({
+                ...baseline.durable,
+                expectedRevision: storedRevision,
+              });
+            }
+          },
+        };
       },
       () => ({
         scope: this.resolveDurableScope(state),
@@ -1147,18 +1177,6 @@ export class ChatComposerPersistence {
           });
         }
         state.requestUpdate?.();
-      },
-      (storedRevision) => {
-        this.forceDurableOwnerRestore = false;
-        if (
-          baseline.durable &&
-          (state.chatMessage || state.chatGoalDraftMode || (state.chatAttachments?.length ?? 0) > 0)
-        ) {
-          this.durablePersistence.persist({
-            ...baseline.durable,
-            expectedRevision: storedRevision,
-          });
-        }
       },
     );
   }

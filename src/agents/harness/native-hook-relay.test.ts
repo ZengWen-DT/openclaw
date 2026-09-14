@@ -1106,13 +1106,14 @@ describe("native hook relay registry", () => {
 
   it("shares relay state across duplicate module instances", async () => {
     const duplicateModule = await importDuplicateNativeHookRelayModuleForTests();
-    const relay = registerNativeHookRelay({
+    const relay = registerOwnedNativeHookRelay({
       provider: "codex",
       relayId: "codex-duplicate-module-session",
       sessionId: "session-1",
       runId: "run-1",
       allowedEvents: ["pre_tool_use", "permission_request"],
     });
+    await relay.ready;
 
     await expect(
       duplicateModule.invokeNativeHookRelay({
@@ -1178,13 +1179,14 @@ describe("native hook relay registry", () => {
     expect(duplicateApprovalRequester).toHaveBeenCalledTimes(1);
     expect(primaryApprovalRequester).not.toHaveBeenCalled();
 
-    const replacement = duplicateModule.registerNativeHookRelay({
+    const replacement = duplicateModule.registerOwnedNativeHookRelay({
       provider: "codex",
       relayId: relay.relayId,
       sessionId: "session-1",
       runId: "run-2",
       allowedEvents: ["post_tool_use"],
     });
+    await replacement.ready;
     expect(testing.getNativeHookRelayRegistrationForTests(relay.relayId)).toMatchObject({
       runId: "run-2",
       allowedEvents: ["post_tool_use"],
@@ -4369,6 +4371,7 @@ describe("native hook relay registry", () => {
     expect(getNativeHookRelaySharedStateForTests().pendingPermissionApprovals.size).toBe(1);
 
     firstRelay.unregister();
+    await expect(firstApproval).rejects.toThrow("registration is inactive");
     registerNativeHookRelay({
       provider: "codex",
       relayId,
@@ -4385,7 +4388,9 @@ describe("native hook relay registry", () => {
     expect(getNativeHookRelaySharedStateForTests().pendingPermissionApprovals.size).toBe(1);
 
     resolvers[0]?.("allow");
-    await expect(firstApproval).rejects.toThrow("registration is inactive");
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
     expect(getNativeHookRelaySharedStateForTests().pendingPermissionApprovals.size).toBe(1);
 
     const duplicateSecondApproval = invokeNativeHookRelay({

@@ -1,16 +1,26 @@
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { UPDATE_RUN_PHASES } from "../../packages/gateway-protocol/src/update-run-vocabulary.js";
-import { UPDATE_INSTALL_SKIP_GUIDANCE } from "../shared/update-outcome.js";
+import {
+  formatUpdateActivationTimeoutGuidance,
+  UPDATE_ACTIVATION_TIMEOUT_REASON,
+  UPDATE_INSTALL_SKIP_GUIDANCE,
+} from "../shared/update-outcome.js";
 import { formatDurationPrecise } from "./format-time/format-duration.ts";
 import type { RestartSentinelPayload } from "./restart-sentinel-store.js";
 import { formatUpdateDoctorConfigWriteRefusal } from "./update-doctor-config.js";
+import {
+  formatUpdateFailureFact,
+  selectUpdateFailureReportSteps,
+} from "./update-failure-facts-format.js";
 import {
   LEGACY_UPDATE_RUN_ADVISORY,
   LEGACY_UPDATE_RUN_EXPIRED_REASON,
 } from "./update-run-legacy-expiry.js";
 import type { UpdateRunRecord } from "./update-run-record.js";
+import type { UpdateRunReportHealth } from "./update-run-report-health.js";
 import { updateRunStepsFromResultStep, updateRunWarningMessages } from "./update-run-step.js";
 import type { UpdateRunResult } from "./update-runner-types.js";
+import { formatUpdateSnapshotCapacity } from "./update-snapshot-capacity.js";
 
 export type UpdateRunReport = { headline: string; lines: string[]; markdown: string };
 export type UpdateRunNoticeKind = "ack" | "parking" | "activating" | "verifying" | "finished";
@@ -29,13 +39,61 @@ type ReportInput = Pick<
 >;
 const PHASES = new Set<string>(UPDATE_RUN_PHASES);
 
+type UpdateRunIdentity =
+  | { kind: "unobserved" }
+  | { kind: "verified" }
+  | { kind: "unavailable" }
+  | { kind: "mismatch"; field: "version" | "build" };
+
+function resolveUpdateRunIdentity(
+  facts: UpdateRunRecord["verification"],
+  expected: UpdateRunRecord["after"],
+): UpdateRunIdentity {
+  if (facts.versionMatch === undefined) {
+    return { kind: "unobserved" };
+  }
+  if (facts.versionMatch) {
+    return { kind: "verified" };
+  }
+  if (facts.runningVersion && expected.version && facts.runningVersion !== expected.version) {
+    return { kind: "mismatch", field: "version" };
+  }
+  if (facts.runningBuildId && expected.buildId && facts.runningBuildId !== expected.buildId) {
+    return { kind: "mismatch", field: "build" };
+  }
+  // Published drivers stored false for missing identity as well as disagreement.
+  return { kind: "unavailable" };
+}
+
+export function formatUpdateRunIdentity(
+  facts: UpdateRunRecord["verification"],
+  expected: UpdateRunRecord["after"],
+): string | null {
+  const identity = resolveUpdateRunIdentity(facts, expected);
+  if (identity.kind === "mismatch") {
+    return `${identity.field} mismatch`;
+  }
+  return {
+    unobserved: null,
+    verified: "version verified",
+    unavailable: "service identity unavailable",
+  }[identity.kind];
+}
+
+export function formatUpdateRunCurrentHealth(health: UpdateRunReportHealth): string {
+  return health.kind === "responding"
+    ? `Current health: Gateway answered on the recorded port (${bounded(health.version, 120)}).`
+    : "Current health unavailable; saved verification describes the update attempt only.";
+}
+
 /** The four conversation milestones share the run's recorded versions and final report. */
 export function renderUpdateRunNotice(
   run: UpdateRunRecord,
   kind: UpdateRunNoticeKind,
+  options: { currentHealth?: UpdateRunReportHealth } = {},
 ): string | null {
   if (kind === "finished") {
-    return run.status === "running" ? null : renderUpdateRunReport(run).markdown;
+    return run.status === "running" ? null : renderUpdateRunReport(run, options).markdown;
   }
   // Managed parking precedes updater staging; its notice must not advance the ledger phase.
   const noticePhase = kind === "ack" || kind === "parking" ? "requested" : kind;
@@ -71,6 +129,9 @@ function recoveryHints(run: ReportInput, nextAction?: string): string[] {
   if (run.reason === LEGACY_UPDATE_RUN_EXPIRED_REASON) {
     return [LEGACY_UPDATE_RUN_ADVISORY];
   }
+  if (run.reason === UPDATE_ACTIVATION_TIMEOUT_REASON) {
+    return nextAction ? [] : [formatUpdateActivationTimeoutGuidance()];
+  }
   const hints: string[] = [];
   if (run.reason === "preflight-insufficient-space") {
     hints.push(
@@ -102,14 +163,25 @@ function recoveryHints(run: ReportInput, nextAction?: string): string[] {
 /** One report for persisted update outcomes; markdown reserves room for the next action. */
 export function renderUpdateRunReport(
   run: ReportInput,
-  opts: { doctorHint?: string | null; nextAction?: string } = {},
+  opts: {
+    doctorHint?: string | null;
+    nextAction?: string;
+    currentHealth?: UpdateRunReportHealth;
+  } = {},
 ): UpdateRunReport {
+  const currentHealth: UpdateRunReportHealth | undefined =
+    opts.currentHealth ??
+    (run.status !== "running" && opts.nextAction === undefined && run.origin.nextAction
+      ? { kind: "unavailable" }
+      : undefined);
   // Git updates can change commits without changing the package version.
   const before = run.before.sha?.slice(0, 8) ?? run.before.version;
   const after = run.after.sha?.slice(0, 8) ?? run.after.version;
   const reason = bounded(run.reason?.trim() || "unknown reason", 240);
   const running =
-    run.verification.serviceRunning === true ? run.verification.runningVersion : undefined;
+    !currentHealth && run.verification.serviceRunning === true
+      ? run.verification.runningVersion
+      : undefined;
   let headline: string;
   switch (run.status) {
     case "succeeded":
@@ -136,6 +208,9 @@ export function renderUpdateRunReport(
   headline = bounded(headline, 500);
   const lines: string[] = [];
   for (const step of run.steps) {
+    if (step.snapshotCapacity) {
+      lines.push(formatUpdateSnapshotCapacity(step.snapshotCapacity));
+    }
     if (step.configWriteRefusal) {
       lines.push(formatUpdateDoctorConfigWriteRefusal(step.configWriteRefusal));
     }
@@ -164,8 +239,11 @@ export function renderUpdateRunReport(
   if (phases.length) {
     lines.push(`Phases: ${phases.join(" → ")}`);
   }
-  for (const step of run.steps.filter((item) => item.status === "failed").slice(-3)) {
+  for (const step of selectUpdateFailureReportSteps(
+    run.steps.filter((item) => item.status === "failed"),
+  )) {
     lines.push(bounded(`Failed: ${step.step}${step.detail ? ` — ${step.detail}` : ""}`, 300));
+    lines.push(...(step.failureFacts ?? []).slice(0, 5).map(formatUpdateFailureFact));
   }
   for (const message of updateRunWarningMessages(run.steps).slice(-3)) {
     lines.push(`Warning: ${bounded(message, 500)}`);
@@ -178,8 +256,9 @@ export function renderUpdateRunReport(
   if (facts.serviceRunning !== undefined) {
     verification.push(facts.serviceRunning ? "service running" : "service stopped");
   }
-  if (facts.versionMatch !== undefined) {
-    verification.push(facts.versionMatch ? "version verified" : "version mismatch");
+  const identity = formatUpdateRunIdentity(facts, run.after);
+  if (identity) {
+    verification.push(identity);
   }
   if (facts.channelsReady !== undefined) {
     verification.push(facts.channelsReady ? "channels ready" : "channels not ready");
@@ -191,7 +270,12 @@ export function renderUpdateRunReport(
     verification.push(`${facts.pluginErrors.length} plugin activation error(s)`);
   }
   if (verification.length) {
-    lines.push(`Verification: ${verification.join("; ")}.`);
+    lines.push(
+      `${currentHealth ? "Recorded verification" : "Verification"}: ${verification.join("; ")}.`,
+    );
+  }
+  if (currentHealth && !run.origin.nextAction && !opts.nextAction) {
+    lines.push(formatUpdateRunCurrentHealth(currentHealth));
   }
   for (const attempt of run.repair.slice(-3)) {
     lines.push(
@@ -204,7 +288,7 @@ export function renderUpdateRunReport(
   if (run.downtimeMs != null) {
     lines.push(`Gateway downtime: ${formatDurationPrecise(run.downtimeMs)}.`);
   }
-  const nextAction =
+  const savedAction =
     opts.nextAction ??
     run.origin.nextAction ??
     (run.status === "skipped" &&
@@ -212,6 +296,14 @@ export function renderUpdateRunReport(
     Object.hasOwn(UPDATE_INSTALL_SKIP_GUIDANCE, run.reason)
       ? UPDATE_INSTALL_SKIP_GUIDANCE[run.reason]
       : undefined);
+  const nextAction =
+    savedAction && currentHealth
+      ? `${formatUpdateRunCurrentHealth(currentHealth)} ${
+          currentHealth.kind === "responding"
+            ? "This observation supersedes saved claims that the Gateway is stopped; other recovery constraints still apply. The recorded update outcome is unchanged."
+            : "Check current Gateway status before acting on this saved advice."
+        }\nHistorical recovery advice: “${savedAction}”`
+      : savedAction;
   const lastRepairReason = run.repair.at(-1)?.reason;
   const repairStopReason =
     lastRepairReason === "requester-revoked" || lastRepairReason === "repair-requires-config-change"
@@ -294,6 +386,7 @@ export function updateRunReportInputFromSentinel(payload: RestartSentinelPayload
     steps: (stats?.steps ?? []).map((step) => ({
       step: step.name,
       status: step.log?.exitCode === 0 ? "completed" : "failed",
+      failureFacts: step.failureFacts,
     })),
   };
 }

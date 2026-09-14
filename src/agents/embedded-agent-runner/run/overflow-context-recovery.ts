@@ -12,6 +12,7 @@ import {
   isProviderRequestSizeCeilingError,
 } from "../../embedded-agent-helpers.js";
 import type { FailoverClassification } from "../../failover/signal.js";
+import { withSessionManagerWrite } from "../../sessions/session-manager-write-admission.js";
 import { runContextEngineMaintenance } from "../context-engine-maintenance.js";
 import { log } from "../logger.js";
 import {
@@ -137,8 +138,8 @@ export async function recoverEmbeddedRunOverflow(
   const errorText = contextOverflowError.text;
   const observedOverflowTokens = extractObservedOverflowTokenCount(errorText);
   const preflightRecovery = input.attempt.preflightRecovery;
-  const truncateToolResults = () => {
-    const { sessionManager, assertActive } = input.prepareRecoverySession();
+  const truncateToolResults = async () => {
+    const { sessionManager, assertActive } = input.prepareRecoverySession(contextTokenBudget);
     if (!sessionManager) {
       return {
         truncated: false,
@@ -146,18 +147,22 @@ export async function recoverEmbeddedRunOverflow(
         reason: "detached recovery has no caller-owned transcript",
       };
     }
-    const target = sessionManager.getSessionTarget();
-    assertActive();
-    const result = truncateOversizedToolResultsInSessionManager({
-      sessionManager,
-      contextWindowTokens: contextTokenBudget,
-      maxCharsOverride: resolveLiveToolResultMaxChars({ contextWindowTokens: contextTokenBudget }),
-      protectTrailingToolResults: preflightRecovery?.route === "compact_then_truncate",
-      projectionState: input.toolResultPromptProjectionState,
-      ...target,
+    return await withSessionManagerWrite(sessionManager, () => {
+      const target = sessionManager.getSessionTarget();
+      assertActive();
+      const result = truncateOversizedToolResultsInSessionManager({
+        sessionManager,
+        contextWindowTokens: contextTokenBudget,
+        maxCharsOverride: resolveLiveToolResultMaxChars({
+          contextWindowTokens: contextTokenBudget,
+        }),
+        protectTrailingToolResults: preflightRecovery?.route === "compact_then_truncate",
+        projectionState: input.toolResultPromptProjectionState,
+        ...target,
+      });
+      assertActive();
+      return result;
     });
-    assertActive();
-    return result;
   };
   const preflightPromptBudget =
     terminal.promptErrorSource === "precheck" &&
@@ -272,7 +277,7 @@ export async function recoverEmbeddedRunOverflow(
         );
       }
       if (input.contextEngine.maintain) {
-        const transcript = input.prepareRecoverySession();
+        const transcript = input.prepareRecoverySession(contextTokenBudget);
         await runContextEngineMaintenance({
           ...transcript,
           contextEngine: input.contextEngine,
@@ -297,7 +302,7 @@ export async function recoverEmbeddedRunOverflow(
     if (preflightRecovery && isNoRealConversationCompactionNoop(compactResult)) {
       input.state.lastCompactionTokensAfter = undefined;
       input.state.lastContextBudgetStatus = undefined;
-      const transcript = input.prepareRecoverySession();
+      const transcript = input.prepareRecoverySession(contextTokenBudget);
       await resetNoRealConversationTokenSnapshot({
         sessionTarget: transcript.sessionManager?.getSessionTarget(),
         sessionPersistence: runParams.sessionPersistence,
@@ -316,7 +321,7 @@ export async function recoverEmbeddedRunOverflow(
 
     if (compactResult.compacted) {
       if (preflightRecovery?.route === "compact_then_truncate") {
-        const truncResult = truncateToolResults();
+        const truncResult = await truncateToolResults();
         if (truncResult.truncated) {
           log.info(
             `[context-overflow-precheck] post-compaction tool-result truncation succeeded for ${input.modelSelection.provider}/${input.modelSelection.model}; truncated ${truncResult.truncatedCount} tool result(s)`,
@@ -372,7 +377,7 @@ export async function recoverEmbeddedRunOverflow(
         `[context-overflow-recovery] Attempting tool result truncation for ${input.modelSelection.provider}/${input.modelSelection.model} ` +
           `(contextWindow=${input.contextTokenBudget} tokens)`,
       );
-      const truncResult = truncateToolResults();
+      const truncResult = await truncateToolResults();
       if (truncResult.truncated) {
         input.markOwnedTranscriptRetry();
         log.info(

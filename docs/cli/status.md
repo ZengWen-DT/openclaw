@@ -8,6 +8,13 @@ title: "openclaw status"
 
 Diagnostics for channels + sessions.
 
+Task counts and audit totals use a read-only metadata summary. Retained task
+payloads and delivery history are not loaded for each status request, and
+overlapping requests share the pending summary read. Database work runs on the
+shared SQLite worker; live task ownership is still checked by the Gateway.
+These summaries are not a full physical database-integrity check. Full registry
+restoration and Doctor retain their integrity verification.
+
 ```bash
 openclaw status
 openclaw status --all
@@ -42,6 +49,18 @@ security audit, plugin compatibility, and memory-vector probes are left to
 `openclaw status --all`, `openclaw status --deep`, `openclaw security audit`,
 and `openclaw memory status --deep`.
 
+Local agent ownership checks read schema and owner metadata from one consistent
+SQLite snapshot, including committed WAL changes. They do not copy the entire
+agent database unless its journal state requires private recovery. Startup and
+migration readiness checks retain their full validation.
+
+The CLI runs in a separate process and contacts the Gateway over WebSocket, even
+for a local loopback target. `--timeout` bounds probes, not the entire status
+command. Compare `openclaw gateway call status --json` with `openclaw status --json`
+to separate the Gateway response from local report collection. Gateway
+[Prometheus RPC timings](/gateway/prometheus) exclude CLI startup and connection
+setup; a slow CLI can finish without a slow Gateway handler.
+
 For Git installs, plain status compares cached remote-tracking refs without a
 network fetch. If the latest recorded update fetch failed and no later update
 run records a completed fetch, the Update row shows
@@ -56,6 +75,20 @@ not clear the recorded warning. Use `openclaw update status` for a fresh check
 and the last update run, or run `openclaw update` again. `openclaw status --deep`
 also fetches for that check; it does not change the ledger. See
 [Release channels](/install/development-channels#checking-current-status).
+
+## Status timing
+
+Use the existing diagnostic timeline to locate time spent outside Gateway RPCs:
+
+```bash
+OPENCLAW_DIAGNOSTICS=timeline \
+OPENCLAW_DIAGNOSTICS_TIMELINE_PATH=/tmp/openclaw-status-timeline.jsonl \
+  openclaw status --json
+```
+
+The timeline includes configuration and secret resolution, agent admission,
+local session reads, Gateway probes, and summary collection. Durations include
+waiting; parallel stages overlap and should not be added together.
 
 ## Skills diagnosis
 
@@ -115,6 +148,8 @@ Use `openclaw skills check --agent <id>` to inspect the missing requirements.
 
 ## Overview and update status
 
+- The **Sessions** overview counts stored conversation rows, including archived
+  rows. Running turns and recent activity are separate from this inventory.
 - Overview includes Gateway + node host service install/runtime status when
   available, plus compact Gateway process uptime and host system uptime.
 - `status --all` shows returned host, IP, version, and platform in **Gateway self**.

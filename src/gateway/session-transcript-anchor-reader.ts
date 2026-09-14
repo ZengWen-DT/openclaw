@@ -1,12 +1,13 @@
 import type { SessionTranscriptReadScope } from "../config/sessions/session-accessor.js";
 import { readSessionTranscriptHistoryAnchorPage } from "../config/sessions/session-accessor.sqlite-history-events.js";
 import { readRestoredSessionTranscript } from "../config/sessions/session-cold-storage-read.js";
+import type { TranscriptAnchorPageOptions } from "../sessions/transcript-anchor-page.js";
 import { projectTranscriptEntryMessage } from "./session-transcript-message.js";
 import {
   resolveTranscriptReadTarget,
   toTranscriptReadScope,
-  type ReadRecentSessionMessagesResult,
-} from "./session-transcript-readers.js";
+} from "./session-transcript-read-target.js";
+import type { ReadRecentSessionMessagesResult } from "./session-transcript-readers.js";
 import { ArchivedTranscriptReader } from "./session-utils.fs.js";
 
 type ReadSessionMessagesAroundIdResult = ReadRecentSessionMessagesResult & {
@@ -18,17 +19,19 @@ type ReadSessionMessagesAroundIdResult = ReadRecentSessionMessagesResult & {
 /** Reads one message-id-anchored page from a single transcript snapshot. */
 export async function readSessionMessagesAroundIdWithStatsAsync(
   scope: SessionTranscriptReadScope,
-  opts: { messageId: string; maxMessages: number; allowResetArchiveFallback?: boolean },
+  opts: TranscriptAnchorPageOptions & { allowResetArchiveFallback?: boolean; readOnly?: boolean },
 ): Promise<ReadSessionMessagesAroundIdResult> {
-  const target = resolveTranscriptReadTarget(scope);
+  const target = await resolveTranscriptReadTarget(scope);
   const sessionFile =
     !scope.sessionFile &&
     scope.sessionEntry?.sessionId &&
     scope.sessionEntry.sessionId !== scope.sessionId
       ? undefined
       : target.sessionFile;
-  const page = await readRestoredSessionTranscript(toTranscriptReadScope(target), () =>
-    readSessionTranscriptHistoryAnchorPage(toTranscriptReadScope(target), opts),
+  const page = await readRestoredSessionTranscript(
+    toTranscriptReadScope(target),
+    () => readSessionTranscriptHistoryAnchorPage(toTranscriptReadScope(target), opts),
+    opts,
   );
   if (!page.found) {
     if (opts.allowResetArchiveFallback === true) {

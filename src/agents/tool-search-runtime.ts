@@ -1,5 +1,6 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { getPluginToolMeta } from "../plugins/tool-metadata.js";
+import { sortAndLimitBy } from "../shared/sort-and-limit.js";
 import { resolveAgentToolExecutionSchema } from "./agent-tool-availability.js";
 import {
   finalizeToolTerminalPresentation,
@@ -8,7 +9,14 @@ import {
 } from "./agent-tools.before-tool-call.js";
 import { runWithToolExecutionValidation } from "./agent-tools.execution-validation.js";
 import { getChannelAgentToolMeta } from "./channel-tool-metadata.js";
+import { captureAgentPluginRuntimeRefresh } from "./plugin-runtime-refresh.js";
 import type { AgentToolResult } from "./runtime/index.js";
+import {
+  captureToolOutputSelection,
+  readToolOutputSchemaVariants,
+  type ToolOutputSelection,
+  selectToolOutputSchema,
+} from "./schema/tool-output-schema.js";
 import { bindJoinedCollectorInvocation } from "./subagents/swarm/swarm-collector-capability.js";
 import { markToolContractFailure } from "./tool-contract-error.js";
 import { isAgentToolReplaySafe } from "./tool-replay-safety.js";
@@ -37,6 +45,7 @@ import {
 } from "./tool-search-ranking.js";
 import {
   formatCatalogInputError,
+  formatCatalogOutputError,
   formatUnknownToolIdError,
   type ToolLookupErrorOptions,
 } from "./tool-search-recovery.js";
@@ -275,15 +284,31 @@ async function validateCatalogSchemaValue(
   entry: ToolSearchCatalogEntry,
   schemaName: CatalogSchemaName,
   value: unknown,
+  outputSelection?: ToolOutputSelection,
 ): Promise<CatalogSchemaValidation | undefined> {
-  const schema =
+  let schema =
     schemaName === "inputSchema"
       ? resolveAgentToolExecutionSchema(entry.tool, entry.parameters)
       : entry.outputSchema;
-  if (entry.source !== "openclaw" || !schema) {
+  if (entry.source !== "openclaw") {
     return undefined;
   }
   try {
+    if (schemaName === "outputSchema") {
+      if (
+        outputSelection &&
+        readToolOutputSchemaVariants(schema)?.inputProperty !== outputSelection.inputProperty
+      ) {
+        throw new Error("Tool output discriminator changed during execution.");
+      }
+      schema = selectToolOutputSchema(
+        schema,
+        outputSelection ? { [outputSelection.inputProperty]: outputSelection.value } : undefined,
+      );
+    }
+    if (!schema) {
+      return undefined;
+    }
     schemaValidatorModulePromise ??= import("../plugins/schema-validator.js");
     const { validateJsonSchemaValue } = await schemaValidatorModulePromise;
     return validateJsonSchemaValue({
@@ -320,8 +345,9 @@ async function assertCatalogOutputSchemaIsValid(entry: ToolSearchCatalogEntry): 
 async function assertCatalogOutputMatchesSchema(
   entry: ToolSearchCatalogEntry,
   result: AgentToolResult<unknown>,
+  outputSelection?: ToolOutputSelection,
 ): Promise<void> {
-  if (!entry.outputSchema) {
+  if (!entry.outputSchema && !outputSelection) {
     return;
   }
   if (isPreExecutionBlockedToolResult(result)) {
@@ -336,23 +362,24 @@ async function assertCatalogOutputMatchesSchema(
     entry,
     "outputSchema",
     unwrapToolResultValue(result),
+    outputSelection,
   );
   if (!validation || validation.ok) {
     return;
   }
   throw markToolContractFailure(
-    new Error(`Tool "${entry.id}" returned details that do not match its declared outputSchema.`),
+    new Error(formatCatalogOutputError(entry, validation.errors)),
     "output_contract",
   );
 }
 
 function sanitizeToolCallIdPart(value: string): string {
-  const trimmed = value.trim();
-  const safe = trimmed.replace(/[^A-Za-z0-9_.:-]+/g, "_").slice(0, 120);
-  return safe || "call";
+  const safe = value.trim().replace(/[^A-Za-z0-9_.:-]+/g, "_");
+  return safe.slice(0, 120) || "call";
 }
 
 export class ToolSearchRuntime {
+  private readonly pluginRuntimeRefresh = captureAgentPluginRuntimeRefresh();
   private callSequence = 0;
   private readonly terminalTargetBatchByParent = new Map<string, boolean>();
   private readonly networkInvocations = new Map<string, { active: number; observed: boolean }>();
@@ -372,10 +399,14 @@ export class ToolSearchRuntime {
     // A query that is exactly a tool name or id is a request for that tool, not
     // a description of one. BM25 alone can rank a shorter entry that merely
     // mentions the word above it, and the limit then drops the tool asked for.
-    const exact = query.trim().toLowerCase();
-    const isExact = (entry: ToolSearchCatalogEntry) =>
-      entry.name.toLowerCase() === exact || entry.id.toLowerCase() === exact;
-    const exactMatches = entries.filter(isExact);
+    const spelling = query.trim();
+    const exact = spelling.toLowerCase();
+    const exactIdEntry = entries.find((entry) => entry.id === spelling);
+    const exactMatches = exactIdEntry
+      ? [exactIdEntry]
+      : entries.filter(
+          (entry) => entry.name.toLowerCase() === exact || entry.id.toLowerCase() === exact,
+        );
     // An unambiguous exact lookup never needs schema traversal or a BM25 index.
     if (limit === 1 && exactMatches.length === 1) {
       return exactMatches.slice(0, limit).map((entry) => compactToolSearchCatalogEntry(entry));
@@ -409,19 +440,25 @@ export class ToolSearchRuntime {
       };
       catalogIndexes.set(indexKey, cachedIndex);
     }
-    const ranked = scoreLexical(cachedIndex.index, tokenizeQuery(query))
-      .toSorted(
-        (a, b) =>
-          Number(isExact(b.value)) - Number(isExact(a.value)) ||
-          Number(b.matchedLiteral) - Number(a.matchedLiteral) ||
-          b.score - a.score ||
-          a.value.id.localeCompare(b.value.id),
-      )
-      .map((hit) => hit.value);
+    const hits = scoreLexical(cachedIndex.index, tokenizeQuery(query));
+    const exactMatchSet = new Set(exactMatches);
     // A tool whose name is a stopword ("do") tokenizes to nothing and so never
     // reaches the ranking at all. Naming it exactly is still an unambiguous
     // request for it, which the previous scorer honored.
-    const exactEntries = exactMatches.filter((entry) => !ranked.includes(entry));
+    const exactEntries = exactMatches.filter((entry) => !hits.some((hit) => hit.value === entry));
+    const remaining = limit - exactEntries.length;
+    const ranked =
+      remaining > 0
+        ? sortAndLimitBy(
+            hits,
+            remaining,
+            (a, b) =>
+              Number(exactMatchSet.has(b.value)) - Number(exactMatchSet.has(a.value)) ||
+              Number(b.matchedLiteral) - Number(a.matchedLiteral) ||
+              b.score - a.score ||
+              a.value.id.localeCompare(b.value.id),
+          ).map((hit) => hit.value)
+        : [];
     return [...exactEntries, ...ranked]
       .slice(0, limit)
       .map((entry) => compactToolSearchCatalogEntry(entry));
@@ -478,6 +515,12 @@ export class ToolSearchRuntime {
 
   callValue = async (id: string, input?: unknown, options?: ToolSearchCallOptions) =>
     unwrapToolResultValue((await this.call(id, input, options)).result);
+
+  observeNetworkContent(parentToolCallId: string): void {
+    const state = this.networkInvocations.get(parentToolCallId) ?? { active: 0, observed: false };
+    state.observed = true;
+    this.networkInvocations.set(parentToolCallId, state);
+  }
 
   hasNetworkContent(parentToolCallId?: string): boolean {
     return parentToolCallId
@@ -540,12 +583,19 @@ export class ToolSearchRuntime {
       onUpdate?: ToolSearchCallOptions["onUpdate"];
     },
   ) => {
+    this.pluginRuntimeRefresh.assertCurrent();
     catalog.callCount += 1;
     const normalizedInput = input ?? {};
     const parentId = sanitizeToolCallIdPart(options?.parentToolCallId ?? "direct");
     const toolCallId = `tool_search_code:${parentId}:${entry.name}:${++this.callSequence}`;
     bindJoinedCollectorInvocation(entry.tool, toolCallId);
     await assertCatalogOutputSchemaIsValid(entry);
+    const outputVariants =
+      entry.source === "openclaw" ? readToolOutputSchemaVariants(entry.outputSchema) : undefined;
+    const callerOutputSelection = outputVariants
+      ? captureToolOutputSelection(outputVariants.inputProperty, normalizedInput)
+      : undefined;
+    let executedOutputSelection: ToolOutputSelection | undefined;
     const executeTool =
       this.ctx.executeTool ??
       (async (params: Parameters<ToolSearchCatalogToolExecutor>[0]) => {
@@ -571,13 +621,22 @@ export class ToolSearchRuntime {
         candidate === acceptedSnapshot
           ? candidate
           : snapshotToolSearchTargetTranscriptResult(candidate);
-      await assertCatalogOutputMatchesSchema(entry, snapshot);
+      await assertCatalogOutputMatchesSchema(entry, snapshot, executedOutputSelection);
+      // Hook rewrites must also satisfy the result type advertised to the caller.
+      if (callerOutputSelection && callerOutputSelection.value !== executedOutputSelection?.value) {
+        await assertCatalogOutputMatchesSchema(entry, snapshot, callerOutputSelection);
+      }
       acceptedSnapshot = snapshot;
       return snapshot;
     };
     const validateInput = this.options.validateInput && entry.source === "openclaw";
-    const executionTool = prepareToolSearchCatalogExecutionTool(entry, this.options);
+    const validateExecution = validateInput || outputVariants !== undefined;
+    const executionTool = prepareToolSearchCatalogExecutionTool(entry, {
+      ...this.options,
+      validateInput: validateExecution,
+    });
     const runExecution = async () => {
+      this.pluginRuntimeRefresh.assertCurrent();
       const parentToolCallId = options?.parentToolCallId ?? toolCallId;
       const signal = options?.signal ?? this.ctx.abortSignal;
       const networkInvocation =
@@ -626,10 +685,21 @@ export class ToolSearchRuntime {
     };
     let acceptedResult: AgentToolResult<unknown> | undefined;
     try {
-      const result = validateInput
+      const result = validateExecution
         ? await runWithToolExecutionValidation(
             toolCallId,
-            async (finalInput) => await assertCatalogInputMatchesSchema(entry, finalInput),
+            async (finalInput) => {
+              if (validateInput) {
+                await assertCatalogInputMatchesSchema(entry, finalInput);
+              }
+              if (outputVariants) {
+                // Retain the prepared primitive, not an input object the tool can mutate.
+                executedOutputSelection = captureToolOutputSelection(
+                  outputVariants.inputProperty,
+                  finalInput,
+                );
+              }
+            },
             runExecution,
           )
         : await runExecution();

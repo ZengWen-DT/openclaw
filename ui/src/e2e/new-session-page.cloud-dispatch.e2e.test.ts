@@ -125,7 +125,21 @@ suite.define(() => {
       await route.continue();
     });
     const sessionKey = "agent:cloud:cloud-e2e";
+    const initialSessions = createdSessionListResult(sessionKey);
+    const initialSession = {
+      ...initialSessions.sessions[0],
+      key: sessionKey,
+      sessionId: "session-cloud-e2e",
+      placement: {
+        state: "requested",
+        generation: 1,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+        stateChangedAtMs: 1,
+      },
+    };
     const gateway = await installMockGateway(page, {
+      sessions: [initialSession],
       defaultAgentId: "cloud",
       models: NEW_SESSION_MODEL_CATALOG,
       operatorScopes: ["operator.admin", "operator.read", "operator.write"],
@@ -183,7 +197,7 @@ suite.define(() => {
           repositoryStatus: "git",
         },
         "sessions.create": { key: sessionKey },
-        "sessions.list": createdSessionListResult(sessionKey),
+        "sessions.list": { ...initialSessions, sessions: [initialSession] },
         "sessions.dispatch": {
           ok: true,
           key: sessionKey,
@@ -199,17 +213,6 @@ suite.define(() => {
             workerBundleHash: "a".repeat(64),
             workspaceBaseManifestRef: "manifest-1",
             remoteWorkspaceDir: "/workspace",
-          },
-        },
-        "sessions.describe": {
-          session: {
-            placement: {
-              state: "requested",
-              generation: 1,
-              createdAtMs: 1,
-              updatedAtMs: 1,
-              stateChangedAtMs: 1,
-            },
           },
         },
         "sessions.delete": { ok: true, deleted: true },
@@ -239,6 +242,8 @@ suite.define(() => {
       await pollLocatorText(trigger.locator(".new-session-page__trigger-label")).toBe("aws");
       expect(await trigger.getAttribute("aria-label")).toContain("aws, Fast");
       await page.keyboard.press("Escape");
+      await page.locator("#new-session-project-trigger").click();
+      await page.locator('.new-session-page__project-popover [data-value="workspace"]').click();
       const checkoutTrigger = page.locator("#new-session-checkout-trigger");
       const checkout = page.locator("wa-popover.new-session-page__checkout-popover");
       await expect.poll(() => checkoutTrigger.getAttribute("data-worktree")).toBe("true");
@@ -541,8 +546,8 @@ suite.define(() => {
         await page.clock.runFor(250);
         expect(await gateway.getRequests("sessions.send")).toHaveLength(0);
       }
-      // This single-page fixture pairs each Swarm child read with its parent read.
-      // Placement updates must not add an unpaired describe for the same session.
+      // Healthy parent and child reads are independent; placement updates must
+      // not add extra parent lookups regardless of which request starts first.
       const parentReads = (await gateway.getRequests()).filter((request) => {
         const params = asNullableRecord(request.params);
         return (
@@ -550,12 +555,11 @@ suite.define(() => {
           (request.method === "sessions.list" && params?.spawnedBy === sessionKey)
         );
       });
-      for (let index = 0; index < parentReads.length; index += 2) {
-        expect(parentReads.slice(index, index + 2)).toMatchObject([
-          { method: "sessions.list", params: { spawnedBy: sessionKey } },
-          { method: "sessions.describe", params: { key: sessionKey } },
-        ]);
-      }
+      const childReads = parentReads.filter((request) => request.method === "sessions.list");
+      expect(childReads.length).toBeGreaterThan(0);
+      expect(parentReads.filter((request) => request.method === "sessions.describe")).toHaveLength(
+        childReads.length,
+      );
       const neutralRow = page.locator('[data-session-key="agent:cloud:neutral-e2e"] a');
       await neutralRow.waitFor();
       await neutralRow.click();

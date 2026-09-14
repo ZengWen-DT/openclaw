@@ -15,7 +15,7 @@ import {
   resolveDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
 } from "@openclaw/normalization-core/number-coercion";
-import { callGateway } from "../gateway/call.js";
+import type { callGateway } from "../gateway/call.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { hasRetryableConnectionErrorCode } from "../infra/retryable-network-errors.js";
 import { normalizeBlockedLivenessWaitStatus } from "../shared/agent-liveness.js";
@@ -31,10 +31,13 @@ import { normalizeAgentRunTerminalReceipt } from "./agent-run-terminal-receipt.j
 import { normalizeAgentRunTerminalReplySnapshot } from "./agent-run-terminal-reply.js";
 import type { AgentWaitResult } from "./run-wait.types.js";
 import { extractStoredAssistantText, stripToolMessages } from "./tools/chat-history-text.js";
+import { bindAgentToolGatewayRequest } from "./tools/in-process-gateway.js";
 
 export type { AgentWaitResult };
 
 type GatewayCaller = typeof callGateway;
+
+const AGENT_RUN_DRAIN_RETRY_DELAY_MS = 100;
 
 function resolveRunWaitTimeoutMs(value: number | undefined): number {
   return clampTimerTimeoutMs(parseFiniteNumber(value) ?? 1) ?? 1;
@@ -178,7 +181,9 @@ export async function readLatestAssistantReply(params: {
   limit?: number;
   callGateway?: GatewayCaller;
 }): Promise<string | undefined> {
-  const history = await (params.callGateway ?? callGateway)<{ messages: unknown[] }>({
+  const history = await (params.callGateway ?? bindAgentToolGatewayRequest({ hostedOnly: true }))<{
+    messages: unknown[];
+  }>({
     method: "chat.history",
     params: {
       sessionKey: params.sessionKey,
@@ -208,7 +213,7 @@ export async function waitForAgentRun(params: {
 }): Promise<AgentWaitResult> {
   const timeoutMs = resolveRunWaitTimeoutMs(params.timeoutMs);
   try {
-    const wait = await (params.callGateway ?? callGateway)({
+    const wait = await (params.callGateway ?? bindAgentToolGatewayRequest({ hostedOnly: true }))({
       method: "agent.wait",
       params: {
         runId: params.runId,
@@ -260,6 +265,7 @@ export async function waitForAgentRunsToDrain(params: {
   callGateway?: GatewayCaller;
 }): Promise<AgentRunsDrainResult> {
   const deadlineAtMs = resolveRunWaitDeadlineAtMs(params);
+  const callGateway = params.callGateway ?? bindAgentToolGatewayRequest({ hostedOnly: true });
 
   // Runs may finish and spawn more runs, so refresh until no pending IDs remain.
   let pendingRunIds = new Set<string>(
@@ -273,11 +279,26 @@ export async function waitForAgentRunsToDrain(params: {
         waitForAgentRun({
           runId,
           timeoutMs: remainingMs,
-          callGateway: params.callGateway,
+          callGateway,
         }),
       ),
     );
+    const previousRunIds = pendingRunIds;
     pendingRunIds = new Set<string>(normalizePendingRunIds(params.getPendingRunIds()));
+    const retryDelayMs = Math.min(AGENT_RUN_DRAIN_RETRY_DELAY_MS, deadlineAtMs - Date.now());
+    if (
+      retryDelayMs > 0 &&
+      pendingRunIds.size > 0 &&
+      pendingRunIds.size === previousRunIds.size &&
+      [...pendingRunIds].every((runId) => previousRunIds.has(runId))
+    ) {
+      // Queued or cached waits can resolve immediately. Let completion callbacks
+      // run instead of repeatedly scanning an unchanged registry in microtasks.
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, retryDelayMs);
+      });
+      pendingRunIds = new Set<string>(normalizePendingRunIds(params.getPendingRunIds()));
+    }
   }
 
   return {

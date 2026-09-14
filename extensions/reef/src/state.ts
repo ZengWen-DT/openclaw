@@ -425,6 +425,9 @@ export class ReviewApprovalStore {
       throw new Error("Reef review retention requires atomic plugin-state deleteIf");
     }
     while (true) {
+      if (this.#store.count && this.#store.count() < this.#maxEntries) {
+        return;
+      }
       const entries = this.#store.entries();
       if (entries.length < this.#maxEntries) {
         return;
@@ -496,10 +499,10 @@ export class ReviewApprovalStore {
 }
 
 export class ReefDeliveredStore {
-  readonly #store: PluginStateSyncKeyedStore<{ id: string }>;
+  readonly #delivered: PluginStateSyncKeyedStore<{ id: string }>;
 
   constructor(runtime: PluginRuntime, maxEntries = REEF_DELIVERED_MAX_ENTRIES) {
-    this.#store = runtime.state.openSyncKeyedStore<{ id: string }>({
+    this.#delivered = runtime.state.openSyncKeyedStore<{ id: string }>({
       namespace: REEF_DELIVERED_NAMESPACE,
       maxEntries,
       overflowPolicy: "reject-new",
@@ -510,16 +513,22 @@ export class ReefDeliveredStore {
   }
 
   async has(id: string): Promise<boolean> {
-    return this.#store.lookup(id)?.id === id;
+    return this.#delivered.lookup(id)?.id === id;
+  }
+
+  async status(id: string): Promise<"delivered" | undefined> {
+    return this.#delivered.lookup(id)?.id === id ? "delivered" : undefined;
+  }
+
+  async confirm(id: string): Promise<void> {
+    const inserted = this.#delivered.registerIfAbsent(id, { id });
+    if (!inserted && this.#delivered.lookup(id)?.id !== id) {
+      throw new Error("Failed persisting Reef delivered marker");
+    }
   }
 
   async add(id: string): Promise<void> {
-    if (this.#store.lookup(id)?.id === id) {
-      return;
-    }
-    if (!this.#store.registerIfAbsent(id, { id }) && this.#store.lookup(id)?.id !== id) {
-      throw new Error("Failed persisting Reef delivered marker");
-    }
+    await this.confirm(id);
   }
 }
 

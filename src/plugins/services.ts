@@ -26,6 +26,7 @@ import { subscribePluginSessionsChanged } from "./gateway-events.js";
 import { isPluginJsonValue, type PluginJsonValue } from "./host-hook-json.js";
 import { withPluginHttpRouteRegistry } from "./http-registry.js";
 import { getPluginInstance, runPluginCleanup } from "./plugin-instance-scope.js";
+import type { PluginInstanceConsumer } from "./plugin-instance.types.js";
 import { resolvePluginReturnPromise } from "./plugin-return-value.js";
 import { getPluginRecordRegistry } from "./registry-lifecycle.js";
 import type { PluginServiceRegistration } from "./registry-types.js";
@@ -66,6 +67,7 @@ type OwnedPluginService = {
   diagnosticsExporter: boolean;
   stop?: () => unknown;
   startup?: Promise<void>;
+  startupConsumer?: PluginInstanceConsumer;
   stopping?: Promise<unknown>;
   reloading?: Promise<void>;
   cleaned: boolean;
@@ -78,50 +80,66 @@ type OwnedPluginService = {
 
 type PluginServicesOwner = {
   services: OwnedPluginService[];
+  attempts: WeakMap<PluginServiceRegistration, OwnedPluginService>;
   registrations: Set<PluginServiceRegistration>;
   stopped: Set<PluginServiceRegistration>;
   closed: boolean;
 };
 const serviceOwners = new WeakMap<PluginServicesHandle, PluginServicesOwner>();
 
-export async function startPluginServices(
-  params: {
-    registry: PluginRegistry;
-    config: OpenClawConfig;
-    workspaceDir?: string;
-    startupTrace?: NonNullable<OpenClawPluginServiceContext["startupTrace"]>;
-    broadcastPluginEvent?: GatewayPluginEventBroadcastFn;
-    getCronService?: () => PluginServiceCronHost | null | undefined;
-    oneShotStopTimeouts?: { eventDrainMs: number; serviceStopMs: number };
-    previous?: PluginServicesHandle | null;
-  } & (
-    | { throwOnStartError: true; onHandle: (handle: PluginServicesHandle) => void }
-    | { throwOnStartError?: false; onHandle?: (handle: PluginServicesHandle) => void }
-  ),
-): Promise<PluginServicesHandle> {
+// Long-lived callbacks must not capture the startup-only predecessor and publication callback.
+export async function startPluginServices({
+  registry,
+  config: initialConfig,
+  workspaceDir,
+  startupTrace,
+  broadcastPluginEvent,
+  getCronService,
+  oneShotStopTimeouts,
+  previous: previousHandle,
+  onHandle,
+  throwOnStartError,
+}: {
+  registry: PluginRegistry;
+  config: OpenClawConfig;
+  workspaceDir?: string;
+  startupTrace?: NonNullable<OpenClawPluginServiceContext["startupTrace"]>;
+  broadcastPluginEvent?: GatewayPluginEventBroadcastFn;
+  getCronService?: () => PluginServiceCronHost | null | undefined;
+  oneShotStopTimeouts?: { eventDrainMs: number; serviceStopMs: number };
+  previous?: PluginServicesHandle | null;
+} & (
+  | { throwOnStartError: true; onHandle: (handle: PluginServicesHandle) => void }
+  | { throwOnStartError?: false; onHandle?: (handle: PluginServicesHandle) => void }
+)): Promise<PluginServicesHandle> {
   // Failed starts still own their cleanup and remain selectable for a later retry.
   const ownedServices: OwnedPluginService[] = [];
+  const previous = previousHandle && serviceOwners.get(previousHandle);
   const owner: PluginServicesOwner = {
     services: ownedServices,
-    registrations: new Set(params.registry.services),
+    attempts: previous?.attempts ?? new WeakMap(),
+    registrations: new Set(registry.services),
     stopped: new Set(),
     closed: false,
   };
-  const previous = params.previous && serviceOwners.get(params.previous);
   if (previous) {
     for (const registration of owner.registrations) {
       previous.registrations.delete(registration);
-      const entry = previous.services.find((service) => service.registration === registration);
+      const entry = owner.attempts.get(registration);
       if (!entry) {
         continue;
       }
-      previous.services.splice(previous.services.indexOf(entry), 1);
+      // Rollback can reclaim an earlier attempt that the rejected candidate did not select.
+      const source = entry.owner;
+      source.registrations.delete(registration);
+      source.services.splice(source.services.indexOf(entry), 1);
       // Explicitly stopped, fully cleaned registrations can start again in a new
       // generation. Failed attempts stay in the inventory until an explicit reload.
-      if (previous.stopped.has(registration) && entry.cleaned && !entry.startup) {
+      if (source.stopped.has(registration) && entry.cleaned && !entry.startup) {
+        owner.attempts.delete(registration);
         continue;
       }
-      if (previous.stopped.has(registration)) {
+      if (source.stopped.has(registration)) {
         owner.stopped.add(registration);
       }
       entry.owner = owner;
@@ -184,15 +202,23 @@ export async function startPluginServices(
     try {
       const invokeStop = () => {
         const record = entry.registry.plugins.find((candidate) => candidate.id === entry.pluginId);
-        const registry = record ? getPluginRecordRegistry(entry.registry, record) : entry.registry;
-        return withPluginHttpRouteRegistry(registry, () => entry.stop?.(), entry.lease);
+        const stopRegistry = record
+          ? getPluginRecordRegistry(entry.registry, record)
+          : entry.registry;
+        return withPluginHttpRouteRegistry(stopRegistry, () => entry.stop?.(), entry.lease);
       };
       const cleanup = () => {
         if (!entry.stopping) {
           try {
             // A caller can stop waiting, but raw startup must finish before the one final cleanup.
             const ready = beforeStop ? beforeStop.then(() => entry.startup) : entry.startup;
-            const stopping = ready ? ready.then(invokeStop) : Promise.resolve(invokeStop());
+            const stop = () => (ready ? ready.then(invokeStop) : Promise.resolve(invokeStop()));
+            // A timed-out start loses execution authority now, but still owns its final stop.
+            const stopping = entry.startupConsumer
+              ? entry.startupConsumer.close(async () => {
+                  await stop();
+                })
+              : stop();
             entry.stopping = stopping;
             // Completion follows the attempt across handoff, independently of an observer's deadline.
             void stopping.then(
@@ -248,10 +274,7 @@ export async function startPluginServices(
     failures: unknown[],
     deadline?: number,
   ) => {
-    for (const entry of reversed) {
-      entry.stopRequested = true;
-    }
-    const oneShotTimeouts = deadline === undefined ? params.oneShotStopTimeouts : undefined;
+    const oneShotTimeouts = deadline === undefined ? oneShotStopTimeouts : undefined;
     // One-shot registries are already scoped; every cleanup follows the drain, without changing grants.
     const afterDrain = oneShotTimeouts
       ? reversed
@@ -308,6 +331,7 @@ export async function startPluginServices(
         }
         for (const entry of selected) {
           entry.reloading = reloading;
+          entry.stopRequested = true;
         }
         const failures: unknown[] = [];
         try {
@@ -367,7 +391,7 @@ export async function startPluginServices(
   };
   serviceOwners.set(handle, owner);
   // The issued handle keeps retained services and failed cleanup even when startup rejects.
-  params.onHandle?.(handle);
+  onHandle?.(handle);
 
   const startService = async (
     entry: PluginServiceRegistration,
@@ -376,7 +400,7 @@ export async function startPluginServices(
     candidate = false,
   ): Promise<boolean> => {
     const service = entry.service;
-    const record = params.registry.plugins.find((plugin) => plugin.id === entry.pluginId);
+    const record = registry.plugins.find((plugin) => plugin.id === entry.pluginId);
     const instance = record && getPluginInstance(record);
     // Native service receivers retain their brands; registration owns their invocation scope.
     const runServiceCleanup = <T>(run: () => T): T =>
@@ -384,7 +408,7 @@ export async function startPluginServices(
     const traceName = `sidecars.plugin-services.${encodeStartupTraceSegment(entry.pluginId)}.${encodeStartupTraceSegment(entry.service.id)}`;
     const lease = createPluginRuntimeCapabilityLease("plugin service");
     const pluginId = entry.pluginId;
-    const broadcast = params.broadcastPluginEvent;
+    const broadcast = broadcastPluginEvent;
     // The broadcaster owns delivery and sessions.changed scheduling. Without it,
     // omit this capability so plugins can detect absence and choose their fallback.
     const gatewayEvents: OpenClawPluginServiceContext["gatewayEvents"] = broadcast
@@ -414,10 +438,9 @@ export async function startPluginServices(
       : undefined;
     const { health, revoke } = createPluginServiceHealthReporter(entry);
     lease.retain(revoke);
-    const { startupTrace, workspaceDir } = params;
-    const getCron = params.getCronService
+    const getCron = getCronService
       ? createPluginServiceCronGetter({
-          getCron: params.getCronService,
+          getCron: getCronService,
           lease,
           isStopping: () => ownedService.owner.closed || ownedService.stopRequested,
         })
@@ -506,7 +529,7 @@ export async function startPluginServices(
       id: service.id,
       pluginId: entry.pluginId,
       registration: entry,
-      registry: params.registry,
+      registry,
       stopRequested: false,
       diagnosticsExporter: serviceContext.internalDiagnostics !== undefined,
       stop: service.stop
@@ -536,33 +559,37 @@ export async function startPluginServices(
     if (existingIndex >= 0) {
       ownedServices[existingIndex] = ownedService;
     } else {
-      const declarationIndex = params.registry.services.indexOf(entry);
+      const declarationIndex = registry.services.indexOf(entry);
       const following = ownedServices.findIndex(
-        (current) => params.registry.services.indexOf(current.registration) > declarationIndex,
+        (current) => registry.services.indexOf(current.registration) > declarationIndex,
       );
       ownedServices.splice(following < 0 ? ownedServices.length : following, 0, ownedService);
     }
+    owner.attempts.set(entry, ownedService);
     try {
       const invokeStart = async () => {
         const settled = createDeferredCore();
         ownedService.startup = settled.promise;
         try {
+          ownedService.startupConsumer = instance?.retainConsumer();
           const start = () => service.start(serviceContext);
           await withPluginHttpRouteRegistry(
-            params.registry,
-            () => (instance ? instance.run(start) : start()),
+            registry,
+            () =>
+              ownedService.startupConsumer ? ownedService.startupConsumer.run(start) : start(),
             lease,
           );
         } finally {
           // Failed-start rollback waits on raw work, never on the rollback that follows it.
+          ownedService.startupConsumer?.release();
+          ownedService.startupConsumer = undefined;
           ownedService.startup = undefined;
           settled.resolve();
         }
       };
       // Bound candidate observation only; raw completion remains owned by the entry.
       await runBeforeDeadline(
-        () =>
-          params.startupTrace ? params.startupTrace.measure(traceName, invokeStart) : invokeStart(),
+        () => (startupTrace ? startupTrace.measure(traceName, invokeStart) : invokeStart()),
         candidate ? Date.now() + PLUGIN_SERVICE_REPLACEMENT_STOP_TIMEOUT_MS : undefined,
         "plugin service startup",
         `${entry.pluginId}/${service.id}`,
@@ -595,12 +622,12 @@ export async function startPluginServices(
   };
   let failedCount = 0;
   const startupSettled = (async () => {
-    for (const entry of params.registry.services) {
+    for (const entry of registry.services) {
       if (owner.closed) {
         break;
       }
       if (!canStart(entry)) {
-        if (params.throwOnStartError && owner.stopped.has(entry)) {
+        if (throwOnStartError && owner.stopped.has(entry)) {
           throw new Error(
             `Previous plugin service cleanup remains pending (${entry.pluginId}/${entry.service.id})`,
           );
@@ -619,19 +646,17 @@ export async function startPluginServices(
         }
       }
       const failures: unknown[] = [];
-      if (
-        !(await startService(entry, params.config, failures, params.throwOnStartError === true))
-      ) {
+      if (!(await startService(entry, initialConfig, failures, throwOnStartError === true))) {
         failedCount += 1;
-        if (params.throwOnStartError) {
+        if (throwOnStartError) {
           throw new AggregateError(failures, "plugin services failed to start");
         }
       }
     }
   })();
   await startupSettled;
-  params.startupTrace?.detail?.("sidecars.plugin-services.summary", [
-    ["serviceCount", params.registry.services.length],
+  startupTrace?.detail?.("sidecars.plugin-services.summary", [
+    ["serviceCount", registry.services.length],
     ["startedCount", ownedServices.length - failedCount],
     ["failedCount", failedCount],
   ]);

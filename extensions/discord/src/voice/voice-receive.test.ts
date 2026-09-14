@@ -11,7 +11,6 @@ defineDiscordVoiceTests(
     it,
     vi,
     ChannelType,
-    createVoiceCaptureState,
     DECRYPT_FAILURE_WINDOW_MS,
     requireRecord,
     lastMockCall,
@@ -46,6 +45,31 @@ defineDiscordVoiceTests(
     receiveRecordedSpeech,
     agentCommandMock,
   }) => {
+    it.each([false, true])(
+      "keeps Live microphone input open during playback without local interruption (recording: %s)",
+      async (recording) => {
+        realtimeSessionMock.bridge.outputAudioMode = "continuous";
+        resolveVoiceIngressWithParticipantsMock.mockResolvedValue({
+          speakerLabel: "Speaker",
+          senderIsOwner: true,
+        });
+        const manager = createAgentProxyManager();
+        try {
+          await manager.join({ guildId: "g1", channelId: "1001" });
+          if (recording) {
+            await startTranscripts(manager, vi.fn());
+          }
+          const entry = getSessionEntry(manager);
+          getLastAudioPlayer().state.status = "playing";
+          await receiveRecordedSpeech(manager, "A spoken interruption", entry);
+          expect(realtimeSessionMock.sendAudio).toHaveBeenCalled();
+          expect(realtimeSessionMock.handleBargeIn).not.toHaveBeenCalled();
+        } finally {
+          await manager.destroy();
+        }
+      },
+    );
+
     it.each(["agent-proxy", "bidi"] as const)(
       "keeps exact capture and %s conversation after destructive recovery",
       async (mode) => {
@@ -1049,26 +1073,25 @@ defineDiscordVoiceTests(
         const manager = createManager({
           voice: {
             enabled: true,
+            mode: "stt-tts",
             captureSilenceGraceMs: 4_000,
           },
         });
-        const stream = { destroy: vi.fn() };
-        const entry = {
-          guildId: "g1",
-          channelId: "1001",
-          capture: createVoiceCaptureState(),
-        };
-        entry.capture.set("u1", {
-          stream: stream as unknown as Readable,
+        expect(await manager.join({ guildId: "g1", channelId: "1001" })).toMatchObject({
+          ok: true,
         });
+        const stream = new PassThrough();
+        const destroy = vi.spyOn(stream, "destroy");
+        const entry = getSessionEntry(manager);
+        entry.capture.set("u1", { stream });
 
         getVoiceReceive(manager).scheduleCaptureFinalize(entry, "u1", "test");
 
         await vi.advanceTimersByTimeAsync(3_999);
-        expect(stream.destroy).not.toHaveBeenCalled();
+        expect(destroy).not.toHaveBeenCalled();
 
         await vi.advanceTimersByTimeAsync(1);
-        expect(stream.destroy).toHaveBeenCalledTimes(1);
+        expect(destroy).toHaveBeenCalledTimes(1);
       } finally {
         vi.useRealTimers();
       }

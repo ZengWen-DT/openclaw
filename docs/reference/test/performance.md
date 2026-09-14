@@ -29,6 +29,29 @@ Native imports also need the plugin's declared dependencies and a resolvable `op
 
 ## Benchmarks
 
+<Accordion title="Session history (scripts/bench-session-history.ts)">
+
+Measure SQLite history pages and the Gateway's bounded history reader with
+synthetic conversations, including sparse markers, dense markers, and resets:
+
+```bash
+pnpm test:sessions:history:bench --samples 30 --output history.json
+pnpm test:sessions:history:bench --profile sparse,trailing,reset --operation recent --analyze --samples 15 --output history-analyzed.json
+```
+
+The second command includes 5,000 trailing compaction markers and refreshes
+SQLite planner statistics before reading. Compare both statistics states when
+changing a query. `--operation` selects `recent`, `page`, or `gateway-tail`;
+omitting it measures all three.
+
+Each reader runs in a fresh process. Reports separate imports, the first read
+(including database open), and warm p50/p95 wall and CPU time. OS caches are not
+flushed. SQL plans, statement counts, rows delivered to JavaScript, and JSON
+parsing counts come from a separate instrumented read. Heap deltas are
+uncollected observations, not total allocations. Fixtures are removed afterward.
+
+</Accordion>
+
 <Accordion title="Model latency (scripts/bench-model.ts)">
 
 ```bash
@@ -98,6 +121,32 @@ Use JSON output or `--output` when comparing changes. Use `--cpu-prof-dir` only 
 
 </Accordion>
 
+<Accordion title="Workspace computation (scripts/bench-workspace-computation.ts)">
+
+Compare workspace inventory, manifest capture, and result preparation against a
+frozen source checkout with its own installed dependencies:
+
+```bash
+node --import ./scripts/tsx.mjs scripts/bench-workspace-computation.ts \
+  --baseline /path/to/baseline-checkout \
+  --scenarios inventory,manifest,delta,unchanged \
+  --sizes 1000,32000,100000 --concurrency 1,4 \
+  --runs 3 --warmup 1 --output .artifacts/workspace-computation.json
+```
+
+Use `--changed-files 2000 --scenarios delta --sizes 32000` to include a larger
+changed payload, and `--file-bytes` to vary the content hashed during capture.
+The default workload is smaller: 1,000 entries and one concurrent operation.
+
+The benchmark checks identical inventory bytes, manifest references, and changed
+payloads. Separate processes measure first invocation and warm throughput, CPU,
+event-loop delay, memory, and HTTP latency from an external probe. Worker task
+diagnostics distinguish queueing, input preparation, transfer, and execution.
+The HTTP probe measures responsiveness of the computation's owning process;
+paired-node wire tests provide the full Gateway dispatch and reconciliation proof.
+
+</Accordion>
+
 <Accordion title="Gateway concurrency (scripts/bench-gateway-concurrency.ts)">
 
 Runs synthetic streaming agent turns in parallel sessions on one isolated
@@ -107,24 +156,192 @@ first; no provider key is required.
 
 ```bash
 pnpm test:gateway:concurrency -- --concurrency 16 --tool-events --workspace-fanout --session-count 100 --history-messages 20 --history-clients 4 --subscribers 4 --visible-observer --control-plane --heap-prof-dir .artifacts/gateway-heap --output .artifacts/gateway-concurrency.json
+pnpm test:gateway:concurrency -- --concurrency 64 --turns-per-session 8 --tool-events --timeout-ms 600000 --heap-prof-dir .artifacts/gateway-sustained-heap --output .artifacts/gateway-sustained.json
 ```
+
+`--concurrency` controls parallel sessions; `--turns-per-session` controls serial
+turns in each session (default 1, maximum 100). The second example completes 512
+turns across 64 sessions. Each session starts its next turn as soon as its
+previous turn completes, retaining its conversation history and workspace;
+there is no barrier between rounds. The fresh-connection probe runs once after
+every session has started its first turn. `--tool-events` requests a tool call
+on every turn, including follow-ups. The per-run timeout still bounds the whole
+workload. Health/control sampling is capped at 2,048 samples, while heap
+sampling continues until the full workload finishes.
+
+Use `--probe-rounds N` for allocation comparisons with equal probe work. It
+attempts exactly N sampler rounds and N history bursts per configured history
+client, regardless of which finishes first. Each sampler round requests
+`/readyz`, the Control UI, and `sessions.list`; `--control-plane` adds one each
+of `tasks.list`, `cron.list`, and `cron.status`. Enabling `--subscribers` adds
+one subscribe attempt per round and an unsubscribe after each successful
+subscription. History attempts total `N × historyClients × historyBurst`, capped
+at 2048 per run. Slow clients receive the same history budget as fast clients.
+Failed probes remain recorded failures; counts describe attempts, not successes.
+Omitting the flag retains adaptive probing until agent turns and mutations end.
+
+Fixed probes can finish before or after agent turns. Every configured workload
+joins before final memory and allocation capture; an exhausted load deadline
+fails the run instead of reporting a partial fixed workload as complete. Output
+records the mode and requested counts in `probeWorkload`; actual sampler and
+history counts remain in `summary.sampleCount` and `summary.historySampleCount`.
+Peak RSS is sampled during sampler rounds plus the final memory observation. If
+those rounds finish early, a later transient RSS peak can be missed; this is not
+continuous peak-RSS coverage of the entire agent workload.
+Equal request counts do not equalize their overlap with agent turns or the
+Gateway's time-dependent background work.
+
+Each run's `cpuUsage` records user, system, and total CPU milliseconds for the
+Gateway process and its main thread. Two private IPC snapshots bound the load
+after setup and profiler activation through completion of all configured work,
+before the final memory probe, profile export, and teardown. Their child-side
+monotonic timestamps define `wallMs`; CPU time can exceed wall time when threads
+run in parallel. Ordinary runs do not connect an inspector or start a profiler.
+
+The process counters include Workers and native threads, including Workers that
+exit during the load, but exclude separate child processes, the mock provider,
+and the browser. Main-thread CPU is part of process CPU; do not add them. Their
+difference estimates work on other threads, with small skew from reading the
+counters sequentially. The summary reports `gatewayProcessCpuMs`,
+`gatewayProcessCpuMsPerTurn`, `gatewayMainThreadCpuMs`, and
+`gatewayProcessCpuCoreRatio`. CPU per turn includes the configured concurrent
+probes and mutations. Compare fixed workloads and identical profiling settings;
+moving work to Workers can improve responsiveness without reducing process CPU.
+The existing `cpuCoreRatio` summary remains sampled readiness-window data.
+
+To measure clicking an existing session in the Control UI sidebar during load,
+build the UI and install Playwright Chromium, then enable the browser probe:
+
+```bash
+pnpm ui:build
+pnpm --dir ui exec playwright install chromium
+pnpm test:gateway:concurrency -- --session-count 1000 --concurrency 16 --turns-per-session 2 --browser-session-clicks 3 --browser-history-messages 80 --timeout-ms 240000 --no-diagnostics-timeline --output .artifacts/gateway-session-clicks.json
+```
+
+`--browser-session-clicks` defaults to 0 and accepts up to 20 first visits,
+followed by one revisit to a recent pane. The probe seeds separate idle click
+targets after the inventory. `--browser-history-messages` defaults to 80 per
+target (maximum 500), independent of `--history-messages`, so a large inventory
+does not require history in every session. `--history-message-chars` also sizes
+the browser targets' synthetic Markdown. The browser uses the built assets in
+`dist/control-ui`; `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` can select an installed
+Chromium executable.
+
+`browser.inventory` records requested load and click target counts alongside
+the authoritative unarchived and retained session counts before load, including
+the click targets. Retained counts include archived sessions; normal inventory
+maintenance can reduce the unarchived count during seeding.
+
+Each run's `browser.clicks` records time from the actual browser click event to
+the target pane's visible history, enabled composer, and successful transcript load
+followed by a paint opportunity (`readyMs`). These timings exclude Playwright
+actionability waits. RPC `windowStartMs` offsets begin before that wait;
+`latencyMs` measures the observed request/response round trip. Request records
+include socket identity, method, session key, success, error, and response bytes.
+An `inherited` request began before the click window and has a negative
+`windowStartMs`; its latency includes the earlier wait. Completed click records
+remain unchanged when a later window observes the response. The probe includes
+message subscribe/unsubscribe requests to expose subscription recovery waits.
+`connections` records observed socket, hello, and outer event sequence gaps;
+negative offsets include recent setup events. Close events report observed inbound
+silence, without inferring a close reason. `paneStates` records changes to the selected pane's loading,
+readiness, connection epoch, and rendered history error. A displayed history
+failure retains visible-history/composer timings but fails the click instead of
+counting as ready. Browser `longTasks`
+contains the milliseconds each observed long task overlaps the click-to-ready
+interval, separate from the Gateway's Node CPU, event-loop, and memory
+samples. Pre-load `/new` and initial-session timings stay outside the click
+summary. Compare first visits and cached revisits separately, and check
+`activeLoadAtStart`, `activeLoadAtFinish`, and `samplesOutsideActiveLoad` before
+attributing latency to concurrent work. A recorded click failure makes the benchmark
+exit unsuccessfully after writing its report.
 
 `--heap-prof-dir` samples allocations in the Gateway's main V8 isolate, starting
 after startup, session seeding, and probe warmup. Sampling ends after the load
 and its final memory probe, before profile serialization and teardown. It uses
 a 32 KiB sampling interval and includes objects collected by both minor and
 major GC, so `sampledAllocatedBytes` estimates gross allocations rather than
-retained heap. Native allocations and separate worker isolates are outside this
-profile. Each run records its `.heapprofile` path and the twenty largest
-allocation stacks; open the raw file in the Chrome DevTools Memory panel.
+retained heap. Each run records its `.heapprofile` path and the twenty largest
+allocation stacks with `scope: "main-isolate"`; open the raw file in the Chrome
+DevTools Memory panel. Worker isolates have separate profiles, described below.
+Native allocations are outside these V8 profiles.
 
 The summary includes sampled allocation bytes per run and per completed turn.
 The per-turn figure also includes concurrent probes and session mutations;
 compare identical workload settings and Node versions across multiple runs.
+Initial and follow-up turns overlap across sessions, so the allocation profile
+covers their combined workload rather than attributing separate cold and warm
+allocations. Compare matched one-turn and sustained runs to study reuse.
 Sampling is statistical and adds overhead. Use unprofiled runs for latency
 comparisons. Existing heap/RSS measurements are taken before exporting the
 profile. `--cpu-prof-dir` remains available separately and includes startup;
 the recorded `loadWindow` identifies the measured interval in that CPU profile.
+
+For CPU attribution during concurrent work, including on Windows, add
+`--load-cpu-prof-dir .artifacts/gateway-load-cpu`. This captures the Gateway's
+main V8 isolate at a 1 ms sampling interval after setup and through the final
+memory probe. The private benchmark IPC channel stops the profiler and writes
+the `.cpuprofile` before process teardown, without depending on signal-driven
+profile flushing. Each run's `loadCpuProfile` records its path, duration, and
+sample count with `scope: "main-isolate"`; open the raw profile in Chrome
+DevTools. Profiled runs add overhead, so keep them separate from latency
+comparisons. `--cpu-prof-dir` retains its startup-inclusive native profiling
+behavior. `--load-cpu-prof-dir` and `--heap-prof-dir` require separate runs so
+exporting one profile cannot contaminate the other capture.
+
+Both load-profile flags also capture observed Worker isolates over the existing
+private inspector connection. The main profile summary links
+`workersManifestPath`, a `.workers.json` manifest beside the main profile. Its
+rows distinguish native `threadId` from `inspectorWorkerId` and link each
+Worker's profile. `completed: true` means that profile was written; inspect
+row-level errors for missing identity, retired Workers, or other incomplete
+captures. A successful profiling command does not mean every Worker produced a
+usable profile. Workers are not paused at birth, so profiling can miss their
+earliest work. These files exclude separate child processes.
+
+The Worker manifest's samples use `performance.now` in the Gateway process, with
+timestamps taken before asynchronous Worker reads. The 100 ms cadence is
+nominal; overlapping reads are coalesced. CPU counters are cumulative
+microseconds: difference observations for the same thread identity instead of
+summing samples. Those deltas cover each Worker's observed interval and can
+miss work before its first or after its last successful sample. The sample's
+`memory.rss` covers the process; other `memory` fields describe the main isolate,
+while each Worker's `heap` contains its own V8 heap statistics.
+
+Capture windows differ: load CPU counters end before the final memory probe;
+the main V8 profile includes that probe; Worker profiles and samples also extend
+through main-profile serialization before their own stop. Use the raw CPU
+profiles' timestamps and manifest observations for attribution, and keep these
+windows separate from `cpuUsage`. Main-thread CPU plus observed Worker CPU does
+not account for every native thread or unobserved Worker interval. Profiling and
+periodic Worker inspection add overhead; compare equally instrumented runs.
+
+Both load-phase profile modes also attach `diagnostics` and a `diagnosticsPath`
+to the run report. The private benchmark preload subscribes only during capture
+and aggregates the main isolate's redaction, session writer, session list, and
+worker-task completion records, including fast work below slow-log thresholds.
+It records counts, totals, and maxima in at most 256 groups; `droppedEvents`
+and `collectionErrors` report incomplete collection. No per-call record history,
+session or agent IDs, paths, message text, regex patterns, or exception text is
+retained in these aggregates. Worker artifact basenames identify task groups.
+
+Redaction reports synchronous thread CPU separately from elapsed time and input
+UTF-16 character counts. These are inclusive measurements: nested redaction
+operations overlap, so do not add their times. Session writer timing separates
+queue wait, writer-held elapsed time, and completion delay. List records
+distinguish `sessions.list` from the initial `sessions.subscribe` snapshot and
+separate projection owners, in-flight followers, and completed cache hits.
+Worker-task records separate queue, preparation, run, and transfer measurements.
+Elapsed intervals can overlap across concurrent work and do not measure CPU.
+
+The capture also aggregates main-isolate GC pause entries. Allocation profiles
+identify allocation sites, including collected objects; they do not establish
+which objects remain reachable or prove a leak. Raw profiles contain function
+names and source locations and need inspection before sharing.
+
+These diagnostics channels have no collector in an ordinary Gateway. The
+benchmark uses isolated synthetic state, private process IPC, and no inspector
+listener. It does not attach to or modify an existing operator Gateway.
 
 </Accordion>
 

@@ -1,6 +1,7 @@
 ---
 summary: "Manifest fields for icons, CLI, MCP, Control UI, dashboard, QA, channel, and backup surfaces"
 read_when:
+  - You are adding plugin branding or compact tool activity artwork
   - Your plugin contributes a CLI command, MCP server, or dashboard widget
   - You are shipping native Control UI or a QA runner
   - You need backups or transcripts to know about plugin-owned data
@@ -15,6 +16,11 @@ Manifest fields that contribute a concrete host surface: an icon, a command, a s
 Place the portable plugin icon at `assets/icon.png`, relative to the plugin root. No manifest
 field is required. Use a square PNG that remains recognizable at 16 px; 512×512 is recommended.
 Missing, unreadable, or invalid icons are ignored and do not invalidate the plugin.
+
+This is the plugin's identity artwork for catalogs, settings, channel setup, and
+installation cards. Compact tool calls use separate
+[inline activity icons](#inline-activity-icons), so improving a chat glyph does
+not change the plugin's branding elsewhere.
 
 OpenClaw adopts this fixed package path as its icon convention, matching the path proposed in
 Agent Plugins spec proposal [agent-plugins-spec#66](https://github.com/agentplugins/agent-plugins-spec/pull/66). OpenClaw itself implements Agent Plugins 1.0.0. Other Agent Plugins
@@ -92,6 +98,59 @@ before plugin installation or capability consent. An installed plugin's doctor
 contract remains authoritative; retained entrypoints do not expose state
 migrations, install plugins, or grant capabilities.
 
+## Inline activity icons
+
+Place a monochrome SVG at `assets/activity.svg` for the compact icon beside the
+plugin's tool calls and collapsed tool results. No manifest field is required.
+Design it to remain clear at 16 px with a transparent background. The Control UI
+renders its shape in the activity row's text color, including dark mode; source
+colors do not become branding colors in the row.
+
+Use `assets/activity/<tool-name>.svg` only when an individual tool needs a
+different shape. The filename must exactly match that tool's `id` from
+`tools.effective`, including case. For example, a tool with ID `calendar_search`
+can ship:
+
+```text
+assets/
+  icon.png
+  activity.svg
+  activity/
+    calendar_search.svg
+```
+
+The tool ID must be at most 128 ASCII characters, start with a letter, digit, or
+underscore, and contain only letters, digits, underscores, hyphens, or periods.
+Keep the override directory to at most 128 entries; larger directories are
+ignored as a whole. The default activity icon covers other tool IDs, including
+integrations whose routing adds prefixes to tool names. These files supply presentation only; they do not
+register tools or change tool ownership.
+
+Keep each SVG file within 32 KiB. Use simple SVG geometry: `path`, `circle`,
+`ellipse`, `line`, `polygon`, `polyline`, and `rect`, optionally inside `g`. The SVG can contain at most four
+elements including the root, 8 KiB of combined path and point data, and 1,024
+path commands. Give the root a `viewBox` with positive width and height, or
+positive numeric `width` and `height`, each at most 4,096. Scripts, stylesheets, event handlers,
+external references, embedded images, and filters are not supported. For
+example:
+
+```xml
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5 5h14v14H5zM8 2v6m8-6v6M5 10h14"/>
+</svg>
+```
+
+OpenClaw validates the SVG and rasterizes it before using it as an activity
+mask; it never inserts package SVG markup into the chat DOM. Missing or invalid
+artwork falls back to the existing tool glyph, without showing the packaged
+brand image. The plugin remains usable.
+
+Include both `assets/activity.svg` and `assets/activity/*.svg` in the published
+package's `files` list when used. OpenClaw's bundled metadata copier and plugin
+runtime package builder include these paths automatically. Asset discovery
+uses the Gateway's prepared plugin metadata; restart or explicitly reload the
+plugin after changing its artwork.
+
 ## Transcript sources reference
 
 `transcriptSources` maps provider IDs to static setup descriptors. Each key must
@@ -133,6 +192,22 @@ include, or generated data that OpenClaw can safely omit and regenerate after
 restore. The backup planner reads this metadata without loading plugin runtime
 or modifying plugin files. Only effectively activated, loadable plugins
 contribute resources; disabled or unloadable plugins cannot exclude data.
+
+An `include` declaration also asks OpenClaw to manage SQLite backups for that
+resource. SQLite files at or below the declared path receive verified online
+snapshots and offline compaction, with their committed write-ahead log (WAL)
+content included and sidecars omitted. Creation refuses a declared database
+when its required SQLite capabilities are unavailable. Declare every hardlink
+alias within these resources so backup can identify its journal owner.
+
+Other plugin SQLite files remain opaque byte copies, including their sidecars,
+unless they alias a canonical OpenClaw database. Backup reports each opaque
+SQLite file and sidecar in `warnings`; verification and restore preserve its bytes
+without applying SQLite validation or compaction. Merely placing a database
+under the state or agent directory does not opt it into managed snapshots.
+Undeclared SQLite symbolic links that exceed the link-resolution limit (`ELOOP`),
+including loops, are skipped with filename warnings. Declared database links still
+fail closed if they cannot be captured safely.
 
 ```json
 {
@@ -349,6 +424,39 @@ from implementations that do not declare support.
 
 The `adapterFactory` id must match `commandName`. Do not export registrations
 for commands absent from the manifest.
+
+## channelAccountKeyPolicies reference
+
+`channelAccountKeyPolicies` declares stored account-key selection rules for channels
+listed in the plugin's `channels` array. It is plugin metadata; operators keep their
+account config under `channels.<id>.accounts`.
+
+```json
+{
+  "channels": ["signal"],
+  "channelAccountKeyPolicies": {
+    "signal": { "canonicalAliasesRequireOwnField": "account" }
+  }
+}
+```
+
+`canonicalAliasesRequireOwnField` is the name of a string field in the account
+entry. An alias that matches only after account-id normalization is eligible when
+that entry has a nonempty value for this field. Root values do not satisfy it.
+Exact stored keys win; existing case-insensitive matches keep their behavior.
+Readers and writers use the same selected stored key.
+
+For Signal, `Work Phone` resolves as `work-phone` when it has its own `account`
+number. Its settings then apply even if the channel root also has a number.
+Without its own number, the previously ignored entry stays ignored and the route
+keeps its inherited settings. Doctor preserves that key and reports the required
+manual change. Doctor also reports normalized-key collisions and preserves both
+entries; an exact `work-phone` key wins at runtime.
+
+Rules for undeclared channels are ignored. Runtime reads use the selected plugin
+metadata snapshot; they do not load plugin code to find the rule. See
+[account lookup arguments](/plugins/sdk-channel-plugins/setup-and-config#stored-account-key-selection)
+for the SDK contract.
 
 ## channelConfigs reference
 

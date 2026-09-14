@@ -1,5 +1,10 @@
+import { scheduleYieldedSubagentRunProgress } from "../../../tasks/task-registry-progress.js";
 /** Settles durable child ownership when the spawning requester turn ends. */
 import type { AcceptedSessionSpawn } from "../../accepted-session-spawn.js";
+import {
+  captureRequesterCronAuthority,
+  promoteRequesterCronAuthority,
+} from "../requester-cron-authority.js";
 import { promoteRequesterFinalAttachment } from "../requester-final-attachment.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
@@ -26,6 +31,13 @@ export function markRequesterTurnYieldedInRuns(params: {
   if (entries.every((entry) => entry.requesterTurnYielded === true)) {
     return entries.length;
   }
+  const cronAuthority = captureRequesterCronAuthority({
+    requesterSessionKey,
+    requesterAgentId: params.requesterAgentId,
+    requesterTurnRunId,
+    batch: entries,
+    runs: params.runs,
+  });
   const previous = entries.map((entry) => entry.requesterTurnYielded);
   for (const entry of entries) {
     entry.requesterTurnYielded = true;
@@ -33,11 +45,13 @@ export function markRequesterTurnYieldedInRuns(params: {
   try {
     params.persistOrThrow(...entries.map((entry) => entry.runId));
   } catch (error) {
+    cronAuthority?.revoke();
     entries.forEach((entry, index) => {
       entry.requesterTurnYielded = previous[index];
     });
     throw error;
   }
+  cronAuthority?.commit();
   return entries.length;
 }
 
@@ -191,6 +205,7 @@ export function settleRequesterTurnAfterSessionSpawns(params: {
     throw error;
   }
 
+  promoteRequesterCronAuthority({ requesterTurnRunId, batch: entries, rearmGeneration });
   if (rearmGeneration !== undefined && params.requesterAgentId) {
     promoteRequesterFinalAttachment({
       requesterAgentId: params.requesterAgentId,
@@ -199,6 +214,11 @@ export function settleRequesterTurnAfterSessionSpawns(params: {
       batchRunIds,
       rearmGeneration,
     });
+  }
+  if (rearmGeneration !== undefined) {
+    for (const entry of entries) {
+      scheduleYieldedSubagentRunProgress(entry);
+    }
   }
   if (
     rearmGeneration !== undefined &&

@@ -16,6 +16,10 @@ import {
   type DoctorConfigCapture,
   type UpdatePostInstallDoctorResult,
 } from "../infra/update-doctor-result.js";
+import {
+  createUpdateFailureFact,
+  normalizeUpdateFailureFacts,
+} from "../infra/update-failure-facts.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
@@ -28,11 +32,7 @@ const outro = (message: string) => clackOutro(stylePromptTitle(message) ?? messa
 const loadConfigModule = createLazyRuntimeModule(() => import("../config/config.js"));
 
 async function assertDoctorDatabaseSchemasCompatible(scope?: "state") {
-  const [databasePreflight, agentDatabase, stateDatabase] = await Promise.all([
-    import("../state/openclaw-database-preflight.js"),
-    import("../state/openclaw-agent-db-contract.js"),
-    import("../state/openclaw-state-db-contract.js"),
-  ]);
+  const databasePreflight = await import("../state/openclaw-database-preflight.js");
   const [{ createConfigIO }, targets] = await Promise.all([
     import("../config/io.js"),
     import("../config/sessions/targets.js"),
@@ -53,10 +53,6 @@ async function assertDoctorDatabaseSchemasCompatible(scope?: "state") {
       { env: process.env },
     ),
     agentAdmissionConfig: cfg,
-    supportedVersions: {
-      state: stateDatabase.OPENCLAW_STATE_SCHEMA_VERSION,
-      agent: agentDatabase.OPENCLAW_AGENT_SCHEMA_VERSION,
-    },
   });
   if (databaseSchemas.incompatible.length > 0) {
     throw new databasePreflight.OpenClawDatabaseSchemaPreflightError(databaseSchemas.incompatible, {
@@ -210,6 +206,16 @@ async function runDoctorHealthFlowWithResult(
           : "Doctor finished, but config fixes were not applied.",
       );
       exitCode = 1;
+      doctorResult = {
+        status: "error",
+        failureFacts: [
+          createUpdateFailureFact({
+            check: "config-write",
+            code: ctx.configWriteRefusal,
+            message: "Doctor config fixes were not applied.",
+          }),
+        ],
+      };
       return;
     }
     if (options.repair === true || options.yes === true) {
@@ -244,7 +250,11 @@ async function runDoctorHealthFlowWithResult(
     await maintenance?.finish(ctx.cfg);
     const warnings = normalizeUpdatePostInstallDoctorWarnings([
       ...(ctx.configResult.stateMigrationStepReceipts ?? []).flatMap((receipt) =>
-        receipt.outcome === "warning" || receipt.outcome === "skipped" ? receipt.warnings : [],
+        receipt.outcome === "warning" ||
+        receipt.outcome === "skipped" ||
+        receipt.outcome === "deferred"
+          ? receipt.warnings
+          : [],
       ),
       ...(ctx.postInstallDoctorResult?.warnings ?? []),
       ...(ctx.updateWarnings ?? []),
@@ -258,9 +268,43 @@ async function runDoctorHealthFlowWithResult(
       return;
     }
   } catch (error) {
+    const { DoctorStateMigrationRefusalError } =
+      await import("../infra/state-migrations.messages.js");
+    if (error instanceof DoctorStateMigrationRefusalError) {
+      const { recordUpdateDoctorRefusal, resolveUpdateDoctorGitRecovery } =
+        await import("../commands/doctor-update-refusal.js");
+      const recovery = await resolveUpdateDoctorGitRecovery({ root, stateRepaired: true });
+      if (recovery) {
+        error.message += `\n${recovery.message}`;
+        recordUpdateDoctorRefusal(error.message);
+      }
+    }
+    doctorResult = {
+      status: "error",
+      failureFacts:
+        error instanceof DoctorStateMigrationRefusalError
+          ? normalizeUpdateFailureFacts(
+              error.stepReceipts.flatMap((receipt) =>
+                receipt.outcome === "refused" && receipt.refusal
+                  ? [
+                      {
+                        check: receipt.id,
+                        code: receipt.refusal.code,
+                        message: receipt.refusal.message,
+                      },
+                    ]
+                  : [],
+              ),
+            )
+          : [
+              createUpdateFailureFact({
+                check: "doctor",
+                code: "doctor-failed",
+                message: error instanceof Error ? error.message : String(error),
+              }),
+            ],
+    };
     if (maintenance) {
-      const { DoctorStateMigrationRefusalError } =
-        await import("../infra/state-migrations.messages.js");
       if (!(error instanceof DoctorStateMigrationRefusalError)) {
         effectiveRuntime.error(
           "Doctor could not complete maintenance. Check the reported service state and resolve the failure.",

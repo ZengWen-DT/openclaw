@@ -11,7 +11,6 @@ import type {
   RequestFrame,
 } from "../../../packages/gateway-protocol/src/schema/frames.js";
 import type { ModelCatalogEntry } from "../../agents/model-catalog.types.js";
-import type { ChannelId } from "../../channels/plugins/types.public.js";
 import type { CliDeps } from "../../cli/deps.types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AgentRunDelegatedAuthority } from "../../infra/agent-run-authority.types.js";
@@ -46,6 +45,7 @@ import type { GatewayBroadcastFn, GatewayBroadcastToConnIdsFn } from "../server-
 import type {
   ChannelAccountStartOutcome,
   ChannelRuntimeSnapshot,
+  ChannelRuntimeSnapshotOptions,
   StartChannelOptions,
 } from "../server-channel-runtime.types.js";
 import type { ChatRunEntry, ChatRunRegistration, ChatRunState } from "../server-chat-state.js";
@@ -192,6 +192,7 @@ type GatewayKernelContext = {
   gatewayTlsFingerprint?: string;
   sessionCompanion?: import("../session-companion.js").SessionCompanionService;
   sessionObserver?: SessionObserverService;
+  sessionActivitySummaries?: import("../session-activity-summaries.js").SessionActivitySummaryService;
   /** Temporary profile-owned mentions for this exact Gateway lifetime. */
   mentionInbox?: MentionInbox;
   resolveTerminalLaunchPolicy: (agentId?: string) => TerminalLaunchResolution;
@@ -312,7 +313,7 @@ type GatewayTransportContext = {
     opts?: { role?: string; reason?: string },
   ) => void;
   hasConnectedClientsForDevice?: (deviceId: string) => boolean;
-  refreshConnectedUserProfile?: (profile: {
+  refreshConnectedUserProfile?: (profile?: {
     id: string;
     displayName: string | null;
     avatarRevision: string;
@@ -354,6 +355,8 @@ type GatewayResidentBridgeContext = {
   workerEnvironmentService?: WorkerEnvironmentServiceContract;
   /** Gateway-host desktop acquisition and observation; present only after enabled startup. */
   hostDesktopService?: import("../desktop/host-source.js").HostDesktopService;
+  /** Local computer provider shared with the node host, owned by this Gateway lifetime. */
+  gatewayComputerService?: import("../desktop/computer-service.js").GatewayComputerService;
   /** Durable per-session worker placement; absent only from lightweight in-process contexts. */
   workerSessionPlacementService?: WorkerSessionPlacementReader &
     Partial<WorkerSessionPlacementRetirementService>;
@@ -375,7 +378,7 @@ type GatewayResidentBridgeContext = {
   modelAccountConnectService?: ReturnType<
     typeof import("../model-account-connect.js").createModelAccountConnectService
   >;
-  getRuntimeSnapshot: (channelId?: ChannelId) => ChannelRuntimeSnapshot;
+  getRuntimeSnapshot: (options?: ChannelRuntimeSnapshotOptions) => ChannelRuntimeSnapshot;
   getEventLoopHealth?: () => GatewayEventLoopHealth | undefined;
   getConfigReloaderHotReloadStatus?: () => GatewayHotReloadStatus | undefined;
   getDeferredChannelReloads?: () => readonly GatewayDeferredChannelReload[];
@@ -426,6 +429,8 @@ export type GatewayRequestOptions = {
   respond: RespondFn;
   context: GatewayRequestContext;
   methodRegistry?: GatewayMethodRegistryView;
+  /** Shared entry/publication precondition; never retained as accepted-run authority. */
+  expectedProfileBinding?: import("../expected-profile.js").ExpectedProfileBinding;
   /** In-process Gateway lifetime guard composed into durable session mutations. */
   sessionMutationCommitGuard?: () => void;
   /** In-process caller lifetime; never serialized into a Gateway request frame. */
@@ -438,6 +443,8 @@ export type GatewayRequestOptions = {
 export type SessionMutationAuthorization = {
   talkSessionTarget?: import("../talk-session-target.types.js").PreparedTalkSessionTarget;
   assertCurrent: () => void;
+  /** Original host/session authority for committed input custody, without the selection precondition. */
+  assertAdmittedInputCurrent?: () => void;
   assertTargetCurrent: (target: {
     sessionKey: string;
     agentId?: string;

@@ -64,7 +64,7 @@ A complete recovery point must cover these together:
   including databases at configured paths outside the default layout.
 - The workspaces, credentials, and retained originals needed by that installation.
 
-Use `openclaw backup` for a verified, WAL-aware archive. Never copy only the
+Use `openclaw backup create --verify` for a verified, WAL-aware archive. Never copy only the
 main `.sqlite` file from a live WAL database: committed data can still be in
 `-wal`. Restore the verified consolidated database offline; do not mix it with
 `-wal` or `-shm` files from another database generation. See [Backup](/cli/backup)
@@ -227,12 +227,13 @@ Use `openclaw triage --agent codex` to select a particular agent.
 Failed interactive updates offer triage after updater cleanup and
 pass the captured failure to the agent before fresh diagnostics can delay the
 handoff. Before launch, OpenClaw shows the agent, saved prompt path when available,
-and use of your own account/tokens; Enter or `y` proceeds, while `n` prints handoff
-commands and preserves diagnostics and the failed update's exit status.
-After 30 seconds without an answer, it announces that it is continuing and
-proceeds as Yes; explicit `openclaw triage` does not ask for this confirmation.
-JSON, `--yes`, and non-interactive update invocations collect diagnostics
-and print handoff commands without starting an agent. For diagnostic collection
+and use of your own account/tokens. Only an affirmative Yes proceeds. Enter, `n`,
+cancellation, or 30 seconds without an answer skips the launch, prints a manual
+recovery command, and preserves diagnostics and the failed update's exit status.
+Explicit `openclaw triage` does not ask for this confirmation.
+JSON, `--yes`, and non-interactive update invocations can start one owned automatic
+repair after an eligible failure; other failures retain diagnostics and handoff
+commands. For diagnostic collection
 alone, use `openclaw triage --non-interactive`; add `--update-result <path>` to
 include a saved update-failure artifact. See [Triage](/cli/triage) for command
 formatting and installation targeting.

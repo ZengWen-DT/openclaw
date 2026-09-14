@@ -70,7 +70,7 @@ import {
 } from "../../scripts/e2e/parallels/provider-auth-prerequisite.mjs";
 import { parseArgs as parseWindowsSmokeArgs } from "../../scripts/e2e/parallels/windows-smoke.ts";
 import { withEnv } from "../../src/test-utils/env.js";
-import { spawnNodeEvalSync } from "../../src/test-utils/node-process.js";
+import { resolveTestNodeExecPath, spawnNodeEvalSync } from "../../src/test-utils/node-process.js";
 import { cleanupTempDirs, makeTempDir } from "../helpers/temp-dir.js";
 
 const WRAPPERS = {
@@ -112,6 +112,7 @@ const TS_SOURCE = Object.fromEntries(
 
 const OS_TS_PATHS = [TS_PATHS.linux, TS_PATHS.macos, TS_PATHS.windows];
 const tempDirs: string[] = [];
+const testNodeExecPath = resolveTestNodeExecPath();
 
 afterEach(() => {
   cleanupTempDirs(tempDirs);
@@ -155,7 +156,7 @@ function writeFakePrlctl(tempDir: string, posixScript: string, windowsBootstrap:
   writeFileSync(prlctlPath, posixScript);
   chmodSync(prlctlPath, 0o755);
   if (process.platform === "win32") {
-    copyFileSync(process.execPath, join(tempDir, "prlctl.exe"));
+    copyFileSync(testNodeExecPath, join(tempDir, "prlctl.exe"));
   }
   writeFileSync(join(tempDir, "prlctl-bootstrap.mjs"), windowsBootstrap);
 }
@@ -326,7 +327,7 @@ async function waitForProcessClose(
 }
 
 function runNode(source: string, options: NonNullable<Parameters<typeof run>[2]> = {}) {
-  return run(process.execPath, ["-e", source], { quiet: true, ...options });
+  return run(testNodeExecPath, ["-e", source], { quiet: true, ...options });
 }
 
 type FakeCommandResult = { status: number; stderr: string; stdout: string };
@@ -439,7 +440,7 @@ run(process.execPath, ['-e', ${JSON.stringify(SIGNAL_PARENT_SCRIPT)}], {
   return {
     grandchildPidPath,
     readyPath,
-    runner: spawn(process.execPath, ["--import", "tsx", runnerPath], {
+    runner: spawn(testNodeExecPath, ["--import", "tsx", runnerPath], {
       cwd: process.cwd(),
       detached: true,
       stdio: "ignore",
@@ -464,7 +465,6 @@ describe("Parallels smoke model selection", () => {
   const {
     agentWorkspace: workspace,
     guestTransports: transports,
-    hostCommand,
     hostServer,
     laneRunner,
     linux,
@@ -769,7 +769,7 @@ ensure_vm_running`,
     chmodSync(fakePnpm, 0o755);
 
     const result = spawnSync(
-      process.execPath,
+      testNodeExecPath,
       [
         "--import",
         "tsx",
@@ -889,7 +889,6 @@ ensure_vm_running`,
   it("keeps snapshot, host, package, and quote helpers shared", () => {
     const common = TS_SOURCE.common;
 
-    expect(common).toContain('export * from "./host-command.ts"');
     expect(common).toContain('export * from "./lane-runner.ts"');
     const packageArtifactExports = new Set(
       (common.match(/export \{([^}]*)\} from "\.\/package-artifact\.ts";/)?.[1] ?? "")
@@ -901,9 +900,6 @@ ensure_vm_running`,
     expect(packageArtifactExports).toContain("packageVersionFromTgz");
     expect(packageArtifactExports).toContain("resolveOpenClawRegistryVersion");
     expect(common).not.toContain('export * from "./package-artifact.ts"');
-    expect(common).toContain('export * from "./parallels-vm.ts"');
-    expect(common).toContain('export * from "./snapshots.ts"');
-    expect(hostCommand).toContain("export function shellQuote");
     expect(laneRunner).toContain("export async function runSmokeLane");
     expect(packageArtifact).toContain("withPackageLock");
     expect(packageArtifact).toContain("Wait for Parallels package lock");
@@ -915,15 +911,12 @@ ensure_vm_running`,
     expect(packageArtifact).toContain("filename !== path.win32.basename(filename)");
     expect(packageArtifact).toContain("npm pack did not report a safe tarball filename");
     expect(packageArtifact).not.toContain("path.basename(packed)");
-    expect(parallelsVm).toContain("export function resolveUbuntuVmName");
-    expect(parallelsVm).toContain("export function resolveMacosVmName");
     expect(parallelsVm).toContain("export function waitForVmStatus");
     expect(hostServer).toContain("export async function startHostServer");
     expect(hostServer).toContain("export async function startNpmRegistryServer");
     expect(hostServer).toContain("hostUrl: `http://127.0.0.1:${port}`");
     expect(hostServer).toContain('OPENCLAW_NPM_REGISTRY_UPSTREAM: "https://registry.npmjs.org"');
     expect(hostServer).toContain("http.server");
-    expect(snapshots).toContain("export function resolveSnapshot");
     expect(smokeCommon).toContain("runSmokeLane");
     expect(smokeCommon).toContain("abstract class SmokeRunController");
 
@@ -1271,7 +1264,7 @@ if (commandArgs[0] === "list") {
       );
 
       const result = spawnSync(
-        process.execPath,
+        testNodeExecPath,
         [
           "--import",
           "tsx",
@@ -1615,8 +1608,13 @@ if (commandArgs[0] === "list") {
       }
       expect(script, scriptPath).toContain("--thinking");
       expect(script, scriptPath).toContain("off");
-      expect(script, scriptPath).toContain("finalAssistant(Raw|Visible)Text");
+      expect(script, scriptPath).toContain(
+        scriptPath === TS_PATHS.windows
+          ? "finalAssistant(Raw|Visible)Text"
+          : "posixAgentTurnScript({",
+      );
     }
+    expect(smokeCommon).toContain("finalAssistant(Raw|Visible)Text");
     expect(macos).toContain("modelProviderConfigBatchJson");
     expect(macos).toContain("config set --batch-file");
     expect(linux).toContain("modelProviderConfigBatchJson");
@@ -1632,6 +1630,7 @@ if (commandArgs[0] === "list") {
     expect(npmUpdateScripts).toContain("--thinking off");
     expect(npmUpdateScripts).toContain("finalAssistant(Raw|Visible)Text");
     expect(npmUpdateScripts).toContain("posixAssertAgentOkScript");
+    expect(npmUpdateScripts).toContain("posixAgentTurnScript({");
     expect(npmUpdateScripts).toContain("windowsAgentTurnConfigPatchScript");
     expect(npmUpdateScripts).toContain("modelProviderConfigBatchJson");
     expect(npmUpdateScripts).toContain("config set --batch-file");
@@ -2246,7 +2245,7 @@ if (commandArgs[0] === "list") {
       const startedAt = Date.now();
 
       try {
-        const result = run(process.execPath, ["-e", parentScript], {
+        const result = run(testNodeExecPath, ["-e", parentScript], {
           check: false,
           env: {
             ...process.env,

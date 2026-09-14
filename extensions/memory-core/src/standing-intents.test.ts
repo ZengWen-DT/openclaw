@@ -352,6 +352,65 @@ describe("standing intents", () => {
     ).toHaveLength(1);
   });
 
+  it("rearms a cooled cohort without per-intent writes", async () => {
+    const created: Awaited<ReturnType<typeof createStandingIntent>>[] = [];
+    for (let index = 0; index < 32; index += 1) {
+      created.push(
+        await createStandingIntent({
+          agentId: "main",
+          description: `Review reminder ${index}.`,
+          triggerKeywords: ["cohort review"],
+          cooldownSeconds: 60,
+          maxFires: 3,
+          nowMs: 1_000 + index,
+        }),
+      );
+    }
+    for (let index = 0; index < Math.ceil(created.length / 3); index += 1) {
+      await matchStandingIntents({ agentId: "main", prompt: "cohort review", nowMs: 2_000 });
+    }
+    for (const intent of created) {
+      intent.status = "fired";
+      intent.fireCount = 1;
+      intent.lastFiredAt = 2_000;
+    }
+    expect(await listStandingIntents({ agentId: "main", nowMs: 61_999 })).toEqual(created);
+
+    // Reopen so fixture setup cannot leave cached statements outside the observer.
+    closeOpenClawAgentDatabasesForTest();
+    const db = openOpenClawAgentDatabase({ agentId: "main" }).db;
+    const prepare = db.prepare.bind(db);
+    let writes = 0;
+    const prepareSpy = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+      const statement = prepare(sql);
+      statement.run = new Proxy(statement.run.bind(statement), {
+        apply(run, receiver, args) {
+          writes += 1;
+          return Reflect.apply(run, receiver, args);
+        },
+      });
+      return statement;
+    });
+    try {
+      for (const intent of created) {
+        intent.status = "armed";
+      }
+      expect(await listStandingIntents({ agentId: "main", nowMs: 62_000 })).toEqual(created);
+      expect(writes).toBeLessThanOrEqual(2);
+    } finally {
+      prepareSpy.mockRestore();
+    }
+    const expectedMatches = created.slice(0, 3);
+    for (const intent of expectedMatches) {
+      intent.status = "fired";
+      intent.fireCount = 2;
+      intent.lastFiredAt = 62_001;
+    }
+    expect(
+      await matchStandingIntents({ agentId: "main", prompt: "cohort review", nowMs: 62_001 }),
+    ).toEqual(expectedMatches);
+  });
+
   it("keeps provider, conversation, sender, and account identities namespaced", async () => {
     await createStandingIntent({
       agentId: "main",
@@ -493,13 +552,39 @@ describe("standing intents", () => {
     });
     const prefix = Array.from({ length: 40 }, (_, index) => `word${index}`).join(" ");
 
-    const matches = await matchStandingIntents({
-      agentId: "main",
-      prompt: `${prefix} deployment needle`,
-      nowMs: 1_000,
+    // Reopen so cached statements from setup cannot bypass the execution counter.
+    closeOpenClawAgentDatabasesForTest();
+    const db = openOpenClawAgentDatabase({ agentId: "main" }).db;
+    const prepare = db.prepare.bind(db);
+    let reads = 0;
+    const prepareSpy = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+      const statement = prepare(sql);
+      statement.get = new Proxy(statement.get.bind(statement), {
+        apply(get, receiver, args) {
+          reads += 1;
+          return Reflect.apply(get, receiver, args);
+        },
+      });
+      statement.iterate = new Proxy(statement.iterate.bind(statement), {
+        apply(iterate, receiver, args) {
+          reads += 1;
+          return Reflect.apply(iterate, receiver, args);
+        },
+      });
+      return statement;
     });
+    try {
+      const matches = await matchStandingIntents({
+        agentId: "main",
+        prompt: `${prefix} deployment needle`,
+        nowMs: 1_000,
+      });
 
-    expect(matches.map((intent) => intent.id)).toStrictEqual([active.id]);
+      expect(matches.map((intent) => intent.id)).toStrictEqual([active.id]);
+      expect(reads).toBeLessThanOrEqual(4);
+    } finally {
+      prepareSpy.mockRestore();
+    }
   });
 
   it("does not consume fire budgets for intents that do not fit hidden context", async () => {

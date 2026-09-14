@@ -9,8 +9,6 @@ import { unsafeHTML } from "lit/directives/unsafe-html.js";
 // Control UI view renders the Automations (cron) screen: a full-width list (stats, task table,
 // starter ideas) and a full-page detail view for creating or editing a single automation.
 import { isSystemMonitorDeclaration } from "../../../../src/cron/system-owned-declaration.js";
-import "../../styles/chat/text.css";
-import "../../styles/cron.css";
 import type {
   ChannelUiMetaEntry,
   CronJob,
@@ -24,6 +22,9 @@ import type {
   CronJobsSortBy,
   CronSortDir,
 } from "../../api/types.ts";
+import "../../styles/chat/text.css";
+import "../../styles/cron.css";
+import { renderAgentRowChip } from "../../components/agent-row-chip.ts";
 import { renderChannelPicker, type ChannelPickerOption } from "../../components/channel-picker.ts";
 import { renderCronJobsPagination } from "../../components/cron-jobs-pagination.ts";
 import { icon, icons } from "../../components/icons.ts";
@@ -42,6 +43,7 @@ import {
   renderSettingsToggleRow,
 } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
+import { registerCronEnglish } from "../../i18n/locales/en-cron.ts";
 import {
   isCronJobActiveFailure,
   isCronJobRunning,
@@ -61,6 +63,8 @@ import { resolveScrollBehavior } from "../../lib/scroll-behavior.ts";
 import { renderSegmented } from "./segmented-control.ts";
 import { CRON_SUGGESTIONS, suggestionFormPatch } from "./suggestions.ts";
 import { renderRunsSection, runStatusLabel } from "./view-runs.ts";
+
+registerCronEnglish();
 
 type CronPanelMode = "overview" | "create" | "job";
 
@@ -287,11 +291,9 @@ function renderFieldRow(params: {
   wide?: boolean;
 }) {
   const controlClass = params.wide ? "cron-control cron-control--wide" : "cron-control";
-  const control = params.error
-    ? html`<div class=${controlClass}>
-        ${params.control}${renderFieldError(params.error, params.errorId)}
-      </div>`
-    : html`<div class=${controlClass}>${params.control}</div>`;
+  const control = html`<div class=${controlClass}>
+    ${params.control}${renderFieldError(params.error, params.errorId)}
+  </div>`;
   return html`
     <div class=${params.stacked ? "settings-row settings-row--stacked" : "settings-row"}>
       <label class="settings-row__text" for=${ifDefined(params.controlId || undefined)}>
@@ -843,6 +845,7 @@ function renderJobRow(job: CronJob, props: CronProps) {
             <span class="cron-table__name-text">${displayName}</span>
             ${job.trigger ? renderTriggerIndicator() : nothing}
           </span>
+          ${systemOwned ? nothing : renderAgentRowChip(job.agentId)}
           ${
             description || !job.enabled
               ? html`

@@ -1,5 +1,6 @@
 // Callable value views preserve plugin admission and native data/receiver contracts.
 import { types } from "node:util";
+import { createPluginArgumentView } from "./plugin-instance-argument-views.js";
 import { pluginInstanceState, type PluginInstanceHandle } from "./plugin-instance-scope.js";
 import type { PluginInstanceCallLease, PluginIteratorAdmission } from "./plugin-instance.types.js";
 import { resolvePluginReturnPromise } from "./plugin-return-value.js";
@@ -77,8 +78,6 @@ function isPluginData(value: unknown, seen?: Set<object>): boolean {
   if (seen?.has(value)) {
     return true;
   }
-  const visited = seen ?? new Set<object>();
-  visited.add(value);
   const native = Array.isArray(value)
     ? Array
     : types.isMap(value)
@@ -114,6 +113,13 @@ function isPluginData(value: unknown, seen?: Set<object>): boolean {
       (nested ??= []).push(descriptor.value);
     }
   }
+  if (!nested && native !== Map && native !== Set) {
+    // Repeated leaves in an existing graph still share its completed classification.
+    seen?.add(value);
+    return true;
+  }
+  const visited = seen ?? new Set<object>();
+  visited.add(value);
   if (nested) {
     for (const child of nested) {
       if (!isPluginData(child, visited)) {
@@ -191,175 +197,6 @@ function collectionCallbackIndex(object: object, key: PropertyKey): 0 | null | u
 function bindNativeReceiver<T, R>(invoke: (receiver: T, args: unknown[]) => R) {
   return function (this: T, ...args: unknown[]): R {
     return invoke(this, args);
-  };
-}
-
-/** Restore opaque handles only when they return to the instance that created their view. */
-function restorePluginArgumentViews(
-  args: unknown[],
-  originals: WeakMap<object, object>,
-): unknown[] {
-  const nodes = new Map<object, { parents: Set<object>; descriptors?: PropertyDescriptorMap }>();
-  const replacements = new Map<object, object>();
-  const visit = (value: unknown, parent?: object) => {
-    if (!value || typeof value !== "object") {
-      return;
-    }
-    let node = nodes.get(value);
-    if (!node) {
-      let original = originals.get(value);
-      // Collapse only this instance's object views; callable restoration keeps its separate guard.
-      while (original && typeof original === "object") {
-        const previous = originals.get(original);
-        if (!previous || typeof previous !== "object") {
-          break;
-        }
-        original = previous;
-      }
-      if (!original) {
-        if (types.isProxy(value)) {
-          return;
-        }
-        const prototype = Object.getPrototypeOf(value);
-        if (
-          prototype !== null &&
-          prototype !== Object.prototype &&
-          !(Array.isArray(value) && prototype === Array.prototype)
-        ) {
-          return;
-        }
-      }
-      const descriptors: PropertyDescriptorMap | undefined = original
-        ? undefined
-        : Object.getOwnPropertyDescriptors(value);
-      // Caller methods and accessors can depend on this exact object's identity.
-      // Keep their containers opaque instead of cloning them to restore a nested handle.
-      if (
-        descriptors &&
-        Reflect.ownKeys(descriptors).some((key) => {
-          const descriptor = descriptors[key]!;
-          return !("value" in descriptor) || typeof descriptor.value === "function";
-        })
-      ) {
-        return;
-      }
-      node = { parents: new Set(), descriptors };
-      nodes.set(value, node);
-      if (original) {
-        replacements.set(value, original);
-      } else {
-        for (const key of Reflect.ownKeys(descriptors!)) {
-          visit(descriptors![key]!.value, value);
-        }
-      }
-    }
-    if (parent) {
-      node.parents.add(parent);
-    }
-  };
-  args.forEach((value) => visit(value));
-  // Copy only changed ancestors; visiting all parents also preserves cycles and shared children.
-  for (const value of replacements.keys()) {
-    for (const parent of nodes.get(value)!.parents) {
-      if (!replacements.has(parent)) {
-        replacements.set(
-          parent,
-          Array.isArray(parent) ? [] : Object.create(Object.getPrototypeOf(parent)),
-        );
-      }
-    }
-  }
-  for (const [value, replacement] of replacements) {
-    const descriptors = nodes.get(value)!.descriptors;
-    if (descriptors) {
-      for (const key of Reflect.ownKeys(descriptors)) {
-        const descriptor = descriptors[key]!;
-        descriptor.value = replacements.get(descriptor.value) ?? descriptor.value;
-      }
-      Object.defineProperties(replacement, descriptors);
-    }
-  }
-  return args.map((value) =>
-    value && typeof value === "object" ? (replacements.get(value) ?? value) : value,
-  );
-}
-
-/** Preserves caller data and caches callback views within one instance. */
-function createPluginArgumentView(bindings: {
-  originalValues: WeakMap<object, object>;
-  wrapped: WeakMap<object, unknown>;
-  wrap: <T>(value: T) => T;
-  invoke: <T>(run: () => T) => T;
-}) {
-  const callbacks = new WeakMap<Function, Function>();
-  return (
-    args: unknown[],
-    callbackIndex?: 0 | null,
-    field = "",
-  ): {
-    args: unknown[];
-    callerData?: unknown[];
-  } => {
-    if (callbackIndex === null) {
-      return {
-        args: args.map((value) =>
-          value && (typeof value === "object" || typeof value === "function")
-            ? (bindings.originalValues.get(value) ?? value)
-            : value,
-        ),
-      };
-    }
-    const callerData =
-      callbackIndex === 0 && (field === "reduce" || field === "reduceRight")
-        ? args.slice(1, 2)
-        : undefined;
-    const callArgs =
-      callbackIndex === undefined
-        ? restorePluginArgumentViews(args, bindings.originalValues)
-        : args;
-    const prepared = callArgs.map((value, index) => {
-      if (typeof value !== "function" || (callbackIndex !== undefined && index !== callbackIndex)) {
-        return value;
-      }
-      // Returned handles regain identity only in their own instance. One hop preserves
-      // the guarded callback when the plugin returned an incoming caller callback.
-      if (callbackIndex === undefined && bindings.wrapped.get(value) === value) {
-        return bindings.originalValues.get(value) ?? value;
-      }
-      let callback = callerData ? undefined : callbacks.get(value);
-      if (!callback) {
-        const invoke = <R>(values: unknown[], run: (values: unknown[]) => R): R =>
-          bindings.invoke(() =>
-            run(
-              values.map((entry, position) =>
-                position === 0 && callerData?.includes(entry) ? entry : bindings.wrap(entry),
-              ),
-            ),
-          );
-        // Caller objects and receivers stay native; only values delivered back through callbacks are owned.
-        callback = new Proxy(value, {
-          apply: (target, receiver, values) => {
-            const result = invoke(values, (wrapped) => Reflect.apply(target, receiver, wrapped));
-            // Native reducers deliver this exact caller value as the next and final accumulator.
-            if (callerData) {
-              callerData[0] = result;
-            }
-            return result;
-          },
-          construct: (target, values, newTarget) =>
-            invoke(values, (wrapped) =>
-              Reflect.construct(target, wrapped, newTarget === callback ? target : newTarget),
-            ),
-        });
-        bindings.originalValues.set(callback, value);
-        if (!callerData) {
-          callbacks.set(value, callback);
-          callbacks.set(callback, callback);
-        }
-      }
-      return callback;
-    });
-    return { args: prepared, callerData };
   };
 }
 

@@ -1,5 +1,7 @@
+import path from "node:path";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import { formatConfigIssueLines } from "../../config/issue-format.js";
+import { createLowDiskSpaceWarning } from "../../infra/disk-space.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import {
   channelToNpmTag,
@@ -22,6 +24,8 @@ import {
   resolveNpmLifecyclePolicyGate,
   type ResolvedGlobalInstallTarget,
 } from "../../infra/update-global.js";
+import { recordUpdateRunStep } from "../../infra/update-run-ledger.js";
+import { updateRunStepsFromResultStep } from "../../infra/update-run-step.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
 import { defaultRuntime } from "../../runtime.js";
 import type { OpenClawSchemaVersions } from "../../state/openclaw-schema-versions.js";
@@ -41,7 +45,7 @@ import {
   captureUpdateCommandExecutorAuthority,
   type UpdateCommandExecutor,
 } from "./update-command-executor.js";
-import { UnreportedUpdateAdmissionOutcome } from "./update-command-result.js";
+import { UnreportedUpdateAdmissionOutcome, type RefuseUpdate } from "./update-command-result.js";
 import {
   failUpdateCommandRun,
   assertUpdatePackageActivationAdmission,
@@ -74,12 +78,13 @@ export async function resolveUpdateCommandTarget(
   let { devTarget } = prepared;
   let root = discoveredRoot;
   let updateInstallKind = installKind;
-  const refuseUpdate = async (reason: string, message?: string) => {
+  const refuseUpdate: RefuseUpdate = async (reason, message, failureFacts) => {
     const report = {
       root,
       installKind: updateInstallKind,
       reason,
       message,
+      failureFacts,
       opts,
       controlPlaneUpdateSentinelMeta,
     };
@@ -238,6 +243,29 @@ export async function resolveUpdateCommandTarget(
           managedServiceRootRedirect !== null || managedServiceNodeRunner !== undefined,
         packageName: installedPackageName,
       });
+      const diskWarning = createLowDiskSpaceWarning({
+        targetPath: packageInstallTarget.packageRoot
+          ? path.dirname(packageInstallTarget.packageRoot)
+          : root,
+        purpose: "global package update",
+      });
+      if (diskWarning) {
+        if (opts.json) {
+          defaultRuntime.error(`Warning: ${diskWarning}`);
+        } else {
+          defaultRuntime.log(theme.warn(diskWarning));
+        }
+        if (opts.run) {
+          opts.run.executorFence?.assertCurrent();
+          for (const step of updateRunStepsFromResultStep({
+            name: "disk-space-preflight",
+            exitCode: 0,
+            warnings: [diskWarning],
+          })) {
+            recordUpdateRunStep(opts.run.runId, step, { env: opts.run.env });
+          }
+        }
+      }
       const npmLifecycleGate = resolveNpmLifecyclePolicyGate(packageInstallTarget);
       if (npmLifecycleGate.error) {
         await refuseUpdate("npm lifecycle policy preflight", npmLifecycleGate.error);

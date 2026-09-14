@@ -28,6 +28,7 @@ import {
   loadSessionEntry,
   loadExactSessionEntry,
   loadTranscriptEventsSync,
+  listSessionPendingInputs,
   patchSessionEntryCore,
   replaceTranscriptEvents,
   replaceSessionEntry,
@@ -43,6 +44,8 @@ import { rotateAgentEventLifecycleGeneration } from "../infra/agent-events.js";
 import { onDiagnosticEvent, type DiagnosticPayloadLargeEvent } from "../infra/diagnostic-events.js";
 import { flushDiagnosticsTimeline } from "../infra/diagnostics-timeline.js";
 import { ExecApprovalsMigrationRequiredError } from "../infra/exec-approvals-migration-gate.js";
+import { readPersistedMediaFacts } from "../media/media-facts.js";
+import { resolveMediaReferenceLocalPath } from "../media/media-reference.js";
 import { getMediaDir } from "../media/store.js";
 import { withPluginMetadataSnapshotScope } from "../plugins/current-plugin-metadata-snapshot.js";
 import { resolveInstalledPluginIndexPolicyHash } from "../plugins/installed-plugin-index-policy.js";
@@ -59,7 +62,6 @@ import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
-import * as chatDisplayProjection from "./chat-display-projection.js";
 import { assertPluginMetadataSnapshotConsistency } from "./plugin-metadata.test-helpers.js";
 import {
   createDirectChatContext,
@@ -958,6 +960,7 @@ describe("gateway server chat", () => {
       const handler = createAgentEventHandler({
         broadcast: context.broadcast,
         broadcastToConnIds: context.broadcastToConnIds,
+        nodeHasSessionSubscribers: () => false,
         nodeSendToSession: context.nodeSendToSession,
         agentRunSeq: context.agentRunSeq,
         chatRunState: context.chatRunState,
@@ -1200,6 +1203,7 @@ describe("gateway server chat", () => {
       const handler = createAgentEventHandler({
         broadcast: context.broadcast,
         broadcastToConnIds: context.broadcastToConnIds,
+        nodeHasSessionSubscribers: () => false,
         nodeSendToSession: context.nodeSendToSession,
         agentRunSeq: context.agentRunSeq,
         chatRunState: context.chatRunState,
@@ -1224,6 +1228,7 @@ describe("gateway server chat", () => {
           sessionKey: "main",
           clientRunId: "run-active",
         });
+        const toolArgs = { path: "a" };
 
         handler({
           runId: "provider-run",
@@ -1237,7 +1242,7 @@ describe("gateway server chat", () => {
           seq: 2,
           stream: "tool",
           ts: 1_002,
-          data: { phase: "start", name: "read", toolCallId: "tool-active", args: { path: "a" } },
+          data: { phase: "start", name: "read", toolCallId: "tool-active", args: toolArgs },
         });
         handler({
           runId: "provider-run",
@@ -1291,6 +1296,7 @@ describe("gateway server chat", () => {
           },
         });
 
+        toolArgs.path = "producer changed after emission";
         const responses: Array<{ ok: boolean; payload?: unknown }> = [];
         await callDirectChat(method, {
           id: method,
@@ -2967,7 +2973,11 @@ describe("gateway server chat", () => {
         }),
         client: {
           connId: "conn-owner",
-          connect: { device: { id: "dev-owner" }, scopes: ["operator.write"] },
+          connect: {
+            ...makeGatewayWebchatClient(),
+            device: { id: "dev-owner" },
+            scopes: ["operator.write"],
+          },
         } as never,
         respond: ((ok, payload, error) => {
           responses.push({ ok, payload, error });
@@ -2984,16 +2994,15 @@ describe("gateway server chat", () => {
     }
   });
 
-  test("chat.send discards prepared inbound media when setup throws before the ACK", async () => {
-    openDirectChatSession();
+  test("chat.send retains durably admitted media when later setup throws before the ACK", async () => {
+    const { storePath } = openDirectChatSession();
     try {
       await writeStoredMainSession({
         modelProvider: "test-provider",
         model: "vision-model",
       });
       const context = createDirectChatContext({
-        // Throwing from addChatRun exercises handleChatSendSetupError — one of
-        // the pre-persistence exits that previously leaked staged media.
+        // addChatRun runs after durable input admission but before the ACK.
         addChatRun: vi.fn(() => {
           throw new Error("setup exploded before ack");
         }),
@@ -3009,8 +3018,6 @@ describe("gateway server chat", () => {
           idempotencyKey: "idem-setup-error-media",
           attachments: [
             {
-              // Non-image attachments always offload into the inbound media
-              // store during preparation; the failed send must discard them.
               type: "file",
               mimeType: "text/plain",
               fileName: "notes.txt",
@@ -3020,7 +3027,16 @@ describe("gateway server chat", () => {
         }),
         client: {
           connId: "conn-owner",
-          connect: { device: { id: "dev-owner" }, scopes: ["operator.write"] },
+          connect: {
+            client: {
+              id: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+              mode: GATEWAY_CLIENT_MODES.BACKEND,
+              version: "1.0.0",
+              platform: "node",
+            },
+            device: { id: "dev-owner" },
+            scopes: ["operator.write"],
+          },
         } as never,
         respond: ((ok, payload, error) => {
           responses.push({ ok, payload, error });
@@ -3034,13 +3050,28 @@ describe("gateway server chat", () => {
           error: expect.anything(),
         },
       ]);
-      // Prepared inbound media has no transcript reference on this exit; the
-      // admission cleanup owner must discard it or the file is orphaned
-      // forever (the inbound sweep is off unless attachments.ttlHours is set).
-      await waitForFast(async () => {
-        const remaining = await fs.readdir(inboundDir).catch(() => []);
-        expect(remaining.filter((name) => !inboundBaseline.has(name))).toEqual([]);
-      }, FAST_WAIT_OPTS);
+      const pending = listSessionPendingInputs({
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        sessionId: "sess-main",
+        storePath,
+      });
+      expect(pending).toMatchObject({
+        total: 1,
+        items: [{ state: "interrupted", runId: "idem-setup-error-media" }],
+      });
+      const media = readPersistedMediaFacts(
+        expectDefined(pending.items[0]?.message, "Expected the retained pending input"),
+      );
+      expect(media).toHaveLength(1);
+      const retainedUrl = expectDefined(media?.[0]?.url, "Expected the pending attachment URL");
+      expect(retainedUrl).toMatch(/^media:\/\/inbound\//);
+      const retainedPath = await resolveMediaReferenceLocalPath(retainedUrl);
+      await expect(fs.readFile(retainedPath, "utf8")).resolves.toBe("offloaded inbound media");
+      const remaining = await fs.readdir(inboundDir);
+      expect(remaining.filter((name) => !inboundBaseline.has(name))).toEqual([
+        path.basename(retainedPath),
+      ]);
     } finally {
       resetDirectChatSession();
     }
@@ -7667,7 +7698,7 @@ describe("gateway server chat", () => {
     });
   });
 
-  test("chat.history fills sparse pages without repeatedly projecting scanned transcript rows", async () => {
+  test("chat.history fills sparse pages with correct visible pagination", async () => {
     await withGatewayChatHarness(async ({ ws, createSessionDir }) => {
       await prepareMainHistoryHarness({ ws, createSessionDir });
       const startedAt = Date.now();
@@ -7680,31 +7711,16 @@ describe("gateway server chat", () => {
       );
       await writeMainSessionTranscript(events);
 
-      let projectedRows = 0;
-      const project = chatDisplayProjection.projectChatDisplayMessagesWithState;
-      const projectionSpy = vi
-        .spyOn(chatDisplayProjection, "projectChatDisplayMessagesWithState")
-        .mockImplementation((messages, options) => {
-          projectedRows += messages.length;
-          return project(messages, options);
-        });
-
-      try {
-        const page = await rpcReq<{
-          messages?: Array<{ __openclaw?: { seq?: number } }>;
-          nextOffset?: number;
-          hasMore?: boolean;
-        }>(ws, "chat.history", makeMainSessionParams({ limit: 25, offset: 0 }));
-        expect(page.ok).toBe(true);
-        expect(page.payload?.messages?.map(readOpenClawSeq)).toEqual(
-          Array.from({ length: 25 }, (_, index) => (index + 5) * 50 + 1),
-        );
-        expect(page.payload).toMatchObject({ hasMore: true, nextOffset: 1_250 });
-        expect(projectedRows).toBeGreaterThan(0);
-        expect(projectedRows).toBeLessThanOrEqual(events.length * 2);
-      } finally {
-        projectionSpy.mockRestore();
-      }
+      const page = await rpcReq<{
+        messages?: Array<{ __openclaw?: { seq?: number } }>;
+        nextOffset?: number;
+        hasMore?: boolean;
+      }>(ws, "chat.history", makeMainSessionParams({ limit: 25, offset: 0 }));
+      expect(page.ok).toBe(true);
+      expect(page.payload?.messages?.map(readOpenClawSeq)).toEqual(
+        Array.from({ length: 25 }, (_, index) => (index + 5) * 50 + 1),
+      );
+      expect(page.payload).toMatchObject({ hasMore: true, nextOffset: 1_250 });
     });
   });
 

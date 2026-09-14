@@ -14,6 +14,125 @@ function prepareDiagnosticReport(reason: string) {
 }
 
 describe("update report diagnostic command boundary", () => {
+  it.each([true, false])("uses only matching finalization facts (matches=%s)", async (matches) => {
+    const message =
+      "Doctor could not enter maintenance. Error: The update parent owns Gateway activation.";
+    const report = await prepareUpdateFailureReport(
+      {
+        attemptId: "finalization-report",
+        result: { status: "error", mode: "unknown", steps: [], durationMs: 1 },
+        recordedRun: {
+          runId: matches ? "finalization-report" : "another-run",
+          reason: "doctor-failed",
+          target: { kind: "package" },
+          steps: [
+            {
+              step: "finalize:doctor",
+              status: "failed",
+              detail: `${message} private-customer-text\nprivate second line`,
+            },
+            { step: "finalize:package-rollback-not-needed", status: "skipped" },
+          ],
+        },
+      },
+      context,
+    );
+    expect(report.body).toContain(`Reason code: ${matches ? "doctor-failed" : "unknown"}`);
+    expect(report.body).toContain(`Update mode: ${matches ? "package" : "unknown"}`);
+    expect(report.body.includes(message)).toBe(matches);
+    expect(report.body.includes("package rollback not needed: no package mutation")).toBe(matches);
+    expect(report.body).not.toContain("private-customer-text");
+    expect(report.body).not.toContain("private second line");
+  });
+
+  it.each(
+    (["check", "code", "pluginId", "affectedKey"] as const).flatMap((field) =>
+      [
+        "private-host.example",
+        "private-host.example:8123",
+        "10.20.30.40",
+        "mcp.servers.private-host.example",
+      ].map((host) => ({
+        field,
+        host,
+      })),
+    ),
+  )("does not publish endpoint $host supplied as $field", async ({ field, host }) => {
+    const report = await prepareUpdateFailureReport(
+      {
+        attemptId: "poisoned-identifier",
+        result: {
+          status: "error",
+          mode: "npm",
+          durationMs: 0,
+          steps: [
+            {
+              name: "verify",
+              command: "",
+              cwd: "",
+              durationMs: 0,
+              exitCode: 1,
+              failureFacts: [{ check: "readyz", code: "readyz-unhealthy", [field]: host }],
+            },
+          ],
+        },
+      },
+      context,
+    );
+    expect(report.body).not.toContain(host);
+    expect(report.body).toContain("Failing check");
+  });
+  it.each([
+    'Permission denied at "/Users/Example Person/private documents/secret.json"',
+    "Permission denied at /home/example/private file.json",
+    'Permission denied at "C:\\Users\\Example Person\\private\\secret.json"',
+    "Permission denied at ~/private/secret.json",
+    "Permission denied at \u001b[31m/Users/example/private/secret.json\u001b[0m",
+    "Permission denied at file:///Users/example/private/secret.json",
+  ])("keeps a failing check while removing private paths: %s", async (message) => {
+    const report = await prepareUpdateFailureReport(
+      {
+        attemptId: "failure-fact-redaction",
+        result: {
+          mode: "npm",
+          status: "error",
+          reason: "doctor-failed",
+          durationMs: 1,
+          steps: [
+            {
+              name: "doctor",
+              command: "",
+              cwd: "",
+              durationMs: 1,
+              exitCode: 1,
+              failureFacts: [
+                {
+                  check: "core/doctor/gateway-config",
+                  code: "EACCES",
+                  affectedKey: "mcp.servers",
+                  message: `token=synthetic-token-value ${message}\nprivate second line`,
+                },
+              ],
+            },
+          ],
+        },
+      },
+      context,
+    );
+    expect(report.body).toContain("Failing check core/doctor/gateway-config (EACCES)");
+    expect(report.body).toContain("Permission denied");
+    expect(report.body).toContain("mcp.servers");
+    for (const secret of [
+      "synthetic-token-value",
+      "Example Person",
+      "example/",
+      "secret.json",
+      "private second line",
+      "private file",
+    ]) {
+      expect(report.body).not.toContain(secret);
+    }
+  });
   it("does not imply rollback when candidate repair stops before activation", async () => {
     const report = await prepareUpdateFailureReport(
       {
@@ -233,6 +352,7 @@ describe("update report diagnostic command boundary", () => {
           durationMs: 1,
         },
         recordedRun: {
+          runId: "durable-failure-history",
           steps: [
             { step: "custom-tool private-customer-text", status: "failed" },
             { step: "activating", status: "failed" },
@@ -277,6 +397,7 @@ describe("update report diagnostic command boundary", () => {
             durationMs: 1,
           },
           recordedRun: {
+            runId: "measured-failure-history",
             steps: [...earlierFailures, "verifying"].map((step) => ({ step, status: "failed" })),
           },
         },

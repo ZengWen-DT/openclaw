@@ -1,10 +1,15 @@
 import { STREAM_ERROR_FALLBACK_TEXT } from "@openclaw/ai/internal/shared";
 import { GATEWAY_ASSISTANT_ERROR_FALLBACK_TEXT } from "@openclaw/gateway-protocol/gateway-error-details";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
-import { normalizeLowercaseStringOrEmpty as normalizeErrorSignal } from "@openclaw/normalization-core/string-coerce";
-import { renderAssistantRequestFailureCopy } from "../agents/failover/assistant-request-failure-copy.js";
-import { isContextOverflowError } from "../agents/failover/classify.js";
-import { renderAssistantFormatFailureCopy } from "../agents/failover/user-copy.js";
+import {
+  normalizeLowercaseStringOrEmpty as normalizeErrorSignal,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import {
+  renderAssistantFormatFailureCopy,
+  renderAssistantRequestFailureCopy,
+} from "../agents/failover/assistant-request-failure-copy.js";
+import { isContextOverflowErrorFromTables } from "../agents/failover/context-overflow-tables.js";
 import { readTranscriptSenderIdentity } from "../chat/sender-identity.js";
 import { classifyGatewayStorageFailure } from "../infra/sqlite-error-diagnostics.js";
 import {
@@ -29,7 +34,7 @@ import {
   projectSessionsSendInterSessionMessages,
   toProjectedMessages,
 } from "./chat-display-projection.history.js";
-import { mirrorMessageToolVisibleReplies } from "./chat-display-projection.message-tool.js";
+import { createMessageToolVisibleReplyProjection } from "./chat-display-projection.message-tool.js";
 import {
   sanitizeChatHistoryContentBlock,
   sanitizeChatHistoryMessage,
@@ -117,6 +122,7 @@ type ChatDisplayProjectionResult = {
   turnBoundaryPending: boolean;
   assistantErrorPending: boolean;
   assistantErrorRecoveryObserved: boolean;
+  commentaryFallbacksObserved?: true;
 };
 
 const GATEWAY_ASSISTANT_CONTEXT_OVERFLOW_FALLBACK_TEXT =
@@ -127,8 +133,7 @@ function isContextOverflowErrorSignal(value: unknown): boolean {
     return false;
   }
   return (
-    normalizeErrorSignal(value) === "context_overflow" ||
-    isContextOverflowError(value, { providerPlugin: null })
+    normalizeErrorSignal(value) === "context_overflow" || isContextOverflowErrorFromTables(value)
   );
 }
 
@@ -324,66 +329,65 @@ export function isPendingAssistantError(value: unknown): boolean {
   );
 }
 
-function projectRecoveredAssistantErrors(
-  messages: Array<Record<string, unknown>>,
-  initialPending = false,
-): {
-  messages: Array<Record<string, unknown>>;
-  pending: boolean;
-  recoveryObserved: boolean;
-} {
+function createRecoveredAssistantErrorProjection(initialPending = false) {
+  const messages: Array<Record<string, unknown>> = [];
   let unseenPending = initialPending;
   let recoveryObserved = false;
   let pendingIndexes: number[] = [];
   const repairedIndexes = new Set<number>();
-  for (let index = 0; index < messages.length; index++) {
-    const message = messages[index];
-    if (!message) {
-      continue;
-    }
-    if (message.role === "user") {
-      unseenPending = false;
-      pendingIndexes = [];
-      continue;
-    }
-    if (isPendingAssistantError(message)) {
-      pendingIndexes.push(index);
-      continue;
-    }
-    if (
-      (!unseenPending && pendingIndexes.length === 0) ||
-      !hasVisibleAssistantDisplayContent(message)
-    ) {
-      continue;
-    }
-    // An incremental reader carries only a pending bit. It must reload raw
-    // history before deciding which previously emitted failures were recovered.
-    recoveryObserved ||= unseenPending;
-    unseenPending = false;
-    const completedRunId =
-      (message.stopReason === "stop" || message.stopReason === "length") &&
-      !isTranscriptOnlyOpenClawAssistantMessage(message)
-        ? readSessionTranscriptRunId(message)
-        : undefined;
-    pendingIndexes = pendingIndexes.filter((pendingIndex) => {
-      const failedRunId = readSessionTranscriptRunId(messages[pendingIndex]);
-      // Unattributed legacy stream sentinels retain their existing turn-local
-      // repair. Runtime attempt failures require completion of the exact run.
-      if (failedRunId && failedRunId !== completedRunId) {
-        return true;
-      }
-      repairedIndexes.add(pendingIndex);
-      recoveryObserved = true;
-      return false;
-    });
-  }
   return {
-    messages:
-      repairedIndexes.size > 0
-        ? messages.filter((_, index) => !repairedIndexes.has(index))
-        : messages,
-    pending: unseenPending || pendingIndexes.length > 0,
-    recoveryObserved,
+    append(message: Record<string, unknown>) {
+      const index = messages.length;
+      messages.push(message);
+      if (message.role === "user") {
+        unseenPending = false;
+        pendingIndexes = [];
+        return;
+      }
+      if (isPendingAssistantError(message)) {
+        pendingIndexes.push(index);
+        return;
+      }
+      if (
+        (!unseenPending && pendingIndexes.length === 0) ||
+        !hasVisibleAssistantDisplayContent(message)
+      ) {
+        return;
+      }
+      // An incremental reader carries only a pending bit. It must reload raw
+      // history before deciding which previously emitted failures were recovered.
+      recoveryObserved ||= unseenPending;
+      unseenPending = false;
+      const completedRunId =
+        (message.stopReason === "stop" || message.stopReason === "length") &&
+        !isTranscriptOnlyOpenClawAssistantMessage(message)
+          ? readSessionTranscriptRunId(message)
+          : undefined;
+      pendingIndexes = pendingIndexes.filter((pendingIndex) => {
+        const failedRunId = readSessionTranscriptRunId(messages[pendingIndex]);
+        // Unattributed legacy stream sentinels retain their existing turn-local
+        // repair. Runtime attempt failures require completion of the exact run.
+        if (failedRunId && failedRunId !== completedRunId) {
+          return true;
+        }
+        repairedIndexes.add(pendingIndex);
+        recoveryObserved = true;
+        return false;
+      });
+    },
+    get pending() {
+      return unseenPending || pendingIndexes.length > 0;
+    },
+    result() {
+      return {
+        messages:
+          repairedIndexes.size > 0
+            ? messages.filter((_, index) => !repairedIndexes.has(index))
+            : messages.slice(),
+        pending: unseenPending || pendingIndexes.length > 0,
+        recoveryObserved,
+      };
+    },
   };
 }
 
@@ -424,11 +428,24 @@ function projectEmptyAssistantErrorMessages(
   return changed ? projected : messages;
 }
 
-export function projectChatDisplayMessagesWithState(
+type ChatHistoryRecoveryOptions = Pick<
+  ChatDisplayProjectionOptions,
+  "maxChars" | "stripEnvelope" | "assistantErrorPending"
+>;
+
+function prepareChatHistoryRecoveryMessages(
   messages: unknown[],
-  options?: ChatDisplayProjectionOptions,
-): ChatDisplayProjectionResult {
-  const projectedActivity = messages.map((message) => {
+  options?: ChatHistoryRecoveryOptions,
+) {
+  const projectedMessages = messages.map((message) => {
+    const entry = asOptionalRecord(message);
+    if (entry?.role === "custom" && entry.customType === "run-failed-before-reply") {
+      const runId = normalizeOptionalString(asOptionalRecord(entry.details)?.runId);
+      if (runId) {
+        // Retain failure correlation before sanitation removes private report details.
+        return { ...entry, __openclaw: { ...asOptionalRecord(entry["__openclaw"]), runId } };
+      }
+    }
     const activity = readNestedToolActivity(message);
     if (!activity) {
       return message;
@@ -452,29 +469,69 @@ export function projectChatDisplayMessagesWithState(
   });
   const source =
     options?.stripEnvelope === false
-      ? projectedActivity
-      : stripEnvelopeFromMessages(projectedActivity);
-  const mirrored = mirrorMessageToolVisibleReplies(source);
-  const recoveredErrors = projectRecoveredAssistantErrors(
-    toProjectedMessages(mirrored),
-    options?.assistantErrorPending,
-  );
+      ? projectedMessages
+      : stripEnvelopeFromMessages(projectedMessages);
+  return source;
+}
+
+export function createChatHistoryRecoveryProjection(options?: ChatHistoryRecoveryOptions) {
+  const mirror = createMessageToolVisibleReplyProjection();
+  let recovery = createRecoveredAssistantErrorProjection(options?.assistantErrorPending);
+  let processedMessages = 0;
+  return {
+    append(messages: unknown[]) {
+      const mirrored = mirror.append(prepareChatHistoryRecoveryMessages(messages, options));
+      if (mirrored.replacedFrom !== undefined && mirrored.replacedFrom < processedMessages) {
+        // A late tool result can hide an earlier delivery mirror and undo a repair.
+        // Replay the same recovery owner over retained derived rows in that case.
+        recovery = createRecoveredAssistantErrorProjection(options?.assistantErrorPending);
+        processedMessages = 0;
+      }
+      for (const message of toProjectedMessages(mirrored.messages.slice(processedMessages))) {
+        recovery.append(message);
+      }
+      processedMessages = mirrored.messages.length;
+    },
+    get pending() {
+      return recovery.pending;
+    },
+    result() {
+      return recovery.result();
+    },
+  };
+}
+
+function projectChatHistoryRecovery(messages: unknown[], options?: ChatHistoryRecoveryOptions) {
+  const projection = createChatHistoryRecoveryProjection(options);
+  projection.append(messages);
+  return projection.result();
+}
+
+export function projectChatDisplayMessagesWithState(
+  messages: unknown[],
+  options?: ChatDisplayProjectionOptions,
+): ChatDisplayProjectionResult {
+  const recoveredErrors = projectChatHistoryRecovery(messages, options);
   const projectedErrors = projectEmptyAssistantErrorMessages(recoveredErrors.messages);
+  const sanitizedMessages = toProjectedMessages(
+    sanitizeChatHistoryMessages(projectedErrors, Number.MAX_SAFE_INTEGER, {
+      includeCommentaryFallbacks: options?.includeCommentaryFallbacks,
+    }),
+  );
+  const commentaryFallbacksObserved =
+    options?.includeCommentaryFallbacks === true &&
+    sanitizedMessages.some(
+      (message) => asOptionalRecord(message.openclawStreamFallback)?.source === "segment",
+    );
   const filtered = filterVisibleProjectedHistoryMessages(
-    projectSessionsSendInterSessionMessages(
-      toProjectedMessages(
-        sanitizeChatHistoryMessages(projectedErrors, Number.MAX_SAFE_INTEGER, {
-          includeCommentaryFallbacks: options?.includeCommentaryFallbacks,
-        }),
-      ),
-    ),
+    projectSessionsSendInterSessionMessages(sanitizedMessages),
     options?.turnBoundaryPending,
   );
   const displayMessages = sanitizeChatHistoryMessages(
     mergeTtsSupplementMessages(filtered.messages),
     options?.maxChars ?? DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS,
   ) as Array<Record<string, unknown>>;
-  return {
+  const result: ChatDisplayProjectionResult = {
     messages: projectCurrentUserProfileAvatars(
       displayMessages,
       options?.resolveCurrentUserProfileDisplay,
@@ -483,6 +540,10 @@ export function projectChatDisplayMessagesWithState(
     assistantErrorPending: recoveredErrors.pending,
     assistantErrorRecoveryObserved: recoveredErrors.recoveryObserved,
   };
+  if (commentaryFallbacksObserved) {
+    result.commentaryFallbacksObserved = true;
+  }
+  return result;
 }
 
 export function projectChatDisplayMessages(

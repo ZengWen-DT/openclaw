@@ -8,6 +8,8 @@ import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import * as sqlite from "../../infra/node-sqlite.js";
 import * as integrity from "../../infra/sqlite-integrity-worker.js";
 import * as logging from "../../logging/logger.js";
+import { closeCachedOpenClawAgentDatabase } from "../../state/openclaw-agent-db-lifecycle.js";
+import { invalidateOpenClawAgentDatabaseValidation } from "../../state/openclaw-agent-db-validation-cache.js";
 import {
   closeOpenClawAgentDatabaseByPath,
   closeOpenClawAgentDatabasesAsync,
@@ -90,6 +92,7 @@ function fixture() {
     env: { OPENCLAW_STATE_DIR: root },
   };
   closeOpenClawAgentDatabaseByPath(database.path);
+  invalidateOpenClawAgentDatabaseValidation(database.path);
   return { scope, databaseOptions };
 }
 
@@ -346,7 +349,10 @@ it("keeps historical preparation asynchronous after materialization evicts its p
   const admission = observeColdAdmission(f.databaseOptions.path);
   archiveHook.afterMaterialize = () => {
     archiveHook.afterMaterialize = undefined;
-    closeOpenClawAgentDatabaseByPath(f.databaseOptions.path);
+    closeCachedOpenClawAgentDatabase(openOpenClawAgentDatabase(f.databaseOptions), {
+      eviction: true,
+    });
+    invalidateOpenClawAgentDatabaseValidation(f.databaseOptions.path);
   };
   const work = own(
     deleteSessionEntryLifecycle({

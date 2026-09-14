@@ -31,10 +31,14 @@ type DesktopProofPhase = Exclude<
   ReturnType<typeof desktopProofTestReport>["files"][number]["assertions"][number]["phase"],
   "unknown"
 >;
+type DesktopViewerResizeFailure = NonNullable<
+  ReturnType<typeof desktopProofTestReport>["files"][number]["assertions"][number]["viewerResize"]
+>;
 
 declare module "vitest" {
   interface TaskMeta {
     desktopProofPhase?: DesktopProofPhase;
+    desktopViewerResizeFailure?: DesktopViewerResizeFailure;
   }
 }
 
@@ -126,17 +130,42 @@ async function captureDesktopSockets(page: Page) {
     );
     const NativeSocket = window.WebSocket;
     const sockets: WebSocket[] = [];
-    Object.assign(window, { desktopProofSockets: sockets });
+    const closes: NonNullable<DesktopViewerResizeFailure["socketCloses"]> = [];
+    Object.assign(window, { desktopProofSockets: sockets, desktopProofSocketCloses: closes });
     // noVNC checks the immediate raw-channel prototype. Observe construction
     // without subclassing or changing the native socket/prototype it receives.
     window.WebSocket = new Proxy(NativeSocket, {
       construct(target, args) {
         const socket = Reflect.construct(target, args) as WebSocket;
         if (new URL(socket.url).pathname === "/desktop/observe") {
+          const socketIndex = sockets.length;
           sockets.push(socket);
-          socket.addEventListener("close", (event) =>
-            console.info("Desktop proof socket closed", event.code, event.reason),
-          );
+          socket.addEventListener("close", (event) => {
+            // Classify the bridge/registry's fixed reasons before retaining anything:
+            // a takeover reason can include the operator's name after the colon.
+            const category =
+              event.reason === "control-taken" || event.reason.startsWith("control-taken:")
+                ? "takeover"
+                : event.reason === "authority_revoked"
+                  ? "authority-revoked"
+                  : event.reason === "desktop stream closed"
+                    ? "stream-close"
+                    : [
+                          "desktop authentication failed",
+                          "desktop authentication timed out",
+                          "desktop ARD authentication failed",
+                          "desktop VNC authentication failed",
+                        ].includes(event.reason)
+                      ? "authentication"
+                      : event.reason
+                        ? "other"
+                        : "unknown";
+            // wasClean describes the native WebSocket close handshake, not noVNC's RFB state.
+            closes.push({ socketIndex, code: event.code, wasClean: event.wasClean, category });
+            if (closes.length > 8) {
+              closes.shift();
+            }
+          });
           socket.addEventListener("error", () => console.error("Desktop proof socket error"));
         }
         return socket;
@@ -558,7 +587,7 @@ suite.define(() => {
             await verifyMatch(stage, observerCanvas);
             expect(
               await observerPanel.locator(".desktop-touch-action, .desktop-sizing").count(),
-            ).toBe(4);
+            ).toBe(5);
           }
           const colorCount = await observerCanvas.evaluate((element) => {
             const surface = element as HTMLCanvasElement;
@@ -589,7 +618,70 @@ suite.define(() => {
           await expect
             .poll(() => guest!.run(["cat", "/tmp/openclaw-desktop-resize-input"]))
             .toBe("controller");
-          await expect.poll(() => framebuffer(canvas)).toEqual(await guest.geometry());
+          const viewerExpected = await guest.geometry();
+          let lastFramebuffer: Awaited<ReturnType<typeof framebuffer>> | null = null;
+          try {
+            await expect
+              .poll(async () => {
+                const current = await framebuffer(canvas);
+                lastFramebuffer = current;
+                return current;
+              })
+              .toEqual(viewerExpected);
+          } catch (error) {
+            const diagnostic: DesktopViewerResizeFailure = {
+              expected: viewerExpected,
+              lastFramebuffer,
+              snapshotStatus: "unavailable",
+              pageClosed: page.isClosed(),
+              canvasCount: null,
+              snapshotFramebuffer: null,
+              socketCount: null,
+              latestReadyState: null,
+              socketCloses: null,
+            };
+            // Retain known facts even if the one read-only browser snapshot cannot settle.
+            context.task.meta.desktopViewerResizeFailure = diagnostic;
+            let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              const snapshot = await Promise.race([
+                canvas.evaluateAll((canvases) => {
+                  const surface = canvases.length === 1 ? canvases[0] : null;
+                  const sockets: unknown = Reflect.get(window, "desktopProofSockets");
+                  const closes: unknown = Reflect.get(window, "desktopProofSocketCloses");
+                  const latest: unknown = Array.isArray(sockets) ? sockets.at(-1) : null;
+                  const readyState = latest instanceof WebSocket ? latest.readyState : null;
+                  return {
+                    canvasCount: canvases.length,
+                    snapshotFramebuffer:
+                      surface instanceof HTMLCanvasElement
+                        ? { width: surface.width, height: surface.height }
+                        : null,
+                    socketCount: Array.isArray(sockets) ? sockets.length : null,
+                    latestReadyState:
+                      readyState === 0 || readyState === 1 || readyState === 2 || readyState === 3
+                        ? readyState
+                        : null,
+                    socketCloses: Array.isArray(closes) ? closes.slice(-8) : null,
+                  };
+                }),
+                new Promise<null>((resolve) => {
+                  snapshotTimer = setTimeout(() => resolve(null), 1_000);
+                }),
+              ]);
+              if (snapshot) {
+                Object.assign(diagnostic, snapshot, { snapshotStatus: "available" });
+              } else {
+                diagnostic.snapshotStatus = "timed-out";
+              }
+            } catch {
+              // Keep the unavailable snapshot, never replace the framebuffer assertion error.
+            } finally {
+              clearTimeout(snapshotTimer);
+              diagnostic.pageClosed = page.isClosed();
+            }
+            throw error;
+          }
           await expect
             .poll(() =>
               page.evaluate(() => {

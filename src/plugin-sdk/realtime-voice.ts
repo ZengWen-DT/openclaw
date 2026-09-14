@@ -188,6 +188,7 @@ export {
 } from "../talk/provider-registry.js";
 export {
   resolveConfiguredRealtimeVoiceProvider,
+  resolveRealtimeVoiceProviderCapabilities,
   type ResolvedRealtimeVoiceProvider,
   type ResolveConfiguredRealtimeVoiceProviderParams,
 } from "../talk/provider-resolver.js";
@@ -223,6 +224,7 @@ export {
 export {
   calculateMulawRms,
   createSpeechThresholdGate,
+  isRealtimeVoiceAudioAudible,
   readPcm16AudioStats,
   type AudioEnergyStats,
 } from "../talk/audio-energy.js";

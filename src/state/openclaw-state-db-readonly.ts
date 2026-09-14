@@ -4,7 +4,7 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import { SqliteCoordinatorError } from "../infra/sqlite-coordinator.js";
-import type { PreparedSqliteReadOnlyLocation } from "../infra/sqlite-readonly-location.js";
+import type { PreparedSqliteReadOnlyLocation } from "../infra/sqlite-readonly-location.types.js";
 import {
   prepareSqliteReadOnlyLocation,
   prepareSqliteReadOnlyLocationSync,
@@ -24,6 +24,82 @@ const artifactPreservingReads = resolveGlobalSingleton(
   Symbol.for("openclaw.artifactPreservingStateReads"),
   () => new AsyncLocalStorage<boolean>(),
 );
+
+const disposableStateReads = resolveGlobalSingleton(
+  Symbol.for("openclaw.disposableStateReads"),
+  () => new AsyncLocalStorage<{ path: string; active: boolean }[]>(),
+);
+
+const stateSnapshotReads = resolveGlobalSingleton(
+  Symbol.for("openclaw.stateSnapshotReads"),
+  () =>
+    new AsyncLocalStorage<{
+      path: string;
+      location: string;
+      env: NodeJS.ProcessEnv;
+      active: boolean;
+    }>(),
+);
+
+/** Resolve a composite read from one online snapshot without redirecting live writers. */
+export async function withOpenClawStateDatabaseReadSnapshot<T>(
+  operation: () => Promise<T>,
+  options: OpenClawStateDatabaseOptions = {},
+): Promise<T> {
+  const pathname = resolveReadOnlyPath(options);
+  const current = stateSnapshotReads.getStore();
+  if ((current?.active && current.path === pathname) || !existingPathOrUndefined(pathname)) {
+    return await operation();
+  }
+  const env = options.env ?? process.env;
+  openClawStateDatabaseCache.assertOpenClawStateDatabaseFreshOpenAllowedAtPath(pathname, env);
+  let prepared: PreparedSqliteReadOnlyLocation;
+  try {
+    prepared = await prepareSqliteReadOnlyLocation(pathname, {
+      preserveSourceArtifacts: isArtifactPreservingStateRead(),
+    });
+  } catch (error) {
+    throw new Error(
+      `Cannot read shared state for discovery: ${pathname}. Retry after the current state operation completes. ${String(error)}`,
+      { cause: error },
+    );
+  }
+  const scope = { path: pathname, location: prepared.location, env, active: true };
+  await using _ = {
+    async [Symbol.asyncDispose]() {
+      scope.active = false;
+      if (!(await prepared.cleanupAsync())) {
+        throw new Error(`Shared-state discovery snapshot cleanup failed: ${pathname}`);
+      }
+    },
+  };
+  openClawStateDatabaseCache.assertOpenClawStateDatabaseFreshOpenAllowedAtPath(pathname, env);
+  return await stateSnapshotReads.run(scope, operation);
+}
+
+/** The caller owns this private database and removes its files after the scope closes. */
+export async function withDisposableOpenClawStateReads<T>(
+  pathname: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const scope = { path: path.resolve(pathname), active: true };
+  try {
+    return await disposableStateReads.run(
+      [...(disposableStateReads.getStore() ?? []), scope],
+      operation,
+    );
+  } finally {
+    // Async descendants can retain the context after its owner starts cleanup.
+    scope.active = false;
+  }
+}
+
+function requiresArtifactPreservingSnapshot(pathname: string): boolean {
+  return (
+    isArtifactPreservingStateRead() &&
+    !disposableStateReads.getStore()?.some((scope) => scope.active && scope.path === pathname)
+  );
+}
 
 /** Admission scopes every nested reader without changing normal live-read semantics. */
 export function withArtifactPreservingStateReads<T>(operation: () => T): T {
@@ -72,6 +148,17 @@ function withOpenClawStateDatabaseReadOnlyIfOpen<T>(
   operation: (database: OpenClawStateReadOnlyDatabase) => T,
   pathname: string,
 ): ReusedOpenClawStateReadOnlyDatabase<T> {
+  const snapshot = stateSnapshotReads.getStore();
+  if (snapshot?.active && snapshot.path === pathname) {
+    openClawStateDatabaseCache.assertOpenClawStateDatabaseFreshOpenAllowedAtPath(
+      pathname,
+      snapshot.env,
+    );
+    return {
+      reused: true,
+      value: withOpenClawStateReadOnlyLocation(operation, pathname, snapshot.location),
+    };
+  }
   const opened = openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(pathname);
   if (!opened || opened.db.isTransaction) {
     return { reused: false };
@@ -103,7 +190,7 @@ function withFreshOpenClawStateDatabaseReadOnly<T>(
   openClawStateDatabaseCache.assertOpenClawStateDatabaseFreshOpenAllowedAtPath(pathname, env);
   // Even read-only SQLite opens can create a missing WAL. The existing worker
   // snapshots committed WAL pages without touching source sidecars or caller-held locks.
-  const prepared = isArtifactPreservingStateRead()
+  const prepared = requiresArtifactPreservingSnapshot(pathname)
     ? prepareSqliteReadOnlyLocationSync(pathname)
     : undefined;
   return withOpenClawStateReadOnlyLocation(operation, pathname, prepared ?? pathname);
@@ -253,6 +340,9 @@ export function withExistingOpenClawStateDatabaseArtifactPreservingReadOnlyAsync
     }
     const env = options.env ?? process.env;
     openClawStateDatabaseCache.assertOpenClawStateDatabaseFreshOpenAllowedAtPath(pathname, env);
+    if (!requiresArtifactPreservingSnapshot(pathname)) {
+      return withOpenClawStateReadOnlyLocation(operation, pathname, pathname);
+    }
     const prepared = await prepareSqliteReadOnlyLocation(pathname, {
       preserveSourceArtifacts: true,
     });

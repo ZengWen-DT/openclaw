@@ -1587,6 +1587,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
   agent_id TEXT,
   requester_agent_id TEXT,
   run_id TEXT,
+  execution_owner_host TEXT,
+  execution_owner_pid INTEGER,
+  execution_owner_start_identity INTEGER,
   label TEXT,
   task TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -1844,6 +1847,21 @@ CREATE TABLE IF NOT EXISTS worktree_provisioned_file_chunks (
   chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
   data BLOB NOT NULL,
   PRIMARY KEY (worktree_id, path, chunk_index)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS worktree_templates (
+  cache_key TEXT NOT NULL PRIMARY KEY,
+  id TEXT NOT NULL UNIQUE,
+  repo_root TEXT NOT NULL,
+  common_dir TEXT NOT NULL,
+  worktree_root TEXT NOT NULL,
+  path TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  source_commit TEXT NOT NULL,
+  content_key TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('preparing', 'ready')),
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER NOT NULL
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS projects (

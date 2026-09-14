@@ -1,6 +1,10 @@
 // Declaration paths are shared metadata; only the runner imports their build values.
 export const runtimeProcessDeclarationEntries = {
+  "extensions/memory-core/manager-cpu-entrypoints":
+    "extensions/memory-core/src/memory/manager-cpu-entrypoints.ts",
   "infra/runtime-process-entrypoints": "src/infra/runtime-process-entrypoints.ts",
+  "extensions/document-extract/document-extractor-worker-entrypoint":
+    "extensions/document-extract/document-extractor-worker-entrypoint.ts",
   "extensions/memory-core/manager-search-knn-entrypoint":
     "extensions/memory-core/src/memory/manager-search-knn-entrypoint.ts",
 };
@@ -20,6 +24,8 @@ export const vitestWorkerDeclarationEntries = {
     "extensions/qa-lab/src/gateway-child-artifacts-runtime.test-support.ts",
   "plugins/loader-sdk-bridge-artifacts.test-support":
     "src/plugins/loader-sdk-bridge-artifacts.test-support.ts",
+  "system-agent/setup-inference-groq-sdk.test-support":
+    "src/system-agent/setup-inference-groq-sdk.test-support.ts",
   "agents/code-mode-retention-entrypoint.test-support":
     "src/agents/code-mode-retention-entrypoint.test-support.ts",
   "agents/command/cli-compaction-runtime.test-support":

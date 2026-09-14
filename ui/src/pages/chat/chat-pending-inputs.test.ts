@@ -96,7 +96,7 @@ describe("server-owned pending input display", () => {
   });
 
   it.each([
-    { state: "queued", runId: undefined, notice: "Queued · waiting for the agent" },
+    { state: "queued", runId: undefined, notice: undefined },
     {
       state: "interrupted",
       runId: "run-queued",
@@ -612,6 +612,7 @@ describe("server-owned pending input display", () => {
     "supersedes a stale custody read when a user input promotes with local run %s",
     async (runId) => {
       const stale = createDeferred<unknown>();
+      const fresh = createDeferred<unknown>();
       const initialUser = {
         role: "user",
         content: "First turn",
@@ -647,20 +648,7 @@ describe("server-owned pending input display", () => {
           ],
         ]),
         requestHandlers: {
-          "chat.history": () =>
-            ++historyReads === 1
-              ? stale.promise
-              : {
-                  sessionId,
-                  messages: [initialUser, promoted],
-                  pendingInputs: { items: [], total: 0 },
-                  sessionInfo: {
-                    key: sessionKey,
-                    sessionId,
-                    hasActiveRun: true,
-                    status: "running",
-                  },
-                },
+          "chat.history": () => (++historyReads === 1 ? stale.promise : fresh.promise),
         },
       });
       applyChatPendingInputs(host, page);
@@ -678,14 +666,23 @@ describe("server-owned pending input display", () => {
           message: promoted,
         },
       });
-      expect(historyReads).toBe(2);
-      const refreshed = await loadChatHistory(host);
+      expect(historyReads).toBe(1);
+      const refreshing = loadChatHistory(host);
+      stale.resolve({ sessionId, messages: [initialUser], pendingInputs: page });
+      await loading;
+      await vi.waitFor(() => expect(historyReads).toBe(2));
+      expect(host.chatMessages).toEqual([initialUser, promoted]);
+      expect(getChatHistoryLoadState(host).phase).toBe("in-flight");
+      fresh.resolve({
+        sessionId,
+        messages: [initialUser, promoted],
+        pendingInputs: { items: [], total: 0 },
+        sessionInfo: { key: sessionKey, sessionId, hasActiveRun: true, status: "running" },
+      });
+      const refreshed = await refreshing;
       expect(host.lastError).toBeNull();
       expect(getChatHistoryLoadState(host).phase).toBe("committed");
       expect(refreshed).toMatchObject({ pendingInputs: { items: [], total: 0 } });
-      expect(getChatPendingInputs(host)?.page.total).toBe(0);
-      stale.resolve({ sessionId, messages: [initialUser], pendingInputs: page });
-      await loading;
       expect(getChatPendingInputs(host)?.page.total).toBe(0);
       expect(host.chatMessages).toEqual([initialUser, promoted]);
       expect(host.chatRunId).toBe(runId);
@@ -843,16 +840,28 @@ describe("server-owned pending input display", () => {
   );
 
   it("replaces a server pending bubble with canonical persistence exactly once", () => {
+    const clients = [{ id: "cli", mode: "cli", displayName: "Release helper" }];
     const promoted = {
       role: "user",
       content: "Keep my accepted input",
-      __openclaw: { id: "input-1", seq: 2, idempotencyKey: "run-queued:user" },
+      __openclaw: {
+        id: "input-1",
+        seq: 2,
+        idempotencyKey: "run-queued:user",
+        transport: { clients },
+      },
     };
     const items = buildChatItems({
       paneId: "promoted-pane",
       sessionKey,
       messages: [promoted],
-      pendingInputs: page.items,
+      pendingInputs: page.items.map((entry) => ({
+        ...entry,
+        message: {
+          ...promoted,
+          __openclaw: { id: `pending:${entry.id}`, transport: { clients } },
+        },
+      })),
       queue: [],
       toolMessages: [],
       streamSegments: [],
@@ -864,11 +873,12 @@ describe("server-owned pending input display", () => {
     expect(items[0]).toMatchObject({
       kind: "group",
       role: "user",
+      sourceClients: clients,
       messages: [{ message: promoted }],
     });
   });
 
-  it("labels unconsumed input as queued between its acceptance time and later output", () => {
+  it("keeps unconsumed input in order without a generic queue notice", () => {
     const earlier = { role: "assistant", content: "Earlier reply", timestamp: 50 };
     const later = { role: "assistant", content: "Later reply", timestamp: 150 };
     const items = buildChatItems({
@@ -890,11 +900,6 @@ describe("server-owned pending input display", () => {
         kind: "group",
         role: "user",
         messages: [{ message: { content: "Keep my accepted input" } }],
-      },
-      {
-        kind: "notice",
-        timestamp: input.acceptedAt,
-        text: "Queued · waiting for the agent",
       },
       { kind: "group", role: "assistant", messages: [{ message: later }] },
     ]);

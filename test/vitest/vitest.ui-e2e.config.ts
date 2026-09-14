@@ -25,8 +25,10 @@ const uiE2eIncludePatterns = [
   automationManagementRealGatewayTest,
 ];
 export const uiE2eRealGatewayTestFiles = [
+  "ui/src/e2e/quota-reset-status.real-gateway.e2e.test.ts",
   "ui/src/e2e/model-api-keys.real-gateway.e2e.test.ts",
   "ui/src/e2e/model-catalog-partial-refresh.real-gateway.e2e.test.ts",
+  "ui/src/e2e/chat-flow.catalog-bootstrap.e2e.test.ts",
   "ui/src/e2e/worker-initial-setup.real-gateway.e2e.test.ts",
   "ui/src/e2e/agent-file-lifecycle.real-gateway.e2e.test.ts",
   "ui/src/e2e/chat-composer-websearch-kill-switch.real-gateway.e2e.test.ts",
@@ -74,6 +76,7 @@ export const uiE2ePrivateServerTestFiles = [
   "ui/src/e2e/community-invite-showing.e2e.test.ts",
   "ui/src/e2e/composer-draft-store.e2e.test.ts",
   "ui/src/e2e/composer-recovery-fences.e2e.test.ts",
+  "ui/src/e2e/config-raw-save.e2e.test.ts",
   "ui/src/e2e/control-ui-shell-routing.e2e.test.ts",
   "ui/src/e2e/cron-duration-save.real-gateway.e2e.test.ts",
   "ui/src/e2e/cron-loading.e2e.test.ts",
@@ -91,6 +94,7 @@ export const uiE2ePrivateServerTestFiles = [
   "ui/src/e2e/mount-recovery.e2e.test.ts",
   "ui/src/e2e/native-notifications-loading.e2e.test.ts",
   "ui/src/e2e/new-session-page.cloud-startup.runtime-load.e2e.test.ts",
+  "ui/src/e2e/quota-reset-status.real-gateway.e2e.test.ts",
   "ui/src/e2e/session-management.delete.e2e.test.ts",
   "ui/src/e2e/settings-loading-skeletons.e2e.test.ts",
   "ui/src/e2e/sidebar-account-footer.e2e.test.ts",
@@ -112,6 +116,7 @@ export const uiE2eSerialTestFiles = [
 // New files stay bundled unless they own every UI server they use.
 const uiE2eStandaloneTestFiles = [
   "ui/src/e2e/board-fixture.e2e.test.ts",
+  "ui/src/e2e/control-ui-build-publication.e2e.test.ts",
   "ui/src/e2e/control-ui-retained-assets.e2e.test.ts",
   "ui/src/e2e/service-worker-update.e2e.test.ts",
 ];

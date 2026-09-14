@@ -3,17 +3,16 @@ unset PR_MAIN_SHA
 PR_MAIN_SHA=""
 
 repo_root() {
+  # The entrypoint freezes this identity before a linked wrapper can delete
+  # its source directory. Post-removal checks must use the same owner.
+  if [ -n "${canonical_repo_root:-}" ]; then
+    printf '%s\n' "$canonical_repo_root"
+    return
+  fi
   # Resolve canonical repository root from git common-dir so wrappers work
   # the same from main checkout or any linked worktree.
   local base_dir
   local common_git_dir
-  # Anchor-exec handoff (see scripts/pr): the wrapper runs from materialized
-  # temp-dir bytes with no git context of its own; the handoff env carries the
-  # repository the run addresses.
-  if [ -n "${OPENCLAW_PR_ANCHOR_REPO_ROOT:-}" ]; then
-    (cd "$OPENCLAW_PR_ANCHOR_REPO_ROOT" && pwd)
-    return
-  fi
   base_dir="${script_parent_dir:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
   if common_git_dir=$(git -C "$base_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
@@ -216,24 +215,68 @@ checkout_pr_worktree_target() {
   recover_review_transition "$pr"
 }
 
-fetch_canonical_main() {
-  local root source git_dir refspec=refs/heads/main
-  local options=(--no-tags --refmap=)
-  if [ -n "${1:-}" ]; then
-    refspec="+$refspec:$1"
-    options+=(--no-write-fetch-head)
-  fi
+fetch_canonical_ref() {
+  local refspec="$1" root source git_dir
+  shift
   root=$(repo_root) || return 1
   source=$(git -C "$root" remote get-url origin) || return 1
   git_dir=$(git rev-parse --absolute-git-dir) || return 1
   # Resolve relative URLs at the canonical root; ignore worktree origin/refmaps.
   # Other PRs and ordinary fetches own shared refs and the root FETCH_HEAD.
-  git -C "$root" --git-dir="$git_dir" fetch "${options[@]}" "$source" "$refspec"
+  # Automatic maintenance can prune unrelated worktree metadata, even on fetch.
+  git -C "$root" --git-dir="$git_dir" fetch --no-auto-maintenance --no-tags --refmap= "$@" "$source" "$refspec"
+}
+
+fetch_canonical_main() {
+  if [ -n "${1:-}" ]; then
+    fetch_canonical_ref "+refs/heads/main:$1" --no-write-fetch-head
+  else
+    fetch_canonical_ref refs/heads/main
+  fi
+}
+
+fetch_pr_head() {
+  local pr="$1" expected_sha="$2" destination="${3:-}"
+  if ! [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "PR head acquisition requires a full lowercase commit SHA for #$pr." >&2
+    return 1
+  fi
+  case "$destination" in
+    ""|"refs/heads/pr-$pr"|"refs/heads/pr-$pr-verify") ;;
+    *) echo "Invalid PR head acquisition destination for #$pr: $destination" >&2; return 1 ;;
+  esac
+
+  local fields=headRefName,headRefOid,headRepository,headRepositoryOwner
+  local before after observed_sha before_identity after_identity refspec fetched_sha
+  before=$(read_pr_view_json "$pr" "$fields") || return 1
+  observed_sha=$(pr_view_string_field "$before" headRefOid "$pr") || return 1
+  pr_view_string_field "$before" headRefName "$pr" >/dev/null || return 1
+  if [ "$observed_sha" != "$expected_sha" ]; then
+    echo "PR head changed before acquisition (expected $expected_sha, live $observed_sha). Re-run review-init." >&2
+    return 1
+  fi
+  before_identity=$(printf '%s\n' "$before" | jq -cS '{headRefName,headRefOid,headRepository,headRepositoryOwner}') || return 1
+  refspec="$expected_sha"
+  [ -z "$destination" ] || refspec="+$expected_sha:$destination"
+  # GitHub's pull/head projection can lag live PR metadata and the branch.
+  # Fetch immutable source bytes without overwriting the operation's main checkpoint.
+  fetch_canonical_ref "$refspec" --no-write-fetch-head || return 1
+  fetched_sha=$(GIT_NO_LAZY_FETCH=1 git rev-parse --verify "${destination:-$expected_sha}^{commit}") || return 1
+  if [ "$fetched_sha" != "$expected_sha" ]; then
+    echo "PR head changed while fetching it (expected $expected_sha, fetched $fetched_sha)." >&2
+    return 1
+  fi
+  after=$(read_pr_view_json "$pr" "$fields") || return 1
+  after_identity=$(printf '%s\n' "$after" | jq -cS '{headRefName,headRefOid,headRepository,headRepositoryOwner}') || return 1
+  if [ "$after_identity" != "$before_identity" ]; then
+    echo "PR head changed during acquisition for #$pr. Re-run review-init." >&2
+    return 1
+  fi
 }
 
 refresh_main_snapshot() {
   # The PR lock owns this worktree's FETCH_HEAD, not the shared origin/main ref.
-  # Capture immediately: subsequent PR-head fetches overwrite FETCH_HEAD.
+  # Capture immediately; PR-head acquisition leaves this checkpoint unchanged.
   PR_MAIN_SHA=""
   local sha
   fetch_canonical_main || return 1
@@ -259,25 +302,19 @@ enter_worktree() {
   # Fetch can launch helpers and mutate Git state even when it fails; leave validation first.
   mark_pr_operation_side_effects_started || return 1
 
-  # Resolve through the parent, never through the leaf: a missing directory has
-  # no real path of its own, and resolving a leaf symlink would silently adopt
-  # whichever worktree it aliases.
   local dir="$root/.worktrees/pr-$pr"
-  local resolved_parent resolved_dir="" initialized_sha=""
-  resolved_parent=$(resolve_existing_dir_path "$(dirname "$dir")" 2>/dev/null || true)
-  [ -z "$resolved_parent" ] || resolved_dir="$resolved_parent/pr-$pr"
+  local resolved_parent resolved_dir state registration initialized_sha=""
+  state=$(pr_worktree_state "$dir" "" entry) || return $?
+  resolved_dir=$(printf '%s\n' "$state" | jq -r '.path') || return $?
+  registration=$(worktree_registration_state "$resolved_dir") || return $?
 
-  if [ ! -d "$dir" ] || [ -z "$resolved_dir" ] || ! worktree_is_registered "$resolved_dir"; then
-    if [ -e "$dir" ] || { [ -n "$resolved_dir" ] && worktree_is_registered "$resolved_dir"; }; then
-      require_worktree_cleanup_evidence "$dir" || return 1
-      echo "Pruning stale worktree registration for .worktrees/pr-$pr"
-      git -C "$root" worktree prune || return 1
-      remove_worktree_if_present "$dir" || return 1
-      [ ! -e "$dir" ] || {
-        echo "Refusing scripts/pr operation for PR #$pr: $dir is not a registered worktree and could not be cleared; scripts/pr refuses to mutate the shared canonical checkout." >&2
-        return 1
-      }
+  if [ "$registration" != registered ] ||
+    ! printf '%s\n' "$state" | jq -e '.present' >/dev/null; then
+    if [ "$registration" = registered ] ||
+      printf '%s\n' "$state" | jq -e '.present or .admin != ""' >/dev/null; then
+      echo "Removing exact stale PR worktree .worktrees/pr-$pr"
     fi
+    remove_worktree_if_present "$dir" || return $?
     # Cold bootstrap needs one extra fetch before private FETCH_HEAD exists.
     # Initialize fully before the next network wait so interruption is retryable.
     # The PR lock owns this existing temp branch, not shared origin/main or FETCH_HEAD.
@@ -287,6 +324,9 @@ enter_worktree() {
     resolved_parent=$(resolve_existing_dir_path "$(dirname "$dir")") || return 1
     resolved_dir="$resolved_parent/pr-$pr"
     initialized_sha=$(git -C "$dir" rev-parse --verify HEAD) || return 1
+    state=$(pr_worktree_state "$dir" "" entry) || return $?
+    registration=$(worktree_registration_state "$resolved_dir") || return $?
+    [ "$registration" = registered ] || return 1
   fi
 
   cd "$resolved_dir" || return 1
@@ -295,9 +335,11 @@ enter_worktree() {
   # prove Git resolves it to this worktree before any branch moves. A directory
   # that is not a worktree lets discovery escape up into the shared canonical
   # checkout, where a sibling session's branch would be clobbered.
-  local actual_toplevel
+  local actual_toplevel actual_identity expected_identity
   actual_toplevel=$(resolve_existing_dir_path "$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null)" 2>/dev/null || true)
-  if [ "$actual_toplevel" != "$resolved_dir" ]; then
+  actual_identity=$(git rev-parse --path-format=absolute --git-dir --git-common-dir) || return $?
+  expected_identity=$(printf '%s\n' "$state" | jq -r '.admin, .common') || return $?
+  if [ "$actual_toplevel" != "$resolved_dir" ] || [ "$actual_identity" != "$expected_identity" ]; then
     echo "Refusing scripts/pr operation for PR #$pr: expected worktree $resolved_dir, Git resolved ${actual_toplevel:-no repository}; scripts/pr refuses to mutate the shared canonical checkout." >&2
     return 1
   fi

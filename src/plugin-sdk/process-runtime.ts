@@ -1,5 +1,6 @@
 // Public process helpers for plugins that spawn or probe local commands.
 
+export { SUPERVISOR_HINT_ENV_VARS } from "../infra/supervisor-markers.js";
 export { splitCommandArgs } from "../utils/shell-argv.js";
 export {
   type CommandOptions,
@@ -15,7 +16,7 @@ export {
 export { prepareOomScoreAdjustedSpawn } from "../process/linux-oom-score.js";
 export type { OomScoreAdjustedSpawn, OomWrapOptions } from "../process/linux-oom-score.js";
 export { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
-export { WorkerTaskPool, serveWorkerTasks } from "../infra/worker-task-pool.js";
+export { WorkerTaskError, WorkerTaskPool, serveWorkerTasks } from "../infra/worker-task-pool.js";
 export { killProcessTree, signalProcessTree } from "../process/kill-tree.js";
 export {
   getFileLockProcessStartTime,

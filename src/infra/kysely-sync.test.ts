@@ -13,7 +13,9 @@ import {
   executeSqliteQueryTakeFirstSync,
   getNodeSqliteKysely,
   iterateSqliteQuerySync,
+  prepareSqliteQueryIterator,
   prepareSqliteQuerySync,
+  prepareSqliteQueryTakeFirstSync,
   sqliteStringSet,
 } from "./kysely-sync.js";
 
@@ -65,6 +67,28 @@ describe("kysely sync helpers", () => {
     ]);
   });
 
+  it("stops first-row selects without evaluating later rows and releases the reader", () => {
+    database = new DatabaseSync(":memory:");
+    database.exec("create table items (id integer primary key, name text not null)");
+    database.exec("insert into items values (1, 'Ada'), (2, 'Grace'), (3, 'Lin')");
+    enableNodeSqliteKyselyStatementCache(database);
+    const db = getNodeSqliteKysely<SyncHelperTestDatabase>(database);
+    const visited: number[] = [];
+    database.function("visit", (id) => {
+      visited.push(Number(id));
+      return id;
+    });
+    const select = db.selectFrom("items").select(db.fn<number>("visit", ["id"]).as("id"));
+    for (let attempt = 0; attempt < 3; attempt++) {
+      visited.length = 0;
+      expect(executeSqliteQueryTakeFirstSync(database, select)).toEqual({ id: 1 });
+      expect(visited).toEqual([1]);
+    }
+    database.exec("drop table items");
+    database.exec("create table items (id integer primary key, name text not null)");
+    expect(executeSqliteQueryTakeFirstSync(database, select)).toBeUndefined();
+  });
+
   it("preserves raw readers and distinguishes writes with and without returned rows", () => {
     database = new DatabaseSync(":memory:");
     database.exec("create table items (id integer primary key, name text not null)");
@@ -75,6 +99,9 @@ describe("kysely sync helpers", () => {
 
     expect(executeSqliteQuerySync(database, pragma).rows).toEqual([{ user_version: 42 }]);
     expect([...iterateSqliteQuerySync(database, pragma)]).toEqual([{ user_version: 42 }]);
+    expect(prepareSqliteQueryTakeFirstSync(database, () => pragma)(undefined)).toEqual({
+      user_version: 42,
+    });
 
     const update = db.updateTable("items").set({ name: "Grace" }).where("id", "=", 1);
     expect([...iterateSqliteQuerySync(database, update)]).toEqual([]);
@@ -86,6 +113,18 @@ describe("kysely sync helpers", () => {
     expect([...iterateSqliteQuerySync(database, update.returningAll())]).toEqual([
       { id: 1, name: "Grace" },
     ]);
+    const visited: number[] = [];
+    database.function("visit", (id) => {
+      visited.push(Number(id));
+      return id;
+    });
+    database.exec("insert into items (id, name) values (2, 'Lin')");
+    const rawRows = {
+      // Raw readers share the completion path with writes; selecting a first result must drain them.
+      compile: () => sql`select visit(id) as id from items order by id`.compile(db),
+    };
+    expect(prepareSqliteQueryTakeFirstSync(database, () => rawRows)(undefined)).toEqual({ id: 1 });
+    expect(visited).toEqual([1, 2]);
   });
 
   it("binds changing values without confusing repeated bindings and literal parameters", () => {
@@ -155,28 +194,43 @@ describe("kysely sync helpers", () => {
     },
   );
 
-  it("keeps prepared query bindings independent during synchronous callback re-entry", () => {
-    database = new DatabaseSync(":memory:");
-    enableNodeSqliteKyselyStatementCache(database);
-    const db = getNodeSqliteKysely<SyncHelperTestDatabase>(database);
-    const select = prepareSqliteQuerySync<number, { nested: number; input: number }>(
-      database,
-      (parameter) => {
+  it.each(["eager", "iterator", "first"])(
+    "keeps prepared query bindings independent during synchronous callback re-entry (%s)",
+    (mode) => {
+      database = new DatabaseSync(":memory:");
+      enableNodeSqliteKyselyStatementCache(database);
+      const db = getNodeSqliteKysely<SyncHelperTestDatabase>(database);
+      type Row = { nested: number; input: number };
+      const build: Parameters<typeof prepareSqliteQuerySync<number, Row>>[1] = (parameter) => {
         const value = parameter((input) => input);
         return db.selectNoFrom([
           db.fn<number>("nested_value", [value]).as("nested"),
           value.as("input"),
         ]);
-      },
-    );
-    database.function("nested_value", (value) => {
-      const input = Number(value);
-      return input === 0 ? 0 : select(input - 1).rows[0]!.nested + 1;
-    });
-    for (const input of [2, 3, 4]) {
-      expect(select(input).rows).toEqual([{ nested: input, input }]);
-    }
-  });
+      };
+      let read: (input: number) => Row[];
+      if (mode === "first") {
+        const select = prepareSqliteQueryTakeFirstSync<number, Row>(database, build);
+        read = (input) => {
+          const row = select(input);
+          return row ? [row] : [];
+        };
+      } else if (mode === "eager") {
+        const select = prepareSqliteQuerySync<number, Row>(database, build);
+        read = (input) => select(input).rows;
+      } else {
+        const select = prepareSqliteQueryIterator<number, Row>(database, build);
+        read = (input) => [...select(input)];
+      }
+      database.function("nested_value", (value) => {
+        const input = Number(value);
+        return input === 0 ? 0 : read(input - 1)[0]!.nested + 1;
+      });
+      for (const input of [2, 3, 4]) {
+        expect(read(input)).toEqual([{ nested: input, input }]);
+      }
+    },
+  );
 
   it("returns identical results while repeated statements move from cold to warm", () => {
     database = new DatabaseSync(":memory:");
@@ -274,7 +328,7 @@ describe("kysely sync helpers", () => {
     expect(prepares.calls()).toBe(192);
   });
 
-  it("keeps nested lazy iterations independent", () => {
+  it.each(["ordinary", "prepared"])("keeps nested lazy iterations independent (%s)", (mode) => {
     database = new DatabaseSync(":memory:");
     database.exec(
       "create table items (id integer primary key autoincrement, name text not null unique)",
@@ -284,23 +338,39 @@ describe("kysely sync helpers", () => {
       executeSqliteQuerySync(database, db.insertInto("items").values({ name }));
     }
     const select = db.selectFrom("items").selectAll().orderBy("id");
+    const read =
+      mode === "prepared"
+        ? prepareSqliteQueryIterator<{ from: number }, { id: number; name: string }>(
+            database,
+            (parameter) =>
+              select.where(
+                "id",
+                ">=",
+                parameter((input) => input.from),
+              ),
+          )
+        : ({ from }: { from: number }) =>
+            iterateSqliteQuerySync(database!, select.where("id", ">=", from));
     const prepares = countPrepares(database);
 
-    expect([...iterateSqliteQuerySync(database, select)]).toHaveLength(3);
-    expect([...iterateSqliteQuerySync(database, select)]).toHaveLength(3);
+    expect([...read({ from: 1 })]).toHaveLength(3);
+    expect([...read({ from: 1 })]).toHaveLength(3);
 
-    const outer = iterateSqliteQuerySync(database, select);
-    expect(outer.next()).toEqual({ done: false, value: { id: 1, name: "Ada" } });
-    expect([...iterateSqliteQuerySync(database, select)]).toEqual([
-      { id: 1, name: "Ada" },
-      { id: 2, name: "Grace" },
-      { id: 3, name: "Lin" },
-    ]);
-    expect([...outer]).toEqual([
+    const input = { from: 2 };
+    const outer = read(input);
+    input.from = 3;
+    const inner = read({ from: 1 });
+    read({ from: 4 }).return?.();
+    expect(prepares.calls()).toBe(2);
+    expect(outer.next()).toEqual({ done: false, value: { id: 2, name: "Grace" } });
+    expect(inner.next()).toEqual({ done: false, value: { id: 1, name: "Ada" } });
+    outer.return?.();
+    expect([...inner]).toEqual([
       { id: 2, name: "Grace" },
       { id: 3, name: "Lin" },
     ]);
     expect(prepares.calls()).toBe(4);
+    database.exec("drop table items");
   });
 
   it("does not reuse an active cached statement during synchronous callback re-entry", () => {
@@ -453,33 +523,43 @@ describe("kysely sync helpers", () => {
     expect(prepares.calls()).toBe(3);
   });
 
-  it.each(["eager", "lazy"])("reads current columns without allocating metadata (%s)", (mode) => {
-    database = new DatabaseSync(":memory:");
-    database.exec("create table items (id integer primary key, name text not null)");
-    database.exec("insert into items (id, name) values (1, 'Ada')");
-    const db = getNodeSqliteKysely<SyncHelperTestDatabase>(database);
-    const select = db.selectFrom("items").selectAll();
-    const prepares = countPrepares(database);
-    const columns = vi.spyOn(StatementSync.prototype, "columns");
-    const read = () =>
-      mode === "eager"
-        ? executeSqliteQuerySync(database!, select).rows
-        : [...iterateSqliteQuerySync(database!, select)];
-    try {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        expect(read()).toEqual([{ id: 1, name: "Ada" }]);
+  it.each(["eager", "lazy", "first", "prepared-first"])(
+    "reads current columns without allocating metadata (%s)",
+    (mode) => {
+      database = new DatabaseSync(":memory:");
+      database.exec("create table items (id integer primary key, name text not null)");
+      database.exec("insert into items (id, name) values (1, 'Ada')");
+      const db = getNodeSqliteKysely<SyncHelperTestDatabase>(database);
+      const select = db.selectFrom("items").selectAll();
+      const preparedFirst = prepareSqliteQueryTakeFirstSync(database, () => select);
+      const prepares = countPrepares(database);
+      const columns = vi.spyOn(StatementSync.prototype, "columns");
+      const read = () =>
+        mode === "eager"
+          ? executeSqliteQuerySync(database!, select).rows
+          : mode === "first" || mode === "prepared-first"
+            ? [
+                mode === "first"
+                  ? executeSqliteQueryTakeFirstSync(database!, select)
+                  : preparedFirst(undefined),
+              ]
+            : [...iterateSqliteQuerySync(database!, select)];
+      try {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          expect(read()).toEqual([{ id: 1, name: "Ada" }]);
+        }
+        expect(prepares.calls()).toBe(mode === "lazy" ? 3 : 2);
+
+        database.exec("alter table items add column note text not null default 'new'");
+
+        expect(read()).toEqual([{ id: 1, name: "Ada", note: "new" }]);
+        expect(prepares.calls()).toBe(mode === "lazy" ? 4 : 2);
+        expect(columns).not.toHaveBeenCalled();
+      } finally {
+        columns.mockRestore();
       }
-      expect(prepares.calls()).toBe(mode === "eager" ? 2 : 3);
-
-      database.exec("alter table items add column note text not null default 'new'");
-
-      expect(read()).toEqual([{ id: 1, name: "Ada", note: "new" }]);
-      expect(prepares.calls()).toBe(mode === "eager" ? 2 : 4);
-      expect(columns).not.toHaveBeenCalled();
-    } finally {
-      columns.mockRestore();
-    }
-  });
+    },
+  );
 
   it("resets a cached row statement after a step-time error", () => {
     database = new DatabaseSync(":memory:");
@@ -501,25 +581,36 @@ describe("kysely sync helpers", () => {
     expect(prepares.calls()).toBe(2);
   });
 
-  it("reports query failures without replacing the original database error", () => {
-    database = new DatabaseSync(":memory:");
-    const db = getNodeSqliteKysely<SyncHelperTestDatabase>(database);
-    const malformedJson = db.selectNoFrom(
-      /* kysely-allow-raw: failure reporting needs a deterministic SQLite step error. */
-      sql<string>`json(${"{"})`.as("value"),
-    );
-    const observed: unknown[] = [];
-    registerNodeSqliteKyselyQueryErrorHandler(database, (error) => {
-      observed.push(error);
-      throw new Error("handler failure");
-    });
+  it.each(["eager", "lazy", "prepared"])(
+    "reports query failures without replacing the original database error (%s)",
+    (mode) => {
+      database = new DatabaseSync(":memory:");
+      const db = getNodeSqliteKysely<SyncHelperTestDatabase>(database);
+      const malformedJson = db.selectNoFrom(
+        /* kysely-allow-raw: failure reporting needs a deterministic SQLite step error. */
+        sql<string>`json(${"{"})`.as("value"),
+      );
+      const observed: unknown[] = [];
+      registerNodeSqliteKyselyQueryErrorHandler(database, (error) => {
+        observed.push(error);
+        throw new Error("handler failure");
+      });
 
-    const thrown = captureError(() => executeSqliteQuerySync(database!, malformedJson));
+      const thrown = captureError(() => {
+        if (mode === "eager") {
+          executeSqliteQuerySync(database!, malformedJson);
+        } else if (mode === "lazy") {
+          Array.from(iterateSqliteQuerySync(database!, malformedJson));
+        } else {
+          Array.from(prepareSqliteQueryIterator(database!, () => malformedJson)(undefined));
+        }
+      });
 
-    expect(observed).toEqual([thrown]);
-    expect(thrown).toBeInstanceOf(Error);
-    expect((thrown as Error).message).toMatch(/malformed JSON/iu);
-  });
+      expect(observed).toEqual([thrown]);
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toMatch(/malformed JSON/iu);
+    },
+  );
 
   it("preserves close return values and double-close errors", () => {
     const baseline = new DatabaseSync(":memory:");

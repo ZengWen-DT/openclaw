@@ -9,12 +9,22 @@ import {
   sql as kyselySql,
   SqliteDialect,
 } from "kysely";
+import { isNodeVersionAtLeast, parseNodeReleaseVersion } from "../../node-version.mjs";
 import {
   executeWithCachedStatement,
   installStatementInvalidation,
   kyselyByDatabase,
   queryErrorHandlerByDatabase,
 } from "./kysely-sync-cache-state.js";
+
+// Node 26.6 fixed all() column counts after statement reprepare (nodejs/node#64219).
+const supportsRepreparedAll =
+  !process.versions.bun &&
+  isNodeVersionAtLeast(parseNodeReleaseVersion(process.versions.node), {
+    major: 26,
+    minor: 6,
+    patch: 0,
+  });
 
 // Sync query helpers execute compiled Kysely SQL against node:sqlite without
 // going through Kysely's async driver path.
@@ -68,16 +78,28 @@ function reportNodeSqliteKyselyQueryError(db: DatabaseSync, error: unknown): voi
 function executeCompiledSqliteQuerySync<Row>(
   db: DatabaseSync,
   compiledQuery: CompiledQuery<Row>,
+  firstRowOnly = false,
 ): QueryResult<Row> {
   const parameters = compiledQuery.parameters as SQLInputValue[];
   try {
     const sql = compiledQuery.sql;
     installStatementInvalidation(db);
     return executeWithCachedStatement(db, sql, parameters, (statement) => {
+      if (firstRowOnly && SelectQueryNode.is(compiledQuery.query)) {
+        // get() reads columns after step/reprepare and resets the reader before returning.
+        // Raw SQL and writes still run to completion through the general executor.
+        // SAFETY: the compiled Kysely selection defines the native result row shape.
+        const row = statement.get(...parameters) as Row | undefined;
+        return { rows: row === undefined ? [] : [row] };
+      }
       // SELECT already guarantees a reader; avoid allocating native column metadata
       // just to classify it. Raw SQL and other roots still need native classification.
       if (SelectQueryNode.is(compiledQuery.query) || statement.columns().length > 0) {
-        // Node's all() snapshots the column count before SQLite can reprepare
+        if (supportsRepreparedAll) {
+          // SAFETY: the compiled Kysely query defines the native result row shape.
+          return { rows: statement.all(...parameters) as Row[] };
+        }
+        // Older Node all() snapshots the column count before SQLite can reprepare
         // an expired statement. Eagerly consuming iterate() reads it after step.
         const iterator = statement.iterate(...parameters);
         try {
@@ -158,6 +180,31 @@ export function prepareSqliteQuerySync<Params, Row = unknown>(
     });
 }
 
+/** Compile a fixed first-row read once and bind fresh values on every execution. */
+export function prepareSqliteQueryTakeFirstSync<Params, Row = unknown>(
+  db: DatabaseSync,
+  build: SqliteQueryBindingBuilder<Params, Row>,
+): (params: Params) => Row | undefined {
+  const { compiled, bind } = compileSqliteQueryBindings(build);
+  return (params) =>
+    executeCompiledSqliteQuerySync<Row>(db, { ...compiled, parameters: bind(params) }, true)
+      .rows[0];
+}
+
+/** Compile once and capture fresh bindings before lazily opening each private iterator. */
+export function prepareSqliteQueryIterator<Params, Row = unknown>(
+  db: DatabaseSync,
+  build: SqliteQueryBindingBuilder<Params, Row>,
+): (params: Params) => IterableIterator<Row> {
+  const { compiled, bind } = compileSqliteQueryBindings(build);
+  return (params) => {
+    const parameters = bind(params);
+    return iterateSqliteQuerySync(db, {
+      compile: () => ({ ...compiled, parameters }),
+    });
+  };
+}
+
 /** Compile and lazily iterate a Kysely query synchronously against node:sqlite. */
 export function* iterateSqliteQuerySync<Row>(
   db: DatabaseSync,
@@ -194,5 +241,5 @@ export function executeSqliteQueryTakeFirstSync<Row>(
   db: DatabaseSync,
   query: Compilable<Row>,
 ): Row | undefined {
-  return executeSqliteQuerySync<Row>(db, query).rows[0];
+  return executeCompiledSqliteQuerySync(db, query.compile(), true).rows[0];
 }

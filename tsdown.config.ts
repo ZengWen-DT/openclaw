@@ -8,6 +8,7 @@ import {
   collectChannelConfigDoctorBuildEntries,
   collectPluginDeclarationSourceEntries,
   collectSourceCheckoutPluginBuildEntries,
+  createBundledPluginBuildInventory,
 } from "./scripts/lib/bundled-plugin-build-entries.mjs";
 import { createGatewayRunChunkMetadataPlugin } from "./scripts/lib/gateway-run-chunk-metadata.mts";
 import { createManagedHandoffBuildConfig } from "./scripts/lib/managed-handoff-build-config.mts";
@@ -22,6 +23,7 @@ import { createRuntimeDependencyOwnershipBuildPlugin } from "./scripts/lib/runti
 import { runtimeProcessBuildEntries } from "./scripts/lib/runtime-process-build-entries.mts";
 import {
   sharedRuntimeProcessBuildEntries,
+  shouldBundleRuntimeSqliteDependency,
   standaloneRuntimeProcessBuildEntries,
 } from "./scripts/lib/runtime-process-core-build-entries.mts";
 import {
@@ -278,7 +280,8 @@ function nodeWorkspacePackageBuildConfig(packageDir: string, config: UserConfig 
   };
 }
 
-const bundledPluginBuildEntries = collectBundledPluginBuildEntries();
+const bundledPluginBuildInventory = createBundledPluginBuildInventory();
+const bundledPluginBuildEntries = collectBundledPluginBuildEntries(bundledPluginBuildInventory);
 const shouldBuildPrivateQaEntries = process.env.OPENCLAW_BUILD_PRIVATE_QA === "1";
 const selectedPluginSdkEntrypoints = shouldBuildPrivateQaEntries
   ? pluginSdkEntrypoints
@@ -354,7 +357,7 @@ function shouldNeverBundleDeclarationDependency(id: string): boolean {
   // Arrow's relative module augmentations must stay beside their package modules.
   return (
     shouldNeverBundleDependency(id) ||
-    ["zod", "apache-arrow"].some((name) => id === name || id.startsWith(`${name}/`))
+    ["zod", "apache-arrow", "kysely"].some((name) => id === name || id.startsWith(`${name}/`))
   );
 }
 
@@ -419,8 +422,6 @@ function buildCoreDistEntries(): Record<string, string> {
     "agents/tool-images.runtime": "src/agents/tool-images.runtime.ts",
     "agents/code-mode.worker": "src/agents/code-mode.worker.ts",
     "agents/compaction-planning.worker": "src/agents/compaction-planning.worker.ts",
-    "config/sessions/session-model-context.worker":
-      "src/config/sessions/session-model-context.worker.ts",
     "config/sessions/disk-budget.worker": "src/config/sessions/disk-budget.worker.ts",
     ...runtimeProcessBuildEntries,
     ...runtimeProcessDeclarationEntries,
@@ -475,8 +476,10 @@ function buildDockerE2eHarnessEntries(): Record<string, string> {
       "src/agents/embedded-agent-runner/run/runtime-context-prompt.ts",
     "auto-reply/reply/commands-system-agent": "src/auto-reply/reply/commands-system-agent.ts",
     "cli/run-main": "src/cli/run-main.ts",
+    "commands/onboard-guided": "src/commands/onboard-guided.ts",
     "config/config": "src/config/config.ts",
     "infra/sqlite-audit-record-store": "src/infra/sqlite-audit-record-store.ts",
+    "state/local-onboarding-state": "src/state/local-onboarding-state.ts",
     "system-agent/audit": "src/system-agent/audit.ts",
     "system-agent/system-agent": "src/system-agent/system-agent.ts",
     "system-agent/rescue-message": "src/system-agent/rescue-message.ts",
@@ -593,9 +596,9 @@ function shouldExternalizeTerminalCoreDependency(id: string): boolean {
 
 const coreDistEntries = buildCoreDistEntries();
 const dockerE2eHarnessEntries = buildDockerE2eHarnessEntries();
-const rootBundledPluginBuildEntries = collectSourceCheckoutPluginBuildEntries().filter(
-  ({ isolated }) => !isolated,
-);
+const rootBundledPluginBuildEntries = collectSourceCheckoutPluginBuildEntries(
+  bundledPluginBuildInventory,
+).filter(({ isolated }) => !isolated);
 const bundledInventoryEntries = rootBundledPluginBuildEntries.flatMap((plugin) => {
   const sourceEntries = plugin.sourceEntries.filter(
     (source) =>
@@ -856,9 +859,12 @@ const configs: UserConfig[] = [
             ([name]) => !bundledInventoryEntryNames.has(name),
           ),
         ),
-        "native-hook-relay/entry": "src/cli/native-hook-relay-entry.ts",
       },
-      deps: unifiedDeps,
+      deps: {
+        ...unifiedDeps,
+        alwaysBundle: (id) =>
+          shouldAlwaysBundleDependency(id) || shouldBundleRuntimeSqliteDependency(id),
+      },
       // Explicit ESM chunks avoid repeated package-format parsing in Node;
       // named entrypoints retain their public .js paths.
       outputOptions: { chunkFileNames: "[name]-[hash].mjs" },
@@ -867,6 +873,18 @@ const configs: UserConfig[] = [
         createGatewayRunChunkMetadataPlugin(),
         createRuntimeDependencyOwnershipBuildPlugin(),
       ],
+    },
+    false,
+  ),
+  nodeBuildConfig(
+    {
+      name: TSDOWN_UNIFIED_CONFIG_GROUP,
+      // One-shot relays must not load shared Gateway/SDK chunks just to read a locator.
+      // Keep splitting enabled so the existing Gateway fallback stays lazy.
+      entry: { "native-hook-relay/entry": "src/cli/native-hook-relay-entry.ts" },
+      deps: unifiedDeps,
+      outputOptions: { chunkFileNames: "native-hook-relay/[name]-[hash].mjs" },
+      plugins: [createStateSchemaInlinePlugin()],
     },
     false,
   ),
@@ -898,7 +916,11 @@ const configs: UserConfig[] = [
     {
       name: TSDOWN_UNIFIED_CONFIG_GROUP,
       entry: standaloneRuntimeProcessBuildEntries,
-      deps: unifiedDeps,
+      deps: {
+        ...unifiedDeps,
+        alwaysBundle: (id) =>
+          shouldAlwaysBundleDependency(id) || shouldBundleRuntimeSqliteDependency(id),
+      },
       outputOptions: { codeSplitting: false },
       plugins: [createStateSchemaInlinePlugin()],
     },
@@ -911,7 +933,7 @@ const configs: UserConfig[] = [
       name: TSDOWN_UNIFIED_CONFIG_GROUP,
       // Keep retained config repairs in their own graph: shared public SDK chunks
       // otherwise pull state-migration exports into these pre-install artifacts.
-      entry: collectChannelConfigDoctorBuildEntries(),
+      entry: collectChannelConfigDoctorBuildEntries(bundledPluginBuildInventory),
       outDir: "dist/config-doctor",
       deps: unifiedDeps,
     },

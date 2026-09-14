@@ -43,7 +43,8 @@ const repositoryScriptEntries = [
   "scripts/vitest-pair-benchmark.mts!",
   // Cloudflare deployment template: wrangler bundles the Worker from this entry.
   "scripts/cloudflare/src/index.ts!",
-  // Invoked by the documented macOS Computer Use live-proof shell rig.
+  // Invoked by the documented Gateway and macOS Computer Use live-proof commands.
+  "scripts/dev/computer-use-gateway-live-proof.ts!",
   "scripts/dev/computer-use-macos-live-proof.ts!",
   "scripts/dev/ios-node-e2e.ts!",
   "scripts/diffs-shiki-curated.ts!",
@@ -105,6 +106,7 @@ const repositoryScriptEntries = [
   // abandoned-update.sh invokes the upgrade ledger assertions through Node.
   "scripts/e2e/lib/upgrade-survivor/abandoned-update.mjs!",
   "scripts/e2e/lib/upgrade-survivor/config-parking.mjs!",
+  "scripts/e2e/lib/upgrade-survivor/custom-plugin-siblings.mjs!",
   // Capture runs in the container; sanitization runs only on the trusted host.
   "scripts/e2e/lib/upgrade-survivor/diagnostics.mjs!",
   "scripts/upgrade-survivor-diagnostics.mjs!",
@@ -118,7 +120,10 @@ const repositoryScriptEntries = [
   "scripts/e2e/lib/upgrade-survivor/mobile-pairing-client.mts!",
   "scripts/e2e/lib/upgrade-survivor/watchos-direct-node.mjs!",
   "scripts/embedded-run-abort-leak.ts!",
+  "scripts/embedded-run-liveness-leak.ts!",
   "scripts/fixtures/packed-plugin-sdk-type-smoke.ts!",
+  // Generates the native browser page scripts from their UI source modules.
+  "scripts/generate-browser-inspect-script-swift.mts!",
   // CI executes screenshot evidence from the workflow-owned harness copy.
   "scripts/ios-screenshot-evidence.mjs!",
   "scripts/ios-release-cut.ts!",
@@ -243,11 +248,15 @@ const rootEntries = [
   "scripts/openclaw-cross-os-release-checks.ts!",
   "scripts/release-plan-producer-core.mts!",
   "scripts/release-plan-producer.mts!",
+  "scripts/full-release-publication-observations.mts!",
   // Spawned by the agent concurrency benchmark; no static import edge exists.
   "scripts/bench-agent-concurrency-worker.ts!",
   // Spawned by the durable task registry churn benchmark in a fresh GC-enabled process.
   "scripts/bench-task-registry-sqlite-worker.ts!",
   "scripts/bench-sqlite-reliability.ts!",
+  "scripts/bench-cron-session-reaper.ts!",
+  // docs/reference/test/performance.md invokes this standalone comparison harness.
+  "scripts/bench-workspace-computation.ts!",
   // Docker/manual E2E executables and their nested assertion/probe entrypoints.
   "scripts/e2e/*.{js,mjs,ts}!",
   "scripts/e2e/lib/**/{assertions,probe,mock-server}.{js,mjs,ts}!",
@@ -298,6 +307,8 @@ const rootEntries = [
   "apps/android/app/src/main/assets/katex/renderer.js!",
   "apps/linux/ui/main.js!",
   "apps/linux/ui/quickchat.js!",
+  // The native window-chrome owner injects this script through Rust include_str!.
+  "apps/linux/ui/window-chrome.js!",
   "scripts/qa/render-maturity-docs.ts!",
   bundledPluginFile("telegram", "src/audit.ts", "!"),
   bundledPluginFile("telegram", "src/token.ts", "!"),
@@ -910,10 +921,14 @@ const config = {
       "src/profile-evidence-sharding.ts!",
     ]),
     [`${BUNDLED_PLUGIN_ROOT_DIR}/senseaudio`]: bundledPluginWorkspace(),
-    [`${BUNDLED_PLUGIN_ROOT_DIR}/slack`]: bundledPluginWorkspace([
-      // The vendor integrity test executes this verifier by path.
-      "scripts/verify-official-skills.mjs!",
-    ]),
+    [`${BUNDLED_PLUGIN_ROOT_DIR}/slack`]: {
+      ...bundledPluginWorkspace([
+        // The vendor integrity test executes this verifier by path.
+        "scripts/verify-official-skills.mjs!",
+      ]),
+      // @slack/bolt loads Socket Mode, whose Undici 7 peer must be provided by the plugin.
+      ignoreDependencies: [...bundledPluginIgnoredRuntimeDependencies, "undici"],
+    },
     [`${BUNDLED_PLUGIN_ROOT_DIR}/tavily`]: bundledPluginWorkspace(),
     [`${BUNDLED_PLUGIN_ROOT_DIR}/tencent`]: bundledPluginWorkspace(),
     [`${BUNDLED_PLUGIN_ROOT_DIR}/vllm`]: bundledPluginWorkspace(),

@@ -6,6 +6,7 @@ import {
   executeSqliteQueryTakeFirstSync,
   getNodeSqliteKysely,
   runSqliteImmediateTransactionSync,
+  sqliteStringSet,
   withOpenClawAgentDatabaseAsync,
 } from "openclaw/plugin-sdk/sqlite-runtime";
 
@@ -246,16 +247,14 @@ function maintainStandingIntentLifecycle(db: DatabaseSync, nowMs: number): void 
       .where("expires_at", ">", nowMs)
       .whereRef("fire_count", "<", "max_fires"),
   ).rows;
-  for (const row of fired) {
-    if (!shouldRearm(row, nowMs)) {
-      continue;
-    }
+  const readyIds = fired.filter((row) => shouldRearm(row, nowMs)).map((row) => row.id);
+  if (readyIds.length > 0) {
     executeSqliteQuerySync(
       db,
       kysely
         .updateTable("standing_intents")
         .set({ status: "armed" })
-        .where("id", "=", row.id)
+        .where("id", "in", sqliteStringSet(readyIds))
         .where("status", "=", "fired"),
     );
   }
@@ -522,16 +521,12 @@ export async function matchStandingIntents(params: {
         cursor = lastCandidate
           ? { createdAt: lastCandidate.created_at, id: lastCandidate.id }
           : cursor;
-        for (const candidate of candidates) {
+        for (const current of candidates) {
           if (fired.length >= INTENT_INJECTION_MAX_COUNT) {
             break;
           }
-          const current = executeSqliteQueryTakeFirstSync(
-            db,
-            kysely.selectFrom("standing_intents").selectAll().where("id", "=", candidate.id),
-          );
+          // This write transaction's page stays current: firing only changes the selected row.
           if (
-            !current ||
             !readKnownCreatorSender(current.creator_sender) ||
             !canFire(current, nowMs) ||
             !scopesMatch(current, channelScopes, storedSenderScope) ||
