@@ -108,10 +108,36 @@ export function withAbortedPartialPersistenceWarning(
   return warning ? { ...error, message: `${error.message} ${warning}` } : error;
 }
 
+type QueuedCollectorAbortOutcome = Result<
+  { aborted: boolean; runIds: string[]; warning?: string },
+  ErrorShape
+>;
+
+function withQueuedCollectorPersistenceWarning(
+  outcome: QueuedCollectorAbortOutcome,
+  failed: boolean,
+): QueuedCollectorAbortOutcome {
+  if (!failed) {
+    return outcome;
+  }
+  return outcome.ok
+    ? {
+        ok: true,
+        value: { ...outcome.value, warning: ABORTED_PARTIAL_PERSISTENCE_WARNING },
+      }
+    : {
+        ok: false,
+        error: withAbortedPartialPersistenceWarning(
+          outcome.error,
+          ABORTED_PARTIAL_PERSISTENCE_WARNING,
+        ),
+      };
+}
+
 /** Queued collectors retain scheduler ownership while Gateway admission is still pending. */
 export function abortQueuedCollectorSession(
   params: Omit<ChatSessionAbortParams, "ops"> & { runId?: string },
-): Promise<Result<{ aborted: boolean; runIds: string[] }, ErrorShape>> | undefined {
+): Promise<QueuedCollectorAbortOutcome> | undefined {
   const entry = getLatestLiveSubagentRunByChildSessionKey(params.sessionKey);
   if (
     !entry ||
@@ -296,7 +322,10 @@ export function abortQueuedCollectorSession(
       // after later owner failures; the transcript writer still fences the session.
       if (sessionAbort?.ok) {
         try {
-          await sessionAbort.value.plan.finish(sessionAbort.value.result);
+          const partialPersistenceFailed = await sessionAbort.value.plan.finish(
+            sessionAbort.value.result,
+          );
+          outcome = withQueuedCollectorPersistenceWarning(outcome, partialPersistenceFailed);
         } catch (error) {
           if (outcome.ok) {
             outcome = {

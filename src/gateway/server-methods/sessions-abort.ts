@@ -435,6 +435,7 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
             ok: true,
             abortedRunId: result.value.runIds[0] ?? null,
             status: result.value.aborted ? "aborted" : "no-active-run",
+            ...(result.value.warning ? { warning: result.value.warning } : {}),
           },
           undefined,
           undefined,
