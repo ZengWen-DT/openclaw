@@ -48,6 +48,49 @@ afterEach(() => {
 });
 
 describe("verifyReplacementHealthy", () => {
+  it("bounds container inspection by the remaining verification timeout", async () => {
+    const containers = runningContainers();
+
+    await verifyReplacementHealthy({
+      containers,
+      record,
+      attemptId,
+      fetchImpl: vi.fn(async () => new Response(null, { status: 200 })),
+      now: () => 0,
+      sleep: async () => {},
+      checkpoint: vi.fn(),
+      timeoutMs: 1_000,
+      pollMs: 2_000,
+      context: "create",
+    });
+
+    expect(containers.inspect).toHaveBeenCalledWith("docker", "openclaw-acme", {
+      timeoutMs: 1_000,
+    });
+  });
+
+  it("rejects a healthy probe that completes at the deadline", async () => {
+    let now = 0;
+
+    await expect(
+      verifyReplacementHealthy({
+        containers: runningContainers(),
+        record,
+        attemptId,
+        fetchImpl: vi.fn(async () => {
+          now = 1_000;
+          return new Response(null, { status: 200 });
+        }),
+        now: () => now,
+        sleep: async () => {},
+        checkpoint: vi.fn(),
+        timeoutMs: 1_000,
+        pollMs: 2_000,
+        context: "upgrade",
+      }),
+    ).rejects.toThrow("Replacement cell container did not become healthy after upgrade.");
+  });
+
   it("clamps polling to the remaining verification timeout", async () => {
     const sleeps: number[] = [];
     let now = 0;

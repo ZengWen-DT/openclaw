@@ -464,13 +464,16 @@ export async function verifyReplacementHealthy(params: {
   context: "upgrade" | "restore" | "create";
 }): Promise<void> {
   const deadline = params.now() + params.timeoutMs;
+  const remainingMs = () => deadline - params.now();
   for (;;) {
-    if (params.now() >= deadline) {
-      throw new Error(`Replacement cell container did not become healthy after ${params.context}.`);
+    const inspectTimeoutMs = remainingMs();
+    if (inspectTimeoutMs <= 0) {
+      break;
     }
     const replacement = await params.containers.inspect(
       params.record.runtime,
       params.record.containerName,
+      { timeoutMs: inspectTimeoutMs },
     );
     if (
       replacement.kind !== "ok" ||
@@ -483,25 +486,26 @@ export async function verifyReplacementHealthy(params: {
           : `Replacement cell container could not be verified after ${params.context}.`,
       );
     }
-    const remainingProbeMs = deadline - params.now();
-    if (remainingProbeMs <= 0) {
-      throw new Error(`Replacement cell container did not become healthy after ${params.context}.`);
+    const probeTimeoutMs = Math.min(HEALTH_TIMEOUT_MS, remainingMs());
+    if (probeTimeoutMs <= 0) {
+      break;
     }
     const health = await probeCellHealth({
       port: params.record.hostPort,
       fetchImpl: params.fetchImpl,
-      timeoutMs: Math.min(HEALTH_TIMEOUT_MS, remainingProbeMs),
+      timeoutMs: probeTimeoutMs,
     });
-    if (health.status === "ok") {
+    if (health.status === "ok" && remainingMs() > 0) {
       return;
     }
-    const remainingPollMs = deadline - params.now();
-    if (remainingPollMs <= 0) {
-      throw new Error(`Replacement cell container did not become healthy after ${params.context}.`);
+    const pollTimeoutMs = Math.min(params.pollMs, remainingMs());
+    if (pollTimeoutMs <= 0) {
+      break;
     }
     params.checkpoint();
-    await params.sleep(Math.min(params.pollMs, remainingPollMs));
+    await params.sleep(pollTimeoutMs);
   }
+  throw new Error(`Replacement cell container did not become healthy after ${params.context}.`);
 }
 
 export async function cleanupFailedCreateContainer(
