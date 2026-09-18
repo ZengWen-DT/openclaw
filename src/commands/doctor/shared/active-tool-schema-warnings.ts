@@ -1,44 +1,45 @@
 import { sanitizeForLog } from "../../../../packages/terminal-core/src/ansi.js";
-import {
-  listAgentIds,
-  resolveAgentConfig,
-  resolveAgentDir,
-  resolveAgentWorkspaceDir,
-} from "../../../agents/agent-scope.js";
-import { createOpenClawCodingTools } from "../../../agents/agent-tools.js";
-import { resolveModel } from "../../../agents/embedded-agent-runner/model.js";
-import { normalizeAgentRuntimeTools } from "../../../agents/runtime-plan/tools.js";
-import {
-  filterRuntimeCompatibleTools,
-  type RuntimeToolSchemaDiagnostic,
-} from "../../../agents/tool-schema-projection.js";
-// Doctor warnings for active tools whose schemas cannot be projected to the selected runtime.
-import { buildReadableToolsByName } from "../../../agents/tools-effective-inventory-build.js";
+import type { RuntimeToolSchemaDiagnostic } from "../../../agents/tool-schema-projection.js";
 import type { AnyAgentTool } from "../../../agents/tools/common.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { formatErrorMessage } from "../../../infra/errors.js";
-import { extractModelCompat } from "../../../plugins/provider-model-compat.js";
+import type { PluginMetadataSnapshotScopeRunner } from "../../../plugins/current-plugin-metadata-snapshot.js";
+import type { extractModelCompat } from "../../../plugins/provider-model-compat.js";
 import type { ProviderRuntimeModel } from "../../../plugins/provider-runtime-model.types.js";
-import { getPluginToolMeta } from "../../../plugins/tools.js";
-import { resolveDoctorPrimaryModelRef } from "./primary-model-ref.js";
+import { getPluginToolMeta } from "../../../plugins/tool-metadata.js";
 
-function resolveRuntimeModelContext(params: {
+type RuntimeModelContext = {
+  modelApi?: string;
+  model?: ProviderRuntimeModel;
+  modelCompat?: ReturnType<typeof extractModelCompat>;
+  modelContextWindowTokens?: number;
+};
+
+async function resolveRuntimeModelContext(params: {
   cfg: OpenClawConfig;
   agentId: string;
   agentDir: string;
   workspaceDir: string;
   provider: string;
   modelId: string;
-}): {
-  modelApi?: string;
-  model?: ProviderRuntimeModel;
-  modelCompat?: ReturnType<typeof extractModelCompat>;
-  modelContextWindowTokens?: number;
-} {
-  const model = resolveModel(params.provider, params.modelId, params.agentDir, params.cfg, {
-    agentId: params.agentId,
-    workspaceDir: params.workspaceDir,
-  }).model as ProviderRuntimeModel | undefined;
+}): Promise<RuntimeModelContext> {
+  const { resolveModelAsync } = await import("../../../agents/embedded-agent-runner/model.js");
+  const { extractModelCompat } = await import("../../../plugins/provider-model-compat.js");
+  // Doctor diagnostics resolve static model facts without publishing a live agent generation.
+  const resolution = await resolveModelAsync(
+    params.provider,
+    params.modelId,
+    params.agentDir,
+    params.cfg,
+    {
+      modelIdSource: "selected",
+      agentId: params.agentId,
+      workspaceDir: params.workspaceDir,
+      skipAgentDiscovery: true,
+      allowBundledStaticCatalogFallback: true,
+    },
+  );
+  const model = resolution.model as ProviderRuntimeModel | undefined;
   if (!model) {
     return {};
   }
@@ -80,110 +81,133 @@ function readPluginId(tool: AnyAgentTool | undefined): string | undefined {
 }
 
 /** Collect per-agent warnings for active plugin tools rejected by runtime schema projection. */
-export function collectActiveToolSchemaProjectionWarnings(params: {
+export async function collectActiveToolSchemaProjectionWarnings(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
-}): string[] {
+  runWithPluginMetadataSnapshot?: PluginMetadataSnapshotScopeRunner;
+}): Promise<string[]> {
   if (params.cfg.plugins?.enabled === false) {
     return [];
   }
+
+  // Disabled plugin diagnostics must not load the agent/tool runtime.
+  const { listAgentIds, resolveAgentConfig, resolveAgentDir, resolveAgentWorkspaceDir } =
+    await import("../../../agents/agent-scope.js");
+  const { createOpenClawCodingTools } = await import("../../../agents/agent-tools.js");
+  const { normalizeAgentRuntimeTools } = await import("../../../agents/runtime-plan/tools.js");
+  const { filterRuntimeCompatibleTools } =
+    await import("../../../agents/tool-schema-projection.js");
+  const { buildReadableToolsByName } =
+    await import("../../../agents/tools-effective-inventory-build.js");
+  const { resolveDoctorPrimaryModelRef } = await import("./primary-model-ref.js");
 
   const env = params.env ?? process.env;
   const warnings: string[] = [];
   for (const agentId of listAgentIds(params.cfg)) {
     const agentConfig = resolveAgentConfig(params.cfg, agentId);
-    const modelRef = resolveDoctorPrimaryModelRef(params.cfg, agentConfig?.model);
     const agentDir = resolveAgentDir(params.cfg, agentId, env);
     const workspaceDir = resolveAgentWorkspaceDir(params.cfg, agentId, env);
-    let runtimeModelContext: ReturnType<typeof resolveRuntimeModelContext> = {};
-    try {
-      runtimeModelContext = resolveRuntimeModelContext({
-        cfg: params.cfg,
-        agentId,
-        agentDir,
-        workspaceDir,
-        provider: modelRef.provider,
-        modelId: modelRef.model,
-      });
-    } catch (error) {
-      warnings.push(
-        sanitizeForLog(
-          `- agents.${agentId}: active tool schema validation could not resolve the runtime model context (${formatErrorMessage(error)}). Fix provider/model loading errors before relying on assistant tool startup.`,
-        ),
-      );
-    }
-    let tools: ReturnType<typeof createOpenClawCodingTools>;
-    try {
-      tools = createOpenClawCodingTools({
-        agentId,
-        agentDir,
-        workspaceDir,
-        config: params.cfg,
-        modelProvider: modelRef.provider,
-        modelId: modelRef.model,
-        modelApi: runtimeModelContext.modelApi,
-        modelCompat: runtimeModelContext.modelCompat,
-        modelContextWindowTokens: runtimeModelContext.modelContextWindowTokens,
-        allowGatewaySubagentBinding: true,
-        toolPolicyAuditLogLevel: "debug",
-      });
-    } catch (error) {
-      warnings.push(
-        sanitizeForLog(
-          `- agents.${agentId}: active tool schema validation could not load the runtime tool set (${formatErrorMessage(error)}). Fix plugin loading errors before relying on assistant tool startup.`,
-        ),
-      );
-      continue;
-    }
+    const collectForAgent = async (): Promise<string[]> => {
+      const agentWarnings: string[] = [];
+      const modelRef = resolveDoctorPrimaryModelRef(params.cfg, agentConfig?.model);
+      let runtimeModelContext: RuntimeModelContext = {};
+      try {
+        runtimeModelContext = await resolveRuntimeModelContext({
+          cfg: params.cfg,
+          agentId,
+          agentDir,
+          workspaceDir,
+          provider: modelRef.provider,
+          modelId: modelRef.model,
+        });
+      } catch (error) {
+        agentWarnings.push(
+          sanitizeForLog(
+            `- agents.${agentId}: active tool schema validation could not resolve the runtime model context (${formatErrorMessage(error)}). Fix provider/model loading errors before relying on assistant tool startup.`,
+          ),
+        );
+      }
+      let tools: ReturnType<typeof createOpenClawCodingTools>;
+      try {
+        tools = createOpenClawCodingTools({
+          agentId,
+          agentDir,
+          workspaceDir,
+          config: params.cfg,
+          modelProvider: modelRef.provider,
+          modelId: modelRef.model,
+          modelApi: runtimeModelContext.modelApi,
+          modelCompat: runtimeModelContext.modelCompat,
+          modelContextWindowTokens: runtimeModelContext.modelContextWindowTokens,
+          allowGatewaySubagentBinding: true,
+        });
+      } catch (error) {
+        agentWarnings.push(
+          sanitizeForLog(
+            `- agents.${agentId}: active tool schema validation could not load the runtime tool set (${formatErrorMessage(error)}). Fix plugin loading errors before relying on assistant tool startup.`,
+          ),
+        );
+        return agentWarnings;
+      }
 
-    const rawToolsByName = buildReadableToolsByName(tools);
-    const preNormalizationDiagnostics: RuntimeToolSchemaDiagnostic[] = [];
-    let normalizedTools: typeof tools;
-    try {
-      normalizedTools = normalizeAgentRuntimeTools({
-        tools,
-        provider: modelRef.provider,
-        config: params.cfg,
-        workspaceDir,
-        env,
-        modelId: modelRef.model,
-        modelApi: runtimeModelContext.modelApi,
-        model: runtimeModelContext.model,
-        onPreNormalizationSchemaDiagnostics: (diagnostics) =>
-          preNormalizationDiagnostics.push(...diagnostics),
-      });
-    } catch (error) {
-      warnings.push(
-        sanitizeForLog(
-          `- agents.${agentId}: active tool schema validation could not normalize the runtime tool set (${formatErrorMessage(error)}). Fix provider/plugin loading errors before relying on assistant tool startup.`,
-        ),
-      );
-      continue;
-    }
-    for (const diagnostic of preNormalizationDiagnostics) {
-      const rawTool = rawToolsByName.get(diagnostic.toolName);
-      const pluginId = readPluginId(rawTool);
-      warnings.push(
-        formatDiagnostic({
-          agentId,
-          diagnostic,
-          ...(pluginId ? { pluginId } : {}),
-        }),
-      );
-    }
-    const projection = filterRuntimeCompatibleTools(normalizedTools);
-    for (const diagnostic of projection.diagnostics) {
-      const tool = readToolByIndex(normalizedTools, diagnostic.toolIndex);
-      const rawTool = rawToolsByName.get(diagnostic.toolName);
-      const pluginId = readPluginId(tool) ?? readPluginId(rawTool);
-      warnings.push(
-        formatDiagnostic({
-          agentId,
-          diagnostic,
-          ...(pluginId ? { pluginId } : {}),
-        }),
-      );
-    }
+      const rawToolsByName = buildReadableToolsByName(tools);
+      const preNormalizationDiagnostics: RuntimeToolSchemaDiagnostic[] = [];
+      let normalizedTools: typeof tools;
+      try {
+        normalizedTools = normalizeAgentRuntimeTools({
+          tools,
+          provider: modelRef.provider,
+          config: params.cfg,
+          workspaceDir,
+          env,
+          modelId: modelRef.model,
+          modelApi: runtimeModelContext.modelApi,
+          model: runtimeModelContext.model,
+          onPreNormalizationSchemaDiagnostics: (diagnostics) =>
+            preNormalizationDiagnostics.push(...diagnostics),
+        });
+      } catch (error) {
+        agentWarnings.push(
+          sanitizeForLog(
+            `- agents.${agentId}: active tool schema validation could not normalize the runtime tool set (${formatErrorMessage(error)}). Fix provider/plugin loading errors before relying on assistant tool startup.`,
+          ),
+        );
+        return agentWarnings;
+      }
+      for (const diagnostic of preNormalizationDiagnostics) {
+        const rawTool = rawToolsByName.get(diagnostic.toolName);
+        const pluginId = readPluginId(rawTool);
+        agentWarnings.push(
+          formatDiagnostic({
+            agentId,
+            diagnostic,
+            ...(pluginId ? { pluginId } : {}),
+          }),
+        );
+      }
+      const projection = filterRuntimeCompatibleTools(normalizedTools);
+      for (const diagnostic of projection.diagnostics) {
+        const tool = readToolByIndex(normalizedTools, diagnostic.toolIndex);
+        const rawTool = rawToolsByName.get(diagnostic.toolName);
+        const pluginId = readPluginId(tool) ?? readPluginId(rawTool);
+        agentWarnings.push(
+          formatDiagnostic({
+            agentId,
+            diagnostic,
+            ...(pluginId ? { pluginId } : {}),
+          }),
+        );
+      }
+      return agentWarnings;
+    };
+    warnings.push(
+      ...(params.runWithPluginMetadataSnapshot
+        ? await params.runWithPluginMetadataSnapshot(
+            { config: params.cfg, workspaceDir },
+            collectForAgent,
+          )
+        : await collectForAgent()),
+    );
   }
 
   return warnings;

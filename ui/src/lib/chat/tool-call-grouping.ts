@@ -4,71 +4,148 @@
  */
 
 import { t } from "../../i18n/index.ts";
+import type { ToolCard } from "./chat-types.ts";
 import {
+  resolveToolCallFileOperations,
   resolveToolCallKind,
   resolveToolCallTargetPaths,
   type ToolCallKind,
 } from "./tool-call-view.ts";
+import { resolveToolDisplay } from "./tool-display.ts";
+
+export type ToolCardGroup<Card = ToolCard> = {
+  card: Card;
+  children: ToolCardGroup<Card>[];
+};
+
+/** Preserve recorded nesting without guessing relationships from names or arrival order. */
+export function groupToolCards<
+  Card extends Pick<ToolCard, "callId" | "runId" | "parentToolCallId">,
+>(cards: readonly Card[]): ToolCardGroup<Card>[] {
+  const groups = cards.map((card): ToolCardGroup<Card> => ({ card, children: [] }));
+  const identities = new Map<string, ToolCardGroup<Card> | null>();
+  for (const group of groups) {
+    const { runId, callId } = group.card;
+    if (runId && callId) {
+      const key = JSON.stringify([runId, callId]);
+      identities.set(key, identities.has(key) ? null : group);
+    }
+  }
+
+  const parents = new Map<ToolCardGroup<Card>, ToolCardGroup<Card>>();
+  for (const group of groups) {
+    const { runId, callId, parentToolCallId } = group.card;
+    if (
+      !runId ||
+      !parentToolCallId ||
+      parentToolCallId === callId ||
+      (callId && identities.get(JSON.stringify([runId, callId])) !== group)
+    ) {
+      continue;
+    }
+    const parent = identities.get(JSON.stringify([runId, parentToolCallId]));
+    if (parent) {
+      parents.set(group, parent);
+    }
+  }
+
+  // Break every cycle member out as a root before linking children. Iterative
+  // traversal also keeps malformed or deeply nested transcripts stack-safe.
+  const visited = new Set<ToolCardGroup<Card>>();
+  for (const group of groups) {
+    const path: ToolCardGroup<Card>[] = [];
+    let current: ToolCardGroup<Card> | undefined = group;
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      path.push(current);
+      current = parents.get(current);
+    }
+    const cycleStart = current ? path.indexOf(current) : -1;
+    if (cycleStart >= 0) {
+      for (const member of path.slice(cycleStart)) {
+        parents.delete(member);
+      }
+    }
+  }
+
+  const roots: ToolCardGroup<Card>[] = [];
+  for (const group of groups) {
+    const parent = parents.get(group);
+    (parent ? parent.children : roots).push(group);
+  }
+  return roots;
+}
 
 type ToolGroupSummaryInput = {
   name: string;
   args?: unknown;
+  callId?: string;
+  runId?: string;
+  parentToolCallId?: string;
   isError?: boolean;
+};
+
+type FileActivity = "read" | "edit" | "write" | "delete";
+
+type FileActivityCounts = {
+  calls: number;
+  paths: Set<string>;
 };
 
 type GroupCounts = {
   commands: number;
-  readPaths: Set<string>;
-  reads: number;
-  editPaths: Set<string>;
-  edits: number;
-  writePaths: Set<string>;
-  writes: number;
+  files: Record<FileActivity, FileActivityCounts>;
   searches: number;
   fetches: number;
   otherNames: Set<string>;
   others: number;
-  failed: number;
 };
+
+function countFiles(counts: GroupCounts, activity: FileActivity, paths: readonly string[]): void {
+  const target = counts.files[activity];
+  target.calls += 1;
+  for (const path of paths) {
+    if (path.trim()) {
+      target.paths.add(path.trim());
+    }
+  }
+}
 
 function countCard(counts: GroupCounts, card: ToolGroupSummaryInput): void {
   const kind: ToolCallKind = resolveToolCallKind(card.name, card.args);
-  const pathKeys = resolveToolCallTargetPaths(card.name, card.args);
-  const addPaths = (target: Set<string>) => {
-    for (const path of pathKeys) {
-      if (path.trim()) {
-        target.add(path.trim());
-      }
+  const fileOperations = resolveToolCallFileOperations(card.name, card.args);
+  if (fileOperations) {
+    for (const { operation, path } of fileOperations) {
+      const activity = operation === "add" ? "write" : operation === "delete" ? "delete" : "edit";
+      countFiles(counts, activity, [path]);
     }
-  };
-  switch (kind) {
-    case "command":
-      counts.commands += 1;
-      break;
-    case "read":
-      counts.reads += 1;
-      addPaths(counts.readPaths);
-      break;
-    case "edit":
-      counts.edits += 1;
-      addPaths(counts.editPaths);
-      break;
-    case "write":
-      counts.writes += 1;
-      addPaths(counts.writePaths);
-      break;
-    case "search":
-      counts.searches += 1;
-      break;
-    case "fetch":
-      counts.fetches += 1;
-      break;
-    default:
-      counts.others += 1;
-      counts.otherNames.add(card.name);
-  }
-  if (card.isError) {
-    counts.failed += 1;
+  } else {
+    const pathKeys = resolveToolCallTargetPaths(card.name, card.args);
+    switch (kind) {
+      case "command":
+        counts.commands += 1;
+        break;
+      case "read":
+        countFiles(counts, "read", pathKeys);
+        break;
+      case "edit":
+        countFiles(counts, "edit", pathKeys);
+        break;
+      case "write":
+        countFiles(counts, "write", pathKeys);
+        break;
+      case "search":
+        counts.searches += 1;
+        break;
+      case "fetch":
+        counts.fetches += 1;
+        break;
+      default:
+        counts.others += 1;
+        // Same display label as the standalone row, so a collapsed rollup of
+        // e.g. heartbeat_respond reads "Heartbeat Respond" in both shapes.
+        counts.otherNames.add(resolveToolDisplay({ name: card.name, args: card.args }).label);
+    }
   }
 }
 
@@ -87,20 +164,30 @@ function fileCount(calls: number, paths: Set<string>): number {
 export function summarizeToolGroup(cards: readonly ToolGroupSummaryInput[]): string {
   const counts: GroupCounts = {
     commands: 0,
-    readPaths: new Set(),
-    reads: 0,
-    editPaths: new Set(),
-    edits: 0,
-    writePaths: new Set(),
-    writes: 0,
+    files: {
+      read: { calls: 0, paths: new Set() },
+      edit: { calls: 0, paths: new Set() },
+      write: { calls: 0, paths: new Set() },
+      delete: { calls: 0, paths: new Set() },
+    },
     searches: 0,
     fetches: 0,
     otherNames: new Set(),
     others: 0,
-    failed: 0,
   };
+  const wrappers = new Set<ToolGroupSummaryInput>();
+  const pending = groupToolCards(cards);
+  for (const { card, children } of pending) {
+    if (children.length) {
+      wrappers.add(card);
+      pending.push(...children);
+    }
+  }
+  // Match the visible hierarchy; failed wrappers retain their own outcome.
   for (const card of cards) {
-    countCard(counts, card);
+    if (card.isError || !wrappers.has(card)) {
+      countCard(counts, card);
+    }
   }
 
   const segments: string[] = [];
@@ -113,32 +200,23 @@ export function summarizeToolGroup(cards: readonly ToolGroupSummaryInput[]): str
       ),
     );
   }
-  if (counts.reads > 0) {
-    segments.push(
-      countLabel(
-        fileCount(counts.reads, counts.readPaths),
-        "chat.toolCards.group.readsOne",
-        "chat.toolCards.group.readsMany",
-      ),
-    );
-  }
-  if (counts.edits > 0) {
-    segments.push(
-      countLabel(
-        fileCount(counts.edits, counts.editPaths),
-        "chat.toolCards.group.editsOne",
-        "chat.toolCards.group.editsMany",
-      ),
-    );
-  }
-  if (counts.writes > 0) {
-    segments.push(
-      countLabel(
-        fileCount(counts.writes, counts.writePaths),
-        "chat.toolCards.group.writesOne",
-        "chat.toolCards.group.writesMany",
-      ),
-    );
+  const fileLabels = [
+    ["read", "readsOne", "readsMany"],
+    ["edit", "editsOne", "editsMany"],
+    ["write", "writesOne", "writesMany"],
+    ["delete", "deletesOne", "deletesMany"],
+  ] as const;
+  for (const [activity, one, many] of fileLabels) {
+    const { calls, paths } = counts.files[activity];
+    if (calls > 0) {
+      segments.push(
+        countLabel(
+          fileCount(calls, paths),
+          `chat.toolCards.group.${one}`,
+          `chat.toolCards.group.${many}`,
+        ),
+      );
+    }
   }
   if (counts.searches > 0) {
     segments.push(
@@ -184,14 +262,5 @@ export function summarizeToolGroup(cards: readonly ToolGroupSummaryInput[]): str
     );
   }
   const label = segments.join(", ");
-  const capitalized = label.charAt(0).toUpperCase() + label.slice(1);
-  if (counts.failed === 0) {
-    return capitalized;
-  }
-  const failureLabel = countLabel(
-    counts.failed,
-    "chat.toolCards.group.failedOne",
-    "chat.toolCards.group.failedMany",
-  );
-  return `${capitalized} · ${failureLabel}`;
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }

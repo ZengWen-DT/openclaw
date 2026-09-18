@@ -7,6 +7,7 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { createSlackLookupClient } from "./client.js";
 import { collectSlackCursorPages } from "./cursor-pages.js";
+import { resolveWorkspaceQualifiedSlackTarget } from "./target-parsing.js";
 
 export type SlackUserLookup = {
   id: string;
@@ -138,14 +139,21 @@ export async function resolveSlackUserAllowlist(params: {
   entries: string[];
   client?: WebClient;
 }): Promise<SlackUserResolution[]> {
+  const workspaceResolved = params.entries.map((input) =>
+    resolveWorkspaceQualifiedSlackTarget(input, "user"),
+  );
+  const lookupEntries = params.entries.filter((_, index) => !workspaceResolved[index]);
+  if (lookupEntries.length === 0) {
+    return workspaceResolved.filter((entry) => entry !== undefined);
+  }
   const client = params.client ?? createSlackLookupClient(params.token);
   const users = await listSlackUsers(client);
-  return resolveDirectoryAllowlistEntries<
+  const resolved = resolveDirectoryAllowlistEntries<
     { id?: string; name?: string; email?: string },
     SlackUserLookup,
     SlackUserResolution
   >({
-    entries: params.entries,
+    entries: lookupEntries,
     lookup: users,
     parseInput: parseSlackUserInput,
     findById: (lookup, id) => lookup.find((user) => user.id === id),
@@ -181,4 +189,6 @@ export async function resolveSlackUserAllowlist(params: {
     },
     buildUnresolved: (input) => ({ input, resolved: false }),
   });
+  let resolvedIndex = 0;
+  return workspaceResolved.map((entry) => entry ?? resolved[resolvedIndex++]!);
 }

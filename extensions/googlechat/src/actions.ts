@@ -5,22 +5,13 @@ import {
   readStringParam,
 } from "openclaw/plugin-sdk/channel-actions";
 import type { ChannelMessageActionAdapter } from "openclaw/plugin-sdk/channel-contract";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { extractToolSend } from "openclaw/plugin-sdk/tool-send";
-import { listEnabledGoogleChatAccounts, resolveGoogleChatAccount } from "./accounts.js";
+import { resolveGoogleChatAccount } from "./accounts.js";
 import { sendGoogleChatMessage } from "./api.js";
+import { describeGoogleChatMessageTool } from "./message-tool-api.js";
 import { resolveGoogleChatOutboundSpace } from "./targets.js";
 
 const providerId = "googlechat";
-
-function listEnabledAccounts(cfg: OpenClawConfig) {
-  return listEnabledGoogleChatAccounts(cfg).filter(
-    (account) =>
-      account.enabled &&
-      account.credentialSource !== "none" &&
-      account.tokenStatus !== "configured_unavailable",
-  );
-}
 
 const OUTBOUND_MEDIA_KEYS = ["media", "mediaUrl", "path", "filePath", "fileUrl"] as const;
 const STRUCTURED_ATTACHMENT_MEDIA_KEYS = [...OUTBOUND_MEDIA_KEYS, "url"] as const;
@@ -47,25 +38,19 @@ function hasGoogleChatOutboundAttachment(params: Record<string, unknown>): boole
 }
 
 export const googlechatMessageActions: ChannelMessageActionAdapter = {
-  describeMessageTool: ({ cfg, accountId }) => {
-    const accounts = accountId
-      ? [resolveGoogleChatAccount({ cfg, accountId })].filter(
-          (account) =>
-            account.enabled &&
-            account.credentialSource !== "none" &&
-            account.tokenStatus !== "configured_unavailable",
-        )
-      : listEnabledAccounts(cfg);
-    if (accounts.length === 0) {
-      return null;
-    }
-    return { actions: ["send"] };
-  },
+  describeMessageTool: describeGoogleChatMessageTool,
   supportsAction: ({ action }) => action === "send",
   extractToolSend: ({ args }) => {
     return extractToolSend(args, "sendMessage");
   },
-  handleAction: async ({ action, params, cfg, accountId }) => {
+  handleAction: async ({
+    action,
+    params,
+    cfg,
+    accountId,
+    assertDirectAdapterHandoff,
+    onPlatformSendDispatch,
+  }) => {
     if (action === "upload-file") {
       throw new Error(
         "Google Chat outbound attachments require user OAuth and are not supported by this service-account channel.",
@@ -94,13 +79,19 @@ export const googlechatMessageActions: ChannelMessageActionAdapter = {
         allowEmpty: true,
       });
       const threadId = readStringParam(params, "threadId") ?? readStringParam(params, "replyTo");
-      const space = await resolveGoogleChatOutboundSpace({ account, target: to });
+      const space = await resolveGoogleChatOutboundSpace({
+        account,
+        target: to,
+        assertDirectAdapterHandoff,
+      });
 
       const sent = await sendGoogleChatMessage({
         account,
         space,
         text: content,
         thread: threadId ?? undefined,
+        assertDirectAdapterHandoff,
+        onPlatformSendDispatch,
       });
       return jsonResult({ ok: true, to: space, ...sent });
     }

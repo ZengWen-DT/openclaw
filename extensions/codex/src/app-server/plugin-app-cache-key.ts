@@ -4,19 +4,22 @@
  */
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { OPENCLAW_VERSION } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { OPENCLAW_VERSION } from "openclaw/plugin-sdk/agent-harness-registration";
 import { readPluginPackageVersion } from "openclaw/plugin-sdk/extension-shared";
 import {
   buildCodexAppInventoryCacheKey,
   type CodexAppInventoryCacheKeyInput,
 } from "./app-inventory-cache.js";
-import { resolveCodexAppServerHomeDir } from "./auth-bridge.js";
-import type { CodexAppServerRuntimeIdentity } from "./client.js";
 import {
+  resolveCodexAppServerHomeDir,
+  resolveCodexAppServerLocalHomeDir,
   resolveCodexAppServerUserHomeDir,
-  type CodexAppServerRuntimeOptions,
-  type CodexAppServerStartOptions,
-} from "./config.js";
+} from "./auth-start-options.js";
+import type { CodexAppServerRuntimeIdentity } from "./client.js";
+import type {
+  CodexAppServerRuntimeOptions,
+  CodexAppServerStartOptions,
+} from "./config-contracts.js";
 
 const require = createRequire(import.meta.url);
 const CODEX_PLUGIN_VERSION = readPluginPackageVersion({ require });
@@ -29,6 +32,7 @@ type CodexPluginAppCacheKeyParams = Omit<
   appServer: Pick<CodexAppServerRuntimeOptions, "start">;
   agentDir?: string;
   runtimeIdentity?: CodexAppServerRuntimeIdentity;
+  desktopGenerationFingerprint?: string;
 };
 
 /** Builds the full app inventory cache key for Codex plugin/app discovery. */
@@ -43,7 +47,12 @@ export function buildCodexPluginAppCacheKey(params: CodexPluginAppCacheKeyParams
       accountId: params.accountId,
       envApiKeyFingerprint: params.envApiKeyFingerprint,
       appServerVersion: params.appServerVersion ?? params.runtimeIdentity?.serverVersion,
-      runtimeIdentity: params.runtimeIdentity,
+      runtimeIdentity: params.desktopGenerationFingerprint
+        ? {
+            ...params.runtimeIdentity,
+            desktopGeneration: params.desktopGenerationFingerprint,
+          }
+        : params.runtimeIdentity,
     },
     OPENCLAW_VERSION,
     CODEX_PLUGIN_VERSION,
@@ -103,7 +112,7 @@ function resolveCodexAppServerConnectionHome(
   if (start.homeScope === "user") {
     return resolveCodexAppServerUserHomeDir(process.env);
   }
-  return agentDir ? resolveCodexAppServerHomeDir(agentDir) : null;
+  return agentDir ? resolveCodexAppServerLocalHomeDir(start, agentDir) : null;
 }
 
 /** Serializes app-server endpoint identity, including credential fingerprints. */

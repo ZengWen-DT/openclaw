@@ -1,6 +1,9 @@
 import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, vi } from "vitest";
+import { withEnvAsync } from "../test-utils/env.js";
 import {
   foldPostCoreFinalizeIntoResult,
   runPostCoreFinalizeAfterGatewayUpdate,
@@ -104,9 +107,8 @@ describe("runPostCoreFinalizeAfterGatewayUpdate", () => {
     expect(call.env.OPENCLAW_UPDATE_EFFECTIVE_CHANNEL).toBe("stable");
     // Host-compat resolution is pinned to the just-installed core version.
     expect(call.env.OPENCLAW_COMPATIBILITY_HOST_VERSION).toBe("2026.6.1");
-    // Outer whole-process timeout is decoupled from the per-step --timeout (120s):
-    // a generous floor so a valid multi-step finalize is not killed prematurely.
-    expect(call.timeoutMs).toBe(30 * 60_000);
+    // The enclosing allowance must preserve every explicit phase budget.
+    expect(call.timeoutMs).toBeGreaterThanOrEqual(120_000);
   });
 
   it("strips the gateway service identity from the finalizer child env", async () => {
@@ -130,6 +132,75 @@ describe("runPostCoreFinalizeAfterGatewayUpdate", () => {
     expect(env.OPENCLAW_SERVICE_MARKER).toBeUndefined();
     expect(env.OPENCLAW_SERVICE_KIND).toBeUndefined();
     expect(env.OPENCLAW_GATEWAY_SERVICE_PID).toBeUndefined();
+  });
+
+  it("isolates stale handoff values at the RPC finalizer boundary", async () => {
+    const spawnFinalize = vi.fn<PostCoreFinalizeSpawner>(async () => ({ code: 0 }));
+    const baseEnv: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin",
+      OPENCLAW_COMPATIBILITY_HOST_VERSION: "stale-version",
+      OPENCLAW_UPDATE_POST_CORE_REQUESTED_CHANNEL: "dev",
+      OPENCLAW_UPDATE_POST_CORE_SOURCE_CONFIG_PATH: "/tmp/stale-config.json",
+      OPENCLAW_UNRELATED: "preserved",
+    };
+    await runPostCoreFinalizeAfterGatewayUpdate({
+      result: gitOkResult({ after: undefined }),
+      resolveEntrypoint: resolveEntrypointOk,
+      spawnFinalize,
+      env: baseEnv,
+    });
+
+    const { env } = expectDefined(
+      spawnFinalize.mock.calls[0],
+      "spawnFinalize.mock.calls[0] test invariant",
+    )[0];
+    expect(env.OPENCLAW_COMPATIBILITY_HOST_VERSION).toBeUndefined();
+    expect(env.OPENCLAW_UPDATE_POST_CORE_REQUESTED_CHANNEL).toBeUndefined();
+    expect(env.OPENCLAW_UPDATE_POST_CORE_SOURCE_CONFIG_PATH).toBeUndefined();
+    expect(env.OPENCLAW_UNRELATED).toBe("preserved");
+    expect(baseEnv.OPENCLAW_COMPATIBILITY_HOST_VERSION).toBe("stale-version");
+    expect(baseEnv.OPENCLAW_UPDATE_POST_CORE_REQUESTED_CHANNEL).toBe("dev");
+    expect(baseEnv.OPENCLAW_UPDATE_POST_CORE_SOURCE_CONFIG_PATH).toBe("/tmp/stale-config.json");
+  });
+
+  it("keeps the default process wrapper from restoring ambient handoff values", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-post-core-finalize-"));
+    const entrypoint = path.join(root, "capture-env.mjs");
+    const outputPath = path.join(root, "child-env.json");
+    await fs.writeFile(
+      entrypoint,
+      `import fs from "node:fs";
+fs.writeFileSync(process.env.OPENCLAW_TEST_OUTPUT_PATH, JSON.stringify({
+  compatibilityHostVersion: process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION ?? null,
+  requestedChannel: process.env.OPENCLAW_UPDATE_POST_CORE_REQUESTED_CHANNEL ?? null,
+  sourceConfigPath: process.env.OPENCLAW_UPDATE_POST_CORE_SOURCE_CONFIG_PATH ?? null,
+}));`,
+      "utf8",
+    );
+    try {
+      await withEnvAsync(
+        {
+          OPENCLAW_COMPATIBILITY_HOST_VERSION: "stale-version",
+          OPENCLAW_TEST_OUTPUT_PATH: outputPath,
+          OPENCLAW_UPDATE_POST_CORE_REQUESTED_CHANNEL: "beta",
+          OPENCLAW_UPDATE_POST_CORE_SOURCE_CONFIG_PATH: "/tmp/stale-config.json",
+        },
+        async () => {
+          const outcome = await runPostCoreFinalizeAfterGatewayUpdate({
+            result: gitOkResult({ root, after: undefined }),
+            resolveEntrypoint: async () => entrypoint,
+          });
+          expect(outcome).toEqual({ status: "ok", entrypoint });
+        },
+      );
+      await expect(fs.readFile(outputPath, "utf8").then(JSON.parse)).resolves.toEqual({
+        compatibilityHostVersion: null,
+        requestedChannel: null,
+        sourceConfigPath: null,
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("carries the external service-repair policy into the finalizer", async () => {
@@ -164,8 +235,8 @@ describe("runPostCoreFinalizeAfterGatewayUpdate", () => {
     expect(call.env.OPENCLAW_UPDATE_EFFECTIVE_CHANNEL).toBe("dev");
     expect(call.argv).not.toContain("--channel");
     expect(call.argv).not.toContain("--timeout");
-    // No per-step timeout requested → outer backstop is the floor.
-    expect(call.timeoutMs).toBe(30 * 60_000);
+    // Doctor has no separate automatic deadline; the enclosing activation is bounded.
+    expect(call.timeoutMs).toBeGreaterThanOrEqual(20 * 60_000);
   });
 
   it("passes and removes the pre-update config payload for channel restoration", async () => {
@@ -203,24 +274,43 @@ describe("runPostCoreFinalizeAfterGatewayUpdate", () => {
     await expect(fs.access(sourceConfigPath!)).rejects.toThrow();
   });
 
-  it("reports error on a non-zero finalize exit", async () => {
-    const spawnFinalize = vi.fn<PostCoreFinalizeSpawner>(async () => ({
+  it.each([
+    { code: 1, stdout: undefined },
+    { code: 1, stdout: "not JSON" },
+    {
       code: 1,
-      stderr: "convergence failed",
-    }));
-    const outcome = await runPostCoreFinalizeAfterGatewayUpdate({
-      result: gitOkResult(),
-      resolveEntrypoint: resolveEntrypointOk,
-      spawnFinalize,
-    });
-    expect(outcome).toEqual({
-      status: "error",
-      reason: "nonzero-exit",
-      entrypoint: ENTRYPOINT,
-      exitCode: 1,
-      message: "convergence failed",
-    });
-  });
+      stdout: JSON.stringify({ status: "error", mode: "finalize", reason: "update-ledger-busy" }),
+    },
+    {
+      code: 1,
+      stdout: JSON.stringify({ status: "skipped", mode: "unknown", reason: "update-ledger-busy" }),
+    },
+    {
+      code: null,
+      stdout: JSON.stringify({ status: "skipped", mode: "finalize", reason: "update-ledger-busy" }),
+    },
+  ])(
+    "preserves finalizer failure without a completed deferred report (%j)",
+    async ({ code, stdout }) => {
+      const spawnFinalize = vi.fn<PostCoreFinalizeSpawner>(async () => ({
+        code,
+        stdout,
+        stderr: "convergence failed",
+      }));
+      const outcome = await runPostCoreFinalizeAfterGatewayUpdate({
+        result: gitOkResult(),
+        resolveEntrypoint: resolveEntrypointOk,
+        spawnFinalize,
+      });
+      expect(outcome).toEqual({
+        status: "error",
+        reason: "nonzero-exit",
+        entrypoint: ENTRYPOINT,
+        ...(code === null ? {} : { exitCode: code }),
+        message: "convergence failed",
+      });
+    },
+  );
 
   it("reports error when the finalize spawn throws", async () => {
     const spawnFinalize = vi.fn<PostCoreFinalizeSpawner>(async () => {

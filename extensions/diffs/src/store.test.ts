@@ -257,18 +257,94 @@ describe("DiffArtifactStore", () => {
     expect(cleanupSpy).toHaveBeenCalled();
   });
 
-  it("removes only old rowless temp directories without reading legacy metadata", async () => {
-    const oldDir = path.join(rootDir, "a".repeat(20));
-    const recentDir = path.join(rootDir, "b".repeat(20));
-    await fs.mkdir(oldDir, { recursive: true });
-    await fs.mkdir(recentDir, { recursive: true });
+  it("looks up only old orphan candidates while preserving live files and the age boundary", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const now = new Date("2026-09-13T12:00:00Z");
+    vi.setSystemTime(now);
+    const day = 24 * 60 * 60 * 1_000;
+    const directories = [
+      { id: "a".repeat(20), age: day + 1_000, live: false },
+      { id: "b".repeat(20), age: 1_000, live: false },
+      { id: "c".repeat(20), age: day, live: false },
+      { id: "d".repeat(20), age: day + 1_000, live: true },
+      { id: "e".repeat(20), age: 1_000, live: true },
+    ];
+    for (const directory of directories) {
+      const dir = path.join(rootDir, directory.id);
+      await fs.mkdir(dir, { recursive: true });
+      const time = new Date(now.getTime() - directory.age);
+      await fs.utimes(dir, time, time);
+      if (directory.live) {
+        await blobStore.register(directory.id, new Uint8Array(), {
+          version: 1,
+          kind: "rendered_file",
+          format: "png",
+        });
+      }
+    }
+    const lookup = vi.spyOn(blobStore, "lookup");
+    try {
+      await store.cleanupExpired();
+
+      await expect(fs.stat(path.join(rootDir, "a".repeat(20)))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      for (const id of ["b", "c", "d", "e"]) {
+        await expect(fs.stat(path.join(rootDir, id.repeat(20)))).resolves.toMatchObject({});
+      }
+      expect(lookup.mock.calls.length).toBeGreaterThan(0);
+      expect(lookup.mock.calls.length).toBeLessThanOrEqual(2);
+    } finally {
+      lookup.mockRestore();
+    }
+  });
+
+  it("retains an old directory registered while its age is being checked", async () => {
+    const id = "f".repeat(20);
+    const dir = path.join(rootDir, id);
+    await fs.mkdir(dir, { recursive: true });
     const oldTime = new Date(Date.now() - 25 * 60 * 60 * 1_000);
-    await fs.utimes(oldDir, oldTime, oldTime);
+    await fs.utimes(dir, oldTime, oldTime);
+    const stat = vi.spyOn(fs, "stat").mockImplementationOnce(async () => {
+      await blobStore.register(id, new Uint8Array(), {
+        version: 1,
+        kind: "rendered_file",
+        format: "png",
+      });
+      return await fs.lstat(dir);
+    });
+    try {
+      await store.cleanupExpired();
+    } finally {
+      stat.mockRestore();
+    }
+
+    await expect(fs.stat(dir)).resolves.toMatchObject({});
+    await expect(blobStore.lookup(id)).resolves.toMatchObject({ key: id });
+  });
+
+  it("preserves a rendering file after its blob expires until rendering completes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const now = new Date("2026-09-13T12:00:00Z");
+    vi.setSystemTime(now);
+    const schedule = vi.spyOn(store, "scheduleCleanup").mockImplementation(() => undefined);
+    let artifact: Awaited<ReturnType<DiffArtifactStore["createStandaloneFileArtifact"]>>;
+    try {
+      artifact = await store.createStandaloneFileArtifact({ format: "png", ttlMs: 1_000 });
+    } finally {
+      schedule.mockRestore();
+    }
+    await fs.writeFile(artifact.filePath, "rendering");
+    const oldTime = new Date(now.getTime() - 25 * 60 * 60 * 1_000);
+    await fs.utimes(path.dirname(artifact.filePath), oldTime, oldTime);
+    vi.setSystemTime(new Date(now.getTime() + 2_000));
 
     await store.cleanupExpired();
 
-    await expect(fs.stat(oldDir)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(fs.stat(recentDir)).resolves.toMatchObject({});
+    await expect(blobStore.lookup(artifact.id)).resolves.toBeUndefined();
+    await expect(fs.readFile(artifact.filePath, "utf8")).resolves.toBe("rendering");
+    await expect(store.completeFileArtifact(artifact.id)).rejects.toThrow();
+    await expect(fs.stat(artifact.filePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("throttles cleanup sweeps across repeated artifact creation", async () => {
@@ -310,6 +386,7 @@ describe("DiffArtifactStore", () => {
 });
 
 describe("createDiffsHttpHandler", () => {
+  const missingViewerPath = "/plugins/diffs/view/not-a-real-id/not-a-real-token";
   let store: DiffArtifactStore;
   let cleanupRootDir: () => Promise<void>;
 
@@ -331,6 +408,7 @@ describe("createDiffsHttpHandler", () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     await cleanupRootDir();
   });
 
@@ -487,7 +565,31 @@ describe("createDiffsHttpHandler", () => {
     },
   );
 
-  it("rate-limits repeated remote misses", async () => {
+  it.each([
+    ["127.0.0.1", 200],
+    ["127.0.0.2", 200],
+    ["127.255.255.254", 200],
+    ["::1", 200],
+    ["::ffff:127.0.0.2", 200],
+    ["128.0.0.1", 404],
+  ] as const)("classifies viewer client address %s", async (remoteAddress, expectedStatusCode) => {
+    const artifact = await createViewerArtifact(store);
+    const handler = createDiffsHttpHandler({ store, allowRemoteViewer: false });
+    const res = createMockServerResponse();
+
+    await handler(
+      localReq({
+        method: "GET",
+        url: artifact.viewerPath,
+        remoteAddress,
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(expectedStatusCode);
+  });
+
+  it("allows the at-capacity remote miss and blocks the next request", async () => {
     const handler = createDiffsHttpHandler({ store, allowRemoteViewer: true });
 
     for (let i = 0; i < 40; i++) {
@@ -495,7 +597,7 @@ describe("createDiffsHttpHandler", () => {
       await handler(
         remoteReq({
           method: "GET",
-          url: "/plugins/diffs/view/aaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          url: missingViewerPath,
         }),
         miss,
       );
@@ -506,11 +608,48 @@ describe("createDiffsHttpHandler", () => {
     await handler(
       remoteReq({
         method: "GET",
-        url: "/plugins/diffs/view/aaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        url: missingViewerPath,
       }),
       limited,
     );
     expect(limited.statusCode).toBe(429);
+  });
+
+  it("slides the remote failure window across the original window boundary", async () => {
+    vi.useFakeTimers();
+    const startedAt = new Date("2026-08-19T12:00:00Z").getTime();
+    vi.setSystemTime(startedAt);
+    const handler = createDiffsHttpHandler({ store, allowRemoteViewer: true });
+
+    const recordMisses = async (count: number) => {
+      for (let i = 0; i < count; i++) {
+        const miss = createMockServerResponse();
+        await handler(remoteReq({ method: "GET", url: missingViewerPath }), miss);
+        expect(miss.statusCode).toBe(404);
+      }
+    };
+
+    await recordMisses(20);
+    vi.setSystemTime(startedAt + 59_000);
+    await recordMisses(19);
+    vi.setSystemTime(startedAt + 61_000);
+    await recordMisses(1);
+    vi.setSystemTime(startedAt + 118_000);
+    await recordMisses(20);
+
+    const limited = createMockServerResponse();
+    await handler(remoteReq({ method: "GET", url: missingViewerPath }), limited);
+    expect(limited.statusCode).toBe(429);
+  });
+
+  it("keeps loopback viewer requests outside the remote failure limiter", async () => {
+    const handler = createDiffsHttpHandler({ store, allowRemoteViewer: true });
+
+    for (let i = 0; i < 41; i++) {
+      const miss = createMockServerResponse();
+      await handler(localReq({ method: "GET", url: missingViewerPath }), miss);
+      expect(miss.statusCode).toBe(404);
+    }
   });
 });
 
@@ -527,11 +666,12 @@ function localReq(input: {
   method: string;
   url: string;
   headers?: Record<string, string>;
+  remoteAddress?: string;
 }): IncomingMessage {
   return {
     ...input,
     headers: input.headers ?? {},
-    socket: { remoteAddress: "127.0.0.1" },
+    socket: { remoteAddress: input.remoteAddress ?? "127.0.0.1" },
   } as unknown as IncomingMessage;
 }
 

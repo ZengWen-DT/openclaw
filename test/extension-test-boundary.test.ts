@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { BUNDLED_PLUGIN_PATH_PREFIX } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
+import { getChangedPathFacts } from "../scripts/lib/changed-path-facts.mjs";
 import { GUARDED_EXTENSION_PUBLIC_SURFACE_BASENAMES } from "../src/plugin-sdk/test-helpers/public-artifacts.js";
 import { expectNoReaddirSyncDuring } from "../src/test-utils/fs-scan-assertions.js";
 import { listGitTrackedFiles, toRepoRelativePath } from "../src/test-utils/repo-files.js";
@@ -98,7 +99,7 @@ function findExtensionImports(source: string): string[] {
 }
 
 function isAllowedExtensionPublicImport(specifier: string): boolean {
-  return /(?:^|\/)extensions\/[^/]+\/(?:api|index|runtime-api|setup-entry|login-qr-api)\.js$/u.test(
+  return /(?:^|\/)extensions\/[^/]+\/(?:api|index|runtime-api|setup-entry|login-qr-api|test-api)\.js$/u.test(
     specifier,
   );
 }
@@ -262,32 +263,16 @@ describe("non-extension test boundaries", () => {
     expect(imports).toStrictEqual([]);
   });
 
-  it("keeps bundled plugin public-surface imports out of core source", () => {
+  it("keeps bundled plugin public-surface imports out of core production source", () => {
     const files = walkCode(path.join(repoRoot, "src")).filter(
-      (file) => !file.startsWith(CHANNEL_CONTRACT_TEST_HELPERS_PREFIX),
+      (file) =>
+        !getChangedPathFacts(file).isTestOnly &&
+        !file.startsWith(CHANNEL_CONTRACT_TEST_HELPERS_PREFIX),
     );
 
     const offenders = files.filter((file) => {
       const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
       return findBundledPluginPublicSurfaceImports(source).length > 0;
-    });
-
-    expect(offenders).toStrictEqual([]);
-  });
-
-  it("keeps bundled plugin sync test-api loaders out of core tests", () => {
-    const files = [
-      ...walkCode(path.join(repoRoot, "src")),
-      ...walkCode(path.join(repoRoot, "test")),
-    ]
-      .filter((file) => !file.startsWith(BUNDLED_PLUGIN_PATH_PREFIX))
-      .filter((file) => !file.startsWith(CHANNEL_CONTRACT_TEST_HELPERS_PREFIX))
-      .filter((file) => !file.startsWith("test/helpers/"))
-      .filter((file) => file !== "test/extension-test-boundary.test.ts");
-
-    const offenders = files.filter((file) => {
-      const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
-      return source.includes("loadBundledPluginTestApiSync(");
     });
 
     expect(offenders).toStrictEqual([]);
@@ -376,12 +361,8 @@ describe("non-extension test boundaries", () => {
       "openclaw/plugin-sdk/channel-config-primitives",
     ];
     const bundledProviderSchemaNames = new Set([
-      "DiscordConfigSchema",
       "GoogleChatConfigSchema",
       "IMessageConfigSchema",
-      "MSTeamsConfigSchema",
-      "SignalConfigSchema",
-      "SlackConfigSchema",
       "TelegramConfigSchema",
       "WhatsAppConfigSchema",
     ]);

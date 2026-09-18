@@ -30,9 +30,15 @@ const mocks = vi.hoisted(() => {
     normalizeMediaProviderId: vi.fn((provider: string) => provider.trim().toLowerCase()),
     buildMediaUnderstandingRegistry: vi.fn(() => new Map()),
     getMediaUnderstandingProvider: vi.fn(),
-    readLocalFileSafely: vi.fn(async () => ({ buffer: Buffer.from("image") })),
     describeImageWithModel: vi.fn(async () => ({ text: "generic image ok", model: "vision" })),
     convertHeicToJpeg: vi.fn(async () => Buffer.from("jpeg-normalized")),
+    optimizeImageDescriptionInput: vi.fn(
+      async (params: { buffer: Buffer; fileName?: string; mime?: string }) => ({
+        buffer: Buffer.concat([Buffer.from("optimized:"), params.buffer]),
+        fileName: params.fileName,
+        mime: params.mime,
+      }),
+    ),
     runCapability: vi.fn(),
     cleanup,
     getBuffer,
@@ -57,10 +63,6 @@ vi.mock("./provider-registry.js", () => ({
   getMediaUnderstandingProvider: mocks.getMediaUnderstandingProvider,
 }));
 
-vi.mock("../infra/fs-safe.js", () => ({
-  readLocalFileSafely: mocks.readLocalFileSafely,
-}));
-
 vi.mock("./image-runtime.js", () => ({
   describeImageWithModel: mocks.describeImageWithModel,
 }));
@@ -68,6 +70,13 @@ vi.mock("./image-runtime.js", () => ({
 vi.mock("../media/media-services.js", () => ({
   convertHeicToJpeg: mocks.convertHeicToJpeg,
 }));
+
+vi.mock("./image-input-normalize.js", async () => {
+  const actual = await vi.importActual<typeof import("./image-input-normalize.js")>(
+    "./image-input-normalize.js",
+  );
+  return { ...actual, optimizeImageDescriptionInput: mocks.optimizeImageDescriptionInput };
+});
 
 function requireRunCapabilityRequest(): unknown {
   // File API tests verify the normalized request handed to runCapability, not
@@ -91,12 +100,18 @@ describe("media-understanding runtime", () => {
     mocks.normalizeMediaProviderId.mockReset();
     mocks.buildMediaUnderstandingRegistry.mockReset();
     mocks.getMediaUnderstandingProvider.mockReset();
-    mocks.readLocalFileSafely.mockReset();
-    mocks.readLocalFileSafely.mockResolvedValue({ buffer: Buffer.from("image") });
     mocks.describeImageWithModel.mockReset();
     mocks.describeImageWithModel.mockResolvedValue({ text: "generic image ok", model: "vision" });
     mocks.convertHeicToJpeg.mockReset();
     mocks.convertHeicToJpeg.mockResolvedValue(Buffer.from("jpeg-normalized"));
+    mocks.optimizeImageDescriptionInput.mockClear();
+    mocks.optimizeImageDescriptionInput.mockImplementation(
+      async (params: { buffer: Buffer; fileName?: string; mime?: string }) => ({
+        buffer: Buffer.concat([Buffer.from("optimized:"), params.buffer]),
+        fileName: params.fileName,
+        mime: params.mime,
+      }),
+    );
     mocks.runCapability.mockReset();
     mocks.cleanup.mockReset();
     mocks.cleanup.mockResolvedValue(undefined);
@@ -135,7 +150,14 @@ describe("media-understanding runtime", () => {
       provider: undefined,
       model: undefined,
       output: undefined,
-      decision: { capability: "image", outcome: "disabled", attachments: [] },
+      decision: {
+        capability: "image",
+        outcome: "disabled",
+        attachments: [],
+        attachmentDispositions: { 0: { kind: "capability-disabled" } },
+        attachmentProcessing: { 0: "omitted" },
+        nativeVisionActive: false,
+      },
     });
 
     expect(mocks.buildProviderRegistry).not.toHaveBeenCalled();
@@ -261,13 +283,11 @@ describe("media-understanding runtime", () => {
     });
 
     expect(mocks.normalizeMediaAttachments).toHaveBeenCalledWith({
-      MediaUrl: "https://httpbin.org/image/png",
-      MediaType: "image/*",
+      media: [{ url: "https://httpbin.org/image/png", contentType: "image/*" }],
     });
     expect(requireRunCapabilityRequest()).toMatchObject({
       ctx: {
-        MediaUrl: "https://httpbin.org/image/png",
-        MediaType: "image/*",
+        media: [{ url: "https://httpbin.org/image/png", contentType: "image/*" }],
       },
     });
   });
@@ -293,12 +313,11 @@ describe("media-understanding runtime", () => {
     });
 
     expect(mocks.normalizeMediaAttachments).toHaveBeenCalledWith({
-      MediaUrl: mediaUrl,
-      MediaType: "video/mp4",
+      media: [{ url: mediaUrl, contentType: "video/mp4" }],
     });
     expect(requireRunCapabilityRequest()).toMatchObject({
       capability: "image",
-      ctx: { MediaUrl: mediaUrl, MediaType: "video/mp4" },
+      ctx: { media: [{ url: mediaUrl, contentType: "video/mp4" }] },
       media,
     });
   });
@@ -359,8 +378,7 @@ describe("media-understanding runtime", () => {
     });
 
     expect(mocks.normalizeMediaAttachments).toHaveBeenCalledWith({
-      MediaPath: "/tmp/sample.jpg",
-      MediaType: "image/jpeg",
+      media: [{ path: "/tmp/sample.jpg", contentType: "image/jpeg" }],
       SessionKey: "agent:main:telegram:dm:123",
       Provider: "telegram",
       Surface: "telegram",
@@ -396,11 +414,12 @@ describe("media-understanding runtime", () => {
     });
 
     expect(mocks.normalizeMediaAttachments).toHaveBeenCalledWith({
-      MediaUrl: "https://example.com/photo.png",
-      MediaType: "image/png",
+      media: [{ url: "https://example.com/photo.png", contentType: "image/png" }],
     });
     expect(requireRunCapabilityRequest()).toMatchObject({
-      ctx: { MediaUrl: "https://example.com/photo.png", MediaType: "image/png" },
+      ctx: {
+        media: [{ url: "https://example.com/photo.png", contentType: "image/png" }],
+      },
       media,
     });
   });
@@ -504,8 +523,7 @@ describe("media-understanding runtime", () => {
         },
       },
       ctx: {
-        MediaPath: "/tmp/sample.jpg",
-        MediaType: "image/jpeg",
+        media: [{ path: "/tmp/sample.jpg", contentType: "image/jpeg" }],
       },
       attachments: cache,
       media,
@@ -521,6 +539,12 @@ describe("media-understanding runtime", () => {
   });
 
   it("uses the generic model-backed image runtime for explicit models without media hooks", async () => {
+    mocks.getBuffer.mockResolvedValue({
+      buffer: Buffer.from("image"),
+      fileName: "sample.jpg",
+      mime: "image/jpeg",
+      size: 5,
+    });
     mocks.buildProviderRegistry.mockReturnValue(
       new Map([["zai", { id: "zai", capabilities: ["image"] }]]),
     );
@@ -538,7 +562,7 @@ describe("media-understanding runtime", () => {
     ).resolves.toEqual({ text: "generic image ok", model: "vision" });
 
     expect(mocks.describeImageWithModel).toHaveBeenCalledWith({
-      buffer: Buffer.from("image"),
+      buffer: Buffer.from("optimized:image"),
       fileName: "sample.jpg",
       mime: "image/jpeg",
       provider: "zai",
@@ -551,50 +575,52 @@ describe("media-understanding runtime", () => {
     });
   });
 
-  it("prefers local image bytes over conflicting explicit MIME metadata", async () => {
-    mocks.readLocalFileSafely.mockResolvedValue({ buffer: PNG_1X1 });
-
-    await describeImageFileWithModel({
-      filePath: "/tmp/sample.jpg",
-      mime: "application/pdf",
-      provider: "zai",
-      model: "glm-4.6v",
-      prompt: "Describe it",
-      cfg: {} as OpenClawConfig,
-      agentDir: "/tmp/agent",
-    });
-
-    expect(mocks.describeImageWithModel).toHaveBeenCalledWith(
-      expect.objectContaining({
-        buffer: PNG_1X1,
-        fileName: "sample.jpg",
-        mime: "image/png",
-      }),
-    );
-  });
-
-  it("normalizes local HEIC explicit image descriptions before provider execution", async () => {
-    mocks.readLocalFileSafely.mockResolvedValue({ buffer: Buffer.from("heic-source") });
-
-    await describeImageFileWithModel({
-      filePath: "/tmp/sample.bin",
+  it.each([
+    {
+      name: "HEIC",
       mime: "image/heic; charset=binary",
-      provider: "zai",
-      model: "glm-4.6v",
-      prompt: "Describe it",
-      cfg: {} as OpenClawConfig,
-      agentDir: "/tmp/agent",
-    });
-
-    expect(mocks.convertHeicToJpeg).toHaveBeenCalledWith(Buffer.from("heic-source"));
-    expect(mocks.describeImageWithModel).toHaveBeenCalledWith(
-      expect.objectContaining({
-        buffer: Buffer.from("jpeg-normalized"),
+      bytes: Buffer.from("heic-source"),
+    },
+    {
+      name: "HEIC sequence",
+      mime: "image/heic-sequence",
+      bytes: Buffer.from("000000186674797068657663000000000000000000000000", "hex"),
+    },
+    {
+      name: "HEIF sequence",
+      mime: "image/heif-sequence",
+      bytes: Buffer.from("00000018667479706d736631000000000000000000000000", "hex"),
+    },
+  ])(
+    "normalizes local $name explicit image descriptions before provider execution",
+    async (testCase) => {
+      mocks.getBuffer.mockResolvedValue({
+        buffer: testCase.bytes,
         fileName: "sample.bin",
-        mime: "image/jpeg",
-      }),
-    );
-  });
+        mime: testCase.mime,
+        size: testCase.bytes.length,
+      });
+
+      await describeImageFileWithModel({
+        filePath: "/tmp/sample.bin",
+        mime: testCase.mime,
+        provider: "zai",
+        model: "glm-4.6v",
+        prompt: "Describe it",
+        cfg: {} as OpenClawConfig,
+        agentDir: "/tmp/agent",
+      });
+
+      expect(mocks.convertHeicToJpeg).toHaveBeenCalledWith(testCase.bytes);
+      expect(mocks.describeImageWithModel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          buffer: Buffer.from("optimized:jpeg-normalized"),
+          fileName: "sample.bin",
+          mime: "image/jpeg",
+        }),
+      );
+    },
+  );
 
   it("preserves fetched metadata for explicit model URL inputs", async () => {
     await describeImageFileWithModel({
@@ -610,7 +636,7 @@ describe("media-understanding runtime", () => {
 
     expect(mocks.describeImageWithModel).toHaveBeenCalledWith(
       expect.objectContaining({
-        buffer: Buffer.from("remote-image"),
+        buffer: Buffer.from("optimized:remote-image"),
         fileName: "photo.png",
         mime: "image/png",
       }),
@@ -639,7 +665,7 @@ describe("media-understanding runtime", () => {
 
     expect(mocks.describeImageWithModel).toHaveBeenCalledWith(
       expect.objectContaining({
-        buffer: PNG_1X1,
+        buffer: Buffer.concat([Buffer.from("optimized:"), PNG_1X1]),
         fileName: "photo.jpg",
         mime: "image/png",
       }),
@@ -672,14 +698,12 @@ describe("media-understanding runtime", () => {
       }),
     ).resolves.toEqual({ text: "generic image ok", model: "vision" });
 
-    expect(mocks.readLocalFileSafely).not.toHaveBeenCalled();
     expect(mocks.normalizeMediaAttachments).toHaveBeenCalledWith({
-      MediaUrl: "https://httpbin.org/image/png",
-      MediaType: "image/*",
+      media: [{ url: "https://httpbin.org/image/png", contentType: "image/*" }],
     });
     expect(mocks.createMediaAttachmentCache).toHaveBeenCalledWith(
       [{ index: 0, url: "https://httpbin.org/image/png", mime: "image/png" }],
-      { ssrfPolicy: undefined },
+      { localPathRoots: undefined, ssrfPolicy: undefined },
     );
     expect(mocks.getBuffer).toHaveBeenCalledWith({
       attachmentIndex: 0,
@@ -688,7 +712,7 @@ describe("media-understanding runtime", () => {
     });
     expect(mocks.describeImageWithModel).toHaveBeenCalledWith(
       expect.objectContaining({
-        buffer: Buffer.from("remote-png"),
+        buffer: Buffer.from("optimized:remote-png"),
         fileName: "png",
         mime: "image/png",
         provider: "zai",
@@ -730,7 +754,12 @@ describe("media-understanding runtime", () => {
     mocks.buildProviderRegistry.mockReturnValue(
       new Map([["gemini", { id: "gemini", capabilities: ["image"], describeImage }]]),
     );
-    mocks.readLocalFileSafely.mockResolvedValue({ buffer: Buffer.from("image-bytes") });
+    mocks.getBuffer.mockResolvedValue({
+      buffer: Buffer.from("image-bytes"),
+      fileName: "sample.jpg",
+      mime: "image/jpeg",
+      size: 11,
+    });
 
     await expect(
       describeImageFileWithModel({
@@ -766,7 +795,7 @@ describe("media-understanding runtime", () => {
       )[0],
       "(describeImage.mock.calls as unknown as Array<\n        [\n          {\n            buffer?: Buffer;\n            fileName?: string;\n            mime?: string;\n            provider?: string;\n            model?: string;\n            prompt?: string;\n            agentDir?: string;\n          },\n        ]\n      >)[0] test invariant",
     );
-    expect(describeImageOptions?.buffer).toEqual(Buffer.from("image-bytes"));
+    expect(describeImageOptions?.buffer).toEqual(Buffer.from("optimized:image-bytes"));
     expect(describeImageOptions?.fileName).toBe("sample.jpg");
     expect(describeImageOptions?.mime).toBe("image/jpeg");
     expect(describeImageOptions?.provider).toBe("gemini");
@@ -776,7 +805,12 @@ describe("media-understanding runtime", () => {
   });
 
   it("resolves the agent directory when direct image description only names an agent", async () => {
-    mocks.readLocalFileSafely.mockResolvedValue({ buffer: Buffer.from("image-bytes") });
+    mocks.getBuffer.mockResolvedValue({
+      buffer: Buffer.from("image-bytes"),
+      fileName: "sample.jpg",
+      mime: "image/jpeg",
+      size: 11,
+    });
 
     await describeImageFileWithModel({
       filePath: "/tmp/sample.jpg",

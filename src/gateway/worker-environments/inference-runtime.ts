@@ -1,3 +1,5 @@
+import { normalizeCodexResponsesBaseUrlForOpenAISdk } from "@openclaw/ai/transports";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { TSchema } from "typebox";
 import type {
   WorkerInferenceContext,
@@ -5,25 +7,16 @@ import type {
   WorkerInferenceStartParams,
   WorkerInferenceTerminalOutcome,
 } from "../../../packages/gateway-protocol/src/schema/worker-inference.js";
-import {
-  resolveAgentConfig,
-  resolveAgentDir,
-  resolveAgentEffectiveModelPrimary,
-  resolveAgentWorkspaceDir,
-  resolveDefaultAgentDir,
-  resolveDefaultAgentId,
-} from "../../agents/agent-scope.js";
-import { resolveSessionAuthProfileOverride } from "../../agents/auth-profiles/session-override.js";
-import { ensureAuthProfileStore } from "../../agents/auth-profiles/store.js";
+import { resolveAgentDir, resolveAgentWorkspaceDir } from "../../agents/agent-scope.js";
+import { resolveSessionAuthSelection } from "../../agents/auth-profiles/session-override.js";
 import { applyExtraParamsToAgent } from "../../agents/embedded-agent-runner/extra-params.js";
 import { resolveModelAsync } from "../../agents/embedded-agent-runner/model.js";
 import { wrapStreamFnWithDiagnosticModelCallEvents } from "../../agents/embedded-agent-runner/run/attempt.model-diagnostic-events.js";
-import { resolveEmbeddedAgentStreamFn } from "../../agents/embedded-agent-runner/stream-resolution.js";
+import { resolveEmbeddedAgentStream } from "../../agents/embedded-agent-runner/stream-resolution.js";
 import { mapThinkingLevel } from "../../agents/embedded-agent-runner/utils.js";
 import { resolveAgentHarnessPolicy } from "../../agents/harness/policy.js";
 import type { ModelCatalogEntry } from "../../agents/model-catalog.types.js";
 import { splitTrailingAuthProfile } from "../../agents/model-ref-profile.js";
-import { modelCatalogLogicalKey } from "../../agents/model-selection-shared.js";
 import {
   buildModelAliasIndex,
   normalizeProviderId,
@@ -34,20 +27,19 @@ import {
   createModelVisibilityPolicy,
   RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
 } from "../../agents/model-visibility-policy.js";
-import { listOpenAIAuthProfileProvidersForAgentRuntime } from "../../agents/openai-routing.js";
-import { acquireAgentRunPreparedModelRuntime } from "../../agents/prepared-model-runtime.js";
-import { resolveProviderModelRouteAuthRequirement } from "../../agents/provider-model-route-auth.js";
+import { resolveModelCatalogIdentityKey } from "../../agents/openai-model-routes.js";
+import {
+  acquireAgentRunPreparedModelRuntime,
+  type PreparedModelRuntimeSnapshot,
+} from "../../agents/prepared-model-runtime.js";
 import { projectProviderModelRouteConfig } from "../../agents/provider-model-route.js";
 import { registerProviderStreamForModel } from "../../agents/provider-stream.js";
-import {
-  prepareSimpleCompletionModel,
-  type PreparedSimpleCompletionModel,
-} from "../../agents/simple-completion-runtime.js";
-import { bindSimpleCompletionModelResolverWorkspace } from "../../agents/simple-completion-scope.js";
-import { normalizeCodexResponsesBaseUrlForOpenAISdk } from "../../agents/simple-completion-transport.js";
-import { normalizeUsage, hasNonzeroUsage } from "../../agents/usage.js";
+import { prepareSimpleCompletionModel } from "../../agents/simple-completion-runtime.js";
+import { normalizeUsage, hasObservedModelUsage } from "../../agents/usage.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { emitAgentEventForRunContext } from "../../infra/agent-events.js";
+import { getAgentRunContext } from "../../infra/agent-run-registry.js";
 import { emitTrustedDiagnosticEvent, isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import { resolveDiagnosticModelContentCapturePolicy } from "../../infra/diagnostic-llm-content.js";
 import {
@@ -66,13 +58,16 @@ import type {
   Usage,
 } from "../../llm/types.js";
 import { resolveProviderModelRoutes } from "../../plugins/provider-model-routes.js";
+import { withPluginRuntimeGenerationScope } from "../../plugins/runtime/generation-scope.js";
 import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
+import { WORKER_PROVIDER_REPLAY_LOCAL_RETRY_MESSAGE } from "../../worker/transcript-message.js";
 import {
   projectWorkerInferenceTerminalMessage,
   type WorkerInferenceModelIdentity,
 } from "./inference-terminal-message.js";
 import { createWorkerToolCallStream } from "./inference-tool-call-stream.js";
 import { resolveWorkerSessionTarget, type ResolvedWorkerSessionTarget } from "./session-target.js";
+import { boundedWorkerError } from "./worker-error.js";
 
 type WorkerInferenceStreamEvent = WorkerInferenceEventParams["event"];
 export type WorkerInferenceExecutor = import("./inference.js").WorkerInferenceExecutor;
@@ -101,67 +96,16 @@ type WorkerInferenceRuntimeDependencies = {
   ) => WorkerInferenceSessionTarget | undefined;
   acquireRuntimeLease: typeof acquireAgentRunPreparedModelRuntime;
   resolveDefaultModel: typeof resolveDefaultModelForAgent;
-  resolveSessionAuthProfile: typeof resolveSessionAuthProfileOverride;
-  resolveAuthProfileMode: typeof resolveWorkerInferenceAuthProfileMode;
+  resolveSessionAuthSelection: typeof resolveSessionAuthSelection;
   resolveModel: typeof resolveModelAsync;
   prepareModel: typeof prepareSimpleCompletionModel;
   resolveProviderStream: typeof registerProviderStreamForModel;
-  resolveStream: typeof resolveEmbeddedAgentStreamFn;
+  resolveStream: typeof resolveEmbeddedAgentStream;
   applyStreamPolicy: typeof applyExtraParamsToAgent;
   wrapStream: typeof wrapStreamFnWithDiagnosticModelCallEvents;
   createTrace: typeof createDiagnosticTraceContextFromActiveScope;
   recordUsage: (params: WorkerInferenceUsageParams) => void;
 };
-
-function resolveWorkerInferenceAuthProfileMode(params: {
-  config: OpenClawConfig;
-  agentDir: string;
-  profileId: string;
-}): string | undefined {
-  const configuredMode = params.config.auth?.profiles?.[params.profileId]?.mode;
-  if (configuredMode) {
-    return configuredMode;
-  }
-  return ensureAuthProfileStore(params.agentDir, {
-    readOnly: true,
-    allowKeychainPrompt: false,
-    config: params.config,
-  }).profiles[params.profileId]?.type;
-}
-
-export function projectWorkerInferenceModelRouteConfig(params: {
-  config: OpenClawConfig;
-  provider: string;
-  modelId: string;
-  authMode?: string;
-}): OpenClawConfig {
-  const authRequirement = resolveProviderModelRouteAuthRequirement(params.authMode);
-  if (!authRequirement) {
-    return params.config;
-  }
-  const resolution = resolveProviderModelRoutes({
-    provider: params.provider,
-    modelId: params.modelId,
-    config: params.config,
-  });
-  if (resolution?.kind !== "routes") {
-    return params.config;
-  }
-  const route = resolution.routes.find(
-    (candidate) => candidate.authRequirement === authRequirement,
-  );
-  if (!route) {
-    return params.config;
-  }
-  // Worker placement owns the agent harness, while the gateway-owned profile
-  // owns the provider route. Keep those decisions separate or OAuth can be
-  // materialized as a public API-key endpoint and fail before the first token.
-  return projectProviderModelRouteConfig({
-    provider: params.provider,
-    config: params.config,
-    route,
-  });
-}
 
 const ERROR_MESSAGES = {
   "model-not-approved": "Model is not approved for this agent.",
@@ -178,17 +122,14 @@ const ERROR_MESSAGES = {
 function inferenceError(
   reason: Extract<WorkerInferenceTerminalOutcome, { type: "error" }>["reason"],
   usage?: Usage,
+  message: string = ERROR_MESSAGES[reason],
 ): WorkerInferenceTerminalOutcome {
   return {
     type: "error",
     reason,
-    message: ERROR_MESSAGES[reason],
+    message,
     ...(usage ? { usage: structuredClone(usage) } : {}),
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function copyTool(tool: NonNullable<WorkerInferenceContext["tools"]>[number]): Tool | undefined {
@@ -321,7 +262,7 @@ function emitWorkerInferenceUsage(params: WorkerInferenceUsageParams): void {
     return;
   }
   const usage = normalizeUsage(params.usage);
-  if (!hasNonzeroUsage(usage)) {
+  if (!hasObservedModelUsage(usage)) {
     return;
   }
   const input = usage.input ?? 0;
@@ -330,14 +271,16 @@ function emitWorkerInferenceUsage(params: WorkerInferenceUsageParams): void {
   const cacheWrite = usage.cacheWrite ?? 0;
   const promptTokens = input + cacheRead + cacheWrite;
   const total = usage.total ?? promptTokens + output;
-  const costUsd = estimateUsageCost({
-    usage,
-    cost: resolveModelCostConfig({
-      provider: params.model.provider,
-      model: params.model.id,
-      config: params.config,
-    }),
-  });
+  const costUsd =
+    usage.cost?.total ??
+    estimateUsageCost({
+      usage,
+      cost: resolveModelCostConfig({
+        provider: params.model.provider,
+        model: params.model.id,
+        config: params.config,
+      }),
+    });
   emitTrustedDiagnosticEvent({
     type: "model.usage",
     trace: freezeDiagnosticTraceContext(params.trace),
@@ -368,51 +311,25 @@ function emitWorkerInferenceUsage(params: WorkerInferenceUsageParams): void {
 
 const DEFAULT_DEPENDENCIES: WorkerInferenceRuntimeDependencies = {
   now: Date.now,
-  resolveSessionTarget: (config, sessionId) => {
-    const target = resolveWorkerSessionTarget(config, sessionId);
-    if (!target) {
-      return undefined;
-    }
-    return {
-      ...target,
-      agentId: target.agentId ?? resolveDefaultAgentId(config),
-    };
-  },
+  resolveSessionTarget: resolveWorkerSessionTarget,
   acquireRuntimeLease: acquireAgentRunPreparedModelRuntime,
   resolveDefaultModel: resolveDefaultModelForAgent,
-  resolveSessionAuthProfile: resolveSessionAuthProfileOverride,
-  resolveAuthProfileMode: resolveWorkerInferenceAuthProfileMode,
+  resolveSessionAuthSelection,
   resolveModel: resolveModelAsync,
   prepareModel: prepareSimpleCompletionModel,
   resolveProviderStream: registerProviderStreamForModel,
-  resolveStream: resolveEmbeddedAgentStreamFn,
+  resolveStream: resolveEmbeddedAgentStream,
   applyStreamPolicy: applyExtraParamsToAgent,
   wrapStream: wrapStreamFnWithDiagnosticModelCallEvents,
   createTrace: createDiagnosticTraceContextFromActiveScope,
   recordUsage: emitWorkerInferenceUsage,
 };
 
-function resolveReturnedProfileSource(
-  entry: WorkerInferenceSessionTarget["sessionEntry"],
-  profileId: string | undefined,
-): "auto" | "user" | undefined {
-  if (!profileId) {
-    return undefined;
-  }
-  if (entry.authProfileOverride?.trim() !== profileId) {
-    return "auto";
-  }
-  return (
-    entry.authProfileOverrideSource ??
-    (typeof entry.authProfileOverrideCompactionCount === "number" ? "auto" : "user")
-  );
-}
-
 async function resolveApprovedModel(params: {
-  config: OpenClawConfig;
   target: WorkerInferenceSessionTarget;
   request: WorkerInferenceStartParams;
   dependencies: WorkerInferenceRuntimeDependencies;
+  runtimeSnapshot: PreparedModelRuntimeSnapshot;
 }): Promise<
   | {
       provider: string;
@@ -420,68 +337,44 @@ async function resolveApprovedModel(params: {
       config: OpenClawConfig;
       agentDir: string;
       workspaceDir: string;
-      prepared: PreparedSimpleCompletionModel;
-      release: () => void;
+      prepared: Awaited<ReturnType<typeof prepareSimpleCompletionModel>>;
     }
   | undefined
 > {
-  const { config, target, request, dependencies } = params;
+  const { target, request, dependencies, runtimeSnapshot } = params;
   const rawRef = `${request.modelRef.provider}/${request.modelRef.model}`;
-  if (splitTrailingAuthProfile(rawRef).profile) {
-    return undefined;
-  }
-  const runtimeLease = await dependencies.acquireRuntimeLease({
-    config,
-    agentId: target.agentId,
-    agentDir: resolveAgentDir(config, target.agentId),
-    inheritedAuthDir: resolveDefaultAgentDir(config),
-  });
-  const runtimeSnapshot = runtimeLease.snapshot;
-  try {
+  return await withPluginRuntimeGenerationScope(runtimeSnapshot, async () => {
     const lifecycleConfig = runtimeSnapshot.config;
     const agentDir = runtimeSnapshot.agentDir;
     const workspaceDir =
       runtimeSnapshot.workspaceDir ?? resolveAgentWorkspaceDir(lifecycleConfig, target.agentId);
     const manifestSnapshot = runtimeSnapshot.metadataSnapshot;
-    const preparedStores = runtimeSnapshot.createStores();
     const defaultModel = dependencies.resolveDefaultModel({
       cfg: lifecycleConfig,
       agentId: target.agentId,
-      manifestPlugins: manifestSnapshot.plugins,
+      manifestPlugins: manifestSnapshot,
       ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
     });
-    const agentModels = resolveAgentConfig(lifecycleConfig, target.agentId)?.models;
-    const aliasConfig = agentModels
-      ? {
-          ...lifecycleConfig,
-          agents: {
-            ...lifecycleConfig.agents,
-            defaults: {
-              ...lifecycleConfig.agents?.defaults,
-              models: { ...lifecycleConfig.agents?.defaults?.models, ...agentModels },
-            },
-          },
-        }
-      : lifecycleConfig;
     const aliasIndex = buildModelAliasIndex({
-      cfg: aliasConfig,
+      cfg: lifecycleConfig,
+      agentId: target.agentId,
       defaultProvider: defaultModel.provider,
-      manifestPlugins: manifestSnapshot.plugins,
+      manifestPlugins: manifestSnapshot,
       ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
     });
     const resolved = resolveModelRefFromString({
-      cfg: aliasConfig,
+      cfg: lifecycleConfig,
+      agentId: target.agentId,
       raw: rawRef,
       defaultProvider: defaultModel.provider,
       aliasIndex,
-      manifestPlugins: manifestSnapshot.plugins,
+      manifestPlugins: manifestSnapshot,
       ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
     });
     if (
       !resolved ||
       normalizeProviderId(resolved.ref.provider) !== normalizeProviderId(request.modelRef.provider)
     ) {
-      runtimeLease.release();
       return undefined;
     }
     const catalog = runtimeSnapshot.modelCatalog.entries;
@@ -489,31 +382,23 @@ async function resolveApprovedModel(params: {
       cfg: lifecycleConfig,
       catalog,
       defaultProvider: defaultModel.provider,
-      defaultModel: `${defaultModel.provider}/${defaultModel.model}`,
+      defaultModel,
       agentId: target.agentId,
-      manifestPlugins: manifestSnapshot.plugins,
+      manifestPlugins: manifestSnapshot,
       ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
     });
-    const resolvedKey = modelCatalogLogicalKey({
+    const resolvedKey = resolveModelCatalogIdentityKey({
       provider: resolved.ref.provider,
       id: resolved.ref.model,
     });
     // Retained refs stay approved during cold discovery.
     const known =
       policy.allowedCatalog.some(
-        (entry: ModelCatalogEntry) => resolvedKey === modelCatalogLogicalKey(entry),
+        (entry: ModelCatalogEntry) => resolvedKey === resolveModelCatalogIdentityKey(entry),
       ) || policy.retainedKeys.has(resolvedKey);
     if (!known || !policy.allows(resolved.ref)) {
-      runtimeLease.release();
       return undefined;
     }
-    const configuredDefaultProfile =
-      resolvedKey ===
-      modelCatalogLogicalKey({ provider: defaultModel.provider, id: defaultModel.model })
-        ? splitTrailingAuthProfile(
-            resolveAgentEffectiveModelPrimary(lifecycleConfig, target.agentId) ?? "",
-          ).profile
-        : undefined;
     const harnessPolicy = resolveAgentHarnessPolicy({
       provider: resolved.ref.provider,
       modelId: resolved.ref.model,
@@ -526,14 +411,12 @@ async function resolveApprovedModel(params: {
       lifecycleConfig.plugins?.entries?.codex?.enabled === true
         ? harnessPolicy.runtime
         : undefined;
-    const sessionProfileId = await dependencies.resolveSessionAuthProfile({
+    const sessionSelection = await dependencies.resolveSessionAuthSelection({
       cfg: lifecycleConfig,
       provider: resolved.ref.provider,
-      acceptedProviderIds: listOpenAIAuthProfileProvidersForAgentRuntime({
-        provider: resolved.ref.provider,
-        harnessRuntime: harnessPolicy.runtime,
-        config: lifecycleConfig,
-      }),
+      modelId: resolved.ref.model,
+      agentId: target.agentId,
+      harnessRuntime: harnessPolicy.runtime,
       agentDir,
       sessionEntry: target.sessionEntry,
       sessionStore: target.sessionStore,
@@ -541,54 +424,48 @@ async function resolveApprovedModel(params: {
       storePath: target.storePath,
       isNewSession: false,
     });
-    const sessionProfileSource = resolveReturnedProfileSource(
-      target.sessionEntry,
-      sessionProfileId,
-    );
-    const selectedProfile =
-      sessionProfileId && sessionProfileSource === "user"
-        ? { id: sessionProfileId, source: sessionProfileSource }
-        : configuredDefaultProfile
-          ? { id: configuredDefaultProfile, source: "user" as const }
-          : sessionProfileId
-            ? { id: sessionProfileId, source: sessionProfileSource }
-            : undefined;
-    const modelConfig = projectWorkerInferenceModelRouteConfig({
-      config: lifecycleConfig,
-      provider: resolved.ref.provider,
-      modelId: resolved.ref.model,
-      authMode: selectedProfile
-        ? dependencies.resolveAuthProfileMode({
-            config: lifecycleConfig,
-            agentDir,
-            profileId: selectedProfile.id,
-          })
-        : undefined,
-    });
-    const modelResolver = bindSimpleCompletionModelResolverWorkspace(
-      (provider, modelId, resolvedAgentDir, cfg, options) =>
-        dependencies.resolveModel(provider, modelId, resolvedAgentDir, cfg, {
-          ...options,
-          authStorage: preparedStores.authStorage,
-          modelRegistry: preparedStores.modelRegistry,
-          ...(agentRuntimeId ? { agentRuntimeId } : {}),
-          workspaceDir,
-        }),
-      workspaceDir,
-    );
+    const selectedProfileId = sessionSelection?.profileId;
+    const routeRequirement = sessionSelection?.routeRequirement;
+    let modelConfig = lifecycleConfig;
+    const routeResolution = routeRequirement
+      ? resolveProviderModelRoutes({
+          provider: resolved.ref.provider,
+          modelId: resolved.ref.model,
+          config: lifecycleConfig,
+        })
+      : undefined;
+    const route =
+      routeResolution?.kind === "routes"
+        ? routeResolution.routes.find((candidate) => candidate.authRequirement === routeRequirement)
+        : undefined;
+    if (route) {
+      // Worker placement owns the agent harness, while the gateway-owned profile
+      // owns the provider route. Keep those decisions separate or OAuth can be
+      // materialized as a public API-key endpoint and fail before the first token.
+      modelConfig = projectProviderModelRouteConfig({
+        provider: resolved.ref.provider,
+        config: lifecycleConfig,
+        route,
+      });
+    }
     // Route projection and credential selection are one decision. Pin even an
     // automatic profile so generic auth fallback cannot cross to another route.
     const prepared = await dependencies.prepareModel({
       cfg: modelConfig,
+      agentId: target.agentId,
       provider: resolved.ref.provider,
       modelId: resolved.ref.model,
       agentDir,
-      ...(selectedProfile ? { profileId: selectedProfile.id } : {}),
-      ...(selectedProfile ? { preferredProfile: selectedProfile.id } : {}),
-      ...(selectedProfile ? { bindAuthOwner: true } : {}),
+      modelIdSource: "selected",
+      ...(selectedProfileId ? { profileId: selectedProfileId } : {}),
+      ...(selectedProfileId ? { preferredProfile: selectedProfileId } : {}),
+      ...(selectedProfileId ? { bindAuthOwner: true } : {}),
       allowMissingApiKeyModes: ["aws-sdk"],
-      useAsyncModelResolution: true,
-      modelResolver,
+      allowBundledStaticCatalogFallback: true,
+      modelResolver: dependencies.resolveModel,
+      preparedModelRuntime: runtimeSnapshot,
+      workspaceDir,
+      ...(agentRuntimeId ? { agentRuntimeId } : {}),
     });
     return {
       provider: resolved.ref.provider,
@@ -597,12 +474,8 @@ async function resolveApprovedModel(params: {
       agentDir,
       workspaceDir,
       prepared,
-      release: runtimeLease.release,
     };
-  } catch (error) {
-    runtimeLease.release();
-    throw error;
-  }
+  });
 }
 
 export function createWorkerInferenceExecutor(overrides?: object): WorkerInferenceExecutor;
@@ -629,30 +502,46 @@ export function createWorkerInferenceExecutor(
     if (!target) {
       return inferenceError("session-not-attached");
     }
+    const runContext = getAgentRunContext(request.runId);
     const context = buildContext(request.context);
     if (!context) {
       return inferenceError("invalid-context");
     }
-    const approved = await resolveApprovedModel({
+    if (
+      splitTrailingAuthProfile(`${request.modelRef.provider}/${request.modelRef.model}`).profile
+    ) {
+      return inferenceError("model-not-approved");
+    }
+    await using runtimeLease = await dependencies.acquireRuntimeLease({
       config,
+      agentId: target.agentId,
+      agentDir: resolveAgentDir(config, target.agentId),
+    });
+    const approved = await resolveApprovedModel({
       target,
       request,
       dependencies,
+      runtimeSnapshot: runtimeLease.snapshot,
     });
     if (!approved) {
       return inferenceError("model-not-approved");
     }
-    try {
+    return await withPluginRuntimeGenerationScope(runtimeLease.snapshot, async () => {
       if ("error" in approved.prepared) {
-        return inferenceError("provider-error");
+        return inferenceError(
+          "provider-error",
+          undefined,
+          boundedWorkerError(approved.prepared.error, 256),
+        );
       }
+      const prepared = approved.prepared;
       // Keep logical identity separate from transport endpoint encoding.
       const modelIdentity: WorkerInferenceModelIdentity = {
-        api: approved.prepared.model.api,
+        api: prepared.model.api,
         provider: approved.provider,
         model: approved.model,
       };
-      const logicalModel = approved.prepared.model;
+      const logicalModel = prepared.model;
       const llmRuntime = getModelLlmRuntime(logicalModel);
       if (!llmRuntime) {
         throw new Error("Prepared worker model has no lifecycle runtime owner");
@@ -670,19 +559,17 @@ export function createWorkerInferenceExecutor(
         agentDir: approved.agentDir,
         workspaceDir: approved.workspaceDir,
       });
-      const authValue = approved.prepared.auth.apiKey;
-      const streamAgent = {
-        streamFn: dependencies.resolveStream({
-          llmRuntime,
-          currentStreamFn: llmRuntime.streamSimple,
-          ...(providerStream ? { providerStreamFn: providerStream } : {}),
-          sessionId: request.sessionId,
-          signal,
-          model: providerModel,
-          resolvedApiKey: authValue,
-          authProfileId: approved.prepared.auth.profileId,
-        }),
-      };
+      const authValue = prepared.auth.apiKey;
+      const streamAgent = dependencies.resolveStream({
+        llmRuntime,
+        currentStreamFn: llmRuntime.streamSimple,
+        ...(providerStream ? { providerStreamFn: providerStream } : {}),
+        sessionId: request.sessionId,
+        signal,
+        model: providerModel,
+        resolvedApiKey: authValue,
+        authProfileId: prepared.auth.profileId,
+      });
       const streamPolicyOptions: WorkerInferenceStartParams["options"] = {
         ...(request.options.temperature !== undefined
           ? { temperature: request.options.temperature }
@@ -757,6 +644,8 @@ export function createWorkerInferenceExecutor(
 
       const providerAbort = new AbortController();
       const providerSignal = AbortSignal.any([signal, providerAbort.signal]);
+      let currentMessage: AssistantMessage | undefined;
+      let publishedModel: string | undefined;
       try {
         const events = await stream(
           model,
@@ -768,6 +657,30 @@ export function createWorkerInferenceExecutor(
           }),
         );
         for await (const event of events) {
+          if (event.type !== "error") {
+            // Lean text deltas retain the provider's latest mutable checkpoint.
+            currentMessage =
+              event.type === "done" ? event.message : (event.partial ?? currentMessage);
+            const executingModel = currentMessage?.responseModel ?? modelIdentity.model;
+            if (
+              currentMessage &&
+              executingModel !== publishedModel &&
+              runContext?.sessionId === request.sessionId &&
+              runContext.sessionKey === target.sessionKey &&
+              (runContext.agentId === undefined || runContext.agentId === target.agentId) &&
+              executionIsCurrent()
+            ) {
+              emitAgentEventForRunContext(
+                {
+                  runId: request.runId,
+                  stream: "lifecycle",
+                  data: { phase: "model", provider: modelIdentity.provider, model: executingModel },
+                },
+                runContext,
+              );
+              publishedModel = executingModel;
+            }
+          }
           if (event.type === "done") {
             recordUsage(event.message.usage);
             if (signal.aborted || !params.isCurrent()) {
@@ -787,14 +700,31 @@ export function createWorkerInferenceExecutor(
             if (!toolCalls.matchesTerminal(event.message)) {
               return inferenceError("provider-error");
             }
-            return {
-              type: "done",
-              message: projectWorkerInferenceTerminalMessage({
-                message: event.message,
-                modelIdentity,
-                stopReason: event.reason,
-              }),
-            };
+            const terminal = projectWorkerInferenceTerminalMessage({
+              message: event.message,
+              modelIdentity,
+              stopReason: event.reason,
+            });
+            if (terminal.kind === "provider-replay-unavailable") {
+              if (isDiagnosticsEnabled(approved.config)) {
+                const { bytes, limitBytes, reason } = terminal.details;
+                emitTrustedDiagnosticEvent({
+                  type: "payload.large",
+                  surface: "worker.provider-replay",
+                  action: "rejected",
+                  bytes,
+                  limitBytes,
+                  reason,
+                  trace: freezeDiagnosticTraceContext(trace),
+                });
+              }
+              return inferenceError(
+                "provider-error",
+                event.message.usage,
+                WORKER_PROVIDER_REPLAY_LOCAL_RETRY_MESSAGE,
+              );
+            }
+            return { type: "done", message: terminal.message };
           }
           if (event.type === "error") {
             recordUsage(event.error.usage);
@@ -843,9 +773,7 @@ export function createWorkerInferenceExecutor(
       } finally {
         providerAbort.abort();
       }
-    } finally {
-      approved.release();
-    }
+    });
   };
 }
 

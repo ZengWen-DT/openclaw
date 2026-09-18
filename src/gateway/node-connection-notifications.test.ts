@@ -1,5 +1,6 @@
 // Node connection notification routing tests cover active-first delivery and fallback fanout.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import {
   disposeNodeConnectionNotifications,
   scheduleNodeConnectionNotification,
@@ -17,6 +18,7 @@ function node(
   return {
     nodeId,
     connId: `conn-${nodeId}`,
+    pairingIdentity: `identity-${nodeId}`,
     displayName: nodeId,
     platform: "darwin",
     commands: ["system.notify"],
@@ -25,9 +27,17 @@ function node(
   } as NodeSession;
 }
 
-function registry<T extends object>(params: T): T {
-  testRegistries.push(params);
-  return params;
+function registry<T extends { listConnected: () => NodeSession[] }>(params: T): T {
+  const value = params as T & {
+    listCurrentConnected?: () => Promise<NodeSession[]>;
+    isConnectionCurrentPairingState?: (connId: string) => Promise<boolean>;
+  };
+  const listCurrentConnected = value.listCurrentConnected ?? (async () => value.listConnected());
+  value.listCurrentConnected = listCurrentConnected;
+  value.isConnectionCurrentPairingState ??= async (connId) =>
+    (await listCurrentConnected()).some((entry) => entry.connId === connId);
+  testRegistries.push(value);
+  return value;
 }
 
 function schedule(registryValue: object, source: NodeSession): void {
@@ -152,7 +162,7 @@ describe("node connection notification routing", () => {
     expect(invoke.mock.calls[0]?.[0]).toMatchObject({ nodeId: "desk" });
   });
 
-  it("resolves the current source session when replacement races persistence", async () => {
+  it("drops a source alert when its exact connection is replaced without taking ownership", async () => {
     vi.useFakeTimers();
     const oldSource = node("new-node");
     const replacement = {
@@ -171,11 +181,33 @@ describe("node connection notification routing", () => {
     connected = [replacement, desk];
     await vi.advanceTimersByTimeAsync(PRIMARY_DELAY_MS);
 
-    expect(invoke).toHaveBeenCalledTimes(1);
-    expect(invoke.mock.calls[0]?.[0]).toMatchObject({
-      nodeId: "desk",
-      params: { body: "Replacement Mac connected to OpenClaw." },
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("drops a delayed alert when the source pairing generation is rotated", async () => {
+    vi.useFakeTimers();
+    const source = {
+      ...node("new-node"),
+      pairingIdentity: "identity-a",
+      pairingGeneration: "generation-a",
+    };
+    const desk = node("desk", { lastActiveAtMs: 100 });
+    let currentPairingGeneration = "generation-a";
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const registryValue = registry({
+      listConnected: () => [source, desk],
+      listCurrentConnected: async () =>
+        currentPairingGeneration === source.pairingGeneration ? [source, desk] : [desk],
+      isConnectionCurrentPairingState: async (connId: string) =>
+        connId === source.connId && currentPairingGeneration === source.pairingGeneration,
+      invoke,
     });
+
+    schedule(registryValue, source);
+    currentPairingGeneration = "generation-b";
+    await vi.advanceTimersByTimeAsync(PRIMARY_DELAY_MS + FALLBACK_DELAY_MS);
+
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("cancels the first-connection claim when the node is gone at delivery", async () => {
@@ -203,10 +235,7 @@ describe("node connection notification routing", () => {
     const replacement = { ...node("new-node"), connId: "conn-new-node-replacement" };
     const desk = node("desk", { lastActiveAtMs: 100 });
     let connected = [oldSource, desk];
-    let resolveInvoke: ((result: { ok: boolean }) => void) | undefined;
-    const firstInvoke = new Promise<{ ok: boolean }>((resolve) => {
-      resolveInvoke = resolve;
-    });
+    const { promise: firstInvoke, resolve: resolveInvoke } = createDeferred<{ ok: boolean }>();
     const invoke = vi.fn(async () => await firstInvoke);
     const registryValue = registry({ listConnected: () => connected, invoke });
 

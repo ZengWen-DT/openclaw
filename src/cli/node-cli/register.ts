@@ -1,15 +1,15 @@
 // Commander registration for foreground node host and node service lifecycle commands.
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import type { Command } from "commander";
+import { Option, type Command } from "commander";
 import { formatDocsLink } from "../../../packages/terminal-core/src/links.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import { loadNodeHostConfig } from "../../node-host/config.js";
 import { runNodeHost } from "../../node-host/runner.js";
 import { runNodeHostWorker } from "../../node-host/worker.js";
 import { defaultRuntime } from "../../runtime.js";
-import { parsePort } from "../daemon-cli/shared.js";
+import { inheritOptionFromParent } from "../command-options.js";
 import { formatInvalidPortOption } from "../error-format.js";
 import { formatHelpExamples } from "../help-format.js";
+import { addNodeCommandOptions } from "./command-options.js";
 import {
   runNodeDaemonInstall,
   runNodeDaemonRestart,
@@ -18,34 +18,23 @@ import {
   runNodeDaemonStop,
   runNodeDaemonUninstall,
 } from "./daemon.js";
+import { resolveNodeGatewayOptions, resolveNodePairGatewayOptions } from "./gateway-options.js";
 import { runNodeIdentityShow } from "./identity.js";
 
-function parsePortOption(value: unknown, fallback: number): number | null {
-  // Undefined keeps config/default port; invalid explicit input returns null for CLI errors.
-  if (value === undefined) {
-    return fallback;
-  }
-  return parsePort(value);
-}
-
 export function registerNodeCli(program: Command) {
-  const node = program
-    .command("node")
-    .description("Run and manage the headless node host service")
-    .addHelpText(
-      "after",
-      () =>
-        `\n${theme.heading("Examples:")}\n${formatHelpExamples([
-          [
-            "openclaw node run --host 127.0.0.1 --port 18789",
-            "Run the node host in the foreground.",
-          ],
-          ["openclaw node status", "Check node host service status."],
-          ["openclaw node install", "Install the node host service."],
-          ["openclaw node start", "Start the installed node host service."],
-          ["openclaw node restart", "Restart the installed node host service."],
-        ])}\n\n${theme.muted("Docs:")} ${formatDocsLink("/cli/node", "docs.openclaw.ai/cli/node")}\n`,
-    );
+  const node = addNodeCommandOptions(
+    program.command("node").description("Run and manage the headless node host service"),
+  ).addHelpText(
+    "after",
+    () =>
+      `\n${theme.heading("Examples:")}\n${formatHelpExamples([
+        ["openclaw node run --host 127.0.0.1 --port 18789", "Run the node host in the foreground."],
+        ["openclaw node status", "Check node host service status."],
+        ["openclaw node install", "Install the node host service."],
+        ["openclaw node start", "Start the installed node host service."],
+        ["openclaw node restart", "Restart the installed node host service."],
+      ])}\n\n${theme.muted("Docs:")} ${formatDocsLink("/cli/node", "docs.openclaw.ai/cli/node")}\n`,
+  );
 
   node
     .command("worker", { hidden: true })
@@ -54,9 +43,11 @@ export function registerNodeCli(program: Command) {
       await runNodeHostWorker();
     });
 
-  node
-    .command("run")
-    .description("Run the headless node host (foreground)")
+  addNodeCommandOptions(node.command("run").description("Run the headless node host (foreground)"))
+    .option(
+      "--pair <code-or-url>",
+      "Pair with a setup code or oc-pair URL; explicit gateway flags take precedence",
+    )
     .option("--host <host>", "Gateway host")
     .option("--port <port>", "Gateway port")
     .option("--context-path <path>", "Gateway WebSocket context path (e.g. /openclaw-gw)")
@@ -65,45 +56,49 @@ export function registerNodeCli(program: Command) {
     .option("--tls-fingerprint <sha256>", "Expected TLS certificate fingerprint (sha256)")
     .option("--node-id <id>", "Override the generated node instance id")
     .option("--display-name <name>", "Override node display name")
+    .addOption(new Option("--ephemeral").hideHelp())
     .option("--share-installed-apps", "Share installed macOS applications with the Gateway")
     .option("--no-share-installed-apps", "Disable installed application sharing")
-    .action(async (opts) => {
-      const existing = await loadNodeHostConfig();
-      const host =
-        normalizeOptionalString(opts.host as string | undefined) ||
-        existing?.gateway?.host ||
-        "127.0.0.1";
-      const port = parsePortOption(opts.port, existing?.gateway?.port ?? 18789);
+    .action(async (opts, command: Command) => {
+      let pair;
+      let gatewayOptions;
+      try {
+        pair = opts.pair ? resolveNodePairGatewayOptions(opts.pair) : undefined;
+        const existing = await loadNodeHostConfig();
+        gatewayOptions = resolveNodeGatewayOptions(opts, existing, pair);
+      } catch (error) {
+        defaultRuntime.error(error instanceof Error ? error.message : String(error));
+        defaultRuntime.exit(1);
+        return;
+      }
+      const { host, port, contextPath, tls, tlsFingerprint, cloudflareAccess, gatewayCandidates } =
+        gatewayOptions;
       if (port === null) {
         defaultRuntime.error(formatInvalidPortOption("--port"));
         defaultRuntime.exit(1);
         return;
       }
-      const retargetedGateway = opts.host !== undefined || opts.port !== undefined;
-      const explicitContextPath = opts.contextPath !== undefined;
-      const explicitTlsDisabled = opts.tls === false;
-      if (explicitTlsDisabled && opts.tlsFingerprint !== undefined) {
+      if (opts.tls === false && opts.tlsFingerprint !== undefined) {
         defaultRuntime.error("--no-tls cannot be combined with --tls-fingerprint");
         defaultRuntime.exit(1);
         return;
       }
-      const tlsFingerprint =
-        explicitTlsDisabled || retargetedGateway
-          ? opts.tlsFingerprint
-          : (opts.tlsFingerprint ?? existing?.gateway?.tlsFingerprint);
-      const inheritedTls = retargetedGateway ? undefined : existing?.gateway?.tls;
       await runNodeHost({
         gatewayHost: host,
         gatewayPort: port,
-        gatewayTls:
-          typeof opts.tls === "boolean" ? opts.tls : Boolean(tlsFingerprint) || inheritedTls,
+        gatewayTls: tls,
         gatewayTlsFingerprint: tlsFingerprint,
-        gatewayContextPath:
-          normalizeOptionalString(opts.contextPath as string | undefined) ??
-          (explicitContextPath || retargetedGateway ? undefined : existing?.gateway?.contextPath),
+        gatewayContextPath: contextPath,
+        gatewayCloudflareAccess: cloudflareAccess,
+        gatewayCandidates,
+        gatewayBootstrapToken: pair?.bootstrapToken,
+        preferGatewayBootstrapToken: pair !== undefined,
+        ...(opts.ephemeral === true ? { forceWorkerRuns: true, ephemeral: true } : {}),
         nodeId: opts.nodeId,
         displayName: opts.displayName,
         installedAppsSharing: opts.shareInstalledApps,
+        commands: opts.commands ?? inheritOptionFromParent<string[]>(command, "commands"),
+        allCommands: opts.allCommands ?? inheritOptionFromParent<boolean>(command, "allCommands"),
       });
     });
 
@@ -123,54 +118,45 @@ export function registerNodeCli(program: Command) {
       runNodeIdentityShow(opts);
     });
 
-  node
-    .command("install")
-    .description("Install the node host service (launchd/systemd/schtasks)")
+  addNodeCommandOptions(
+    node.command("install").description("Install the node host service (launchd/systemd/schtasks)"),
+  )
     .option("--host <host>", "Gateway host")
     .option("--port <port>", "Gateway port")
     .option("--context-path <path>", "Gateway WebSocket context path (e.g. /openclaw-gw)")
-    .option("--tls", "Use TLS for the gateway connection", false)
+    .option("--tls", "Use TLS for the gateway connection")
+    .option("--no-tls", "Disable TLS for the gateway connection")
     .option("--tls-fingerprint <sha256>", "Expected TLS certificate fingerprint (sha256)")
     .option("--node-id <id>", "Override the generated node instance id")
     .option("--display-name <name>", "Override node display name")
     .option("--share-installed-apps", "Share installed macOS applications with the Gateway")
     .option("--no-share-installed-apps", "Disable installed application sharing")
-    .option("--runtime <runtime>", "Service runtime (node). Default: node")
+    .option("--runtime <runtime>", "Service runtime (node|bun). Default: node")
+    .option("--runtime-path <path>", "Pin an absolute Node/Bun executable path")
     .option("--force", "Reinstall/overwrite if already installed", false)
     .option("--json", "Output JSON", false)
-    .action(async (opts) => {
-      await runNodeDaemonInstall(opts);
+    .action(async (opts, command: Command) => {
+      await runNodeDaemonInstall({
+        ...opts,
+        commands: opts.commands ?? inheritOptionFromParent<string[]>(command, "commands"),
+        allCommands: opts.allCommands ?? inheritOptionFromParent<boolean>(command, "allCommands"),
+      });
     });
 
-  node
-    .command("uninstall")
-    .description("Uninstall the node host service (launchd/systemd/schtasks)")
-    .option("--json", "Output JSON", false)
-    .action(async (opts) => {
-      await runNodeDaemonUninstall(opts);
-    });
-
-  node
-    .command("stop")
-    .description("Stop the node host service (launchd/systemd/schtasks)")
-    .option("--json", "Output JSON", false)
-    .action(async (opts) => {
-      await runNodeDaemonStop(opts);
-    });
-
-  node
-    .command("start")
-    .description("Start the node host service (launchd/systemd/schtasks)")
-    .option("--json", "Output JSON", false)
-    .action(async (opts) => {
-      await runNodeDaemonStart(opts);
-    });
-
-  node
-    .command("restart")
-    .description("Restart the node host service (launchd/systemd/schtasks)")
-    .option("--json", "Output JSON", false)
-    .action(async (opts) => {
-      await runNodeDaemonRestart(opts);
-    });
+  for (const [name, action] of [
+    ["uninstall", runNodeDaemonUninstall],
+    ["stop", runNodeDaemonStop],
+    ["start", runNodeDaemonStart],
+    ["restart", runNodeDaemonRestart],
+  ] as const) {
+    node
+      .command(name)
+      .description(
+        `${name.charAt(0).toUpperCase()}${name.slice(1)} the node host service (launchd/systemd/schtasks)`,
+      )
+      .option("--json", "Output JSON", false)
+      .action(async (opts) => {
+        await action(opts);
+      });
+  }
 }

@@ -1,3 +1,4 @@
+import { extractErrorCode } from "@openclaw/normalization-core/error-coercion";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { runExec, spawnCommand } from "../../process/exec.js";
 
@@ -41,12 +42,13 @@ async function observeXdgOpenStartup(command: OpenPathCommand): Promise<void> {
   // failures without making the Gateway own the launched application's lifetime.
   const child = spawnCommand([command.command, ...command.args], {
     buffer: false,
+    // Independent applications must survive Gateway/broker shutdown.
     cleanup: false,
     detached: true,
     reject: true,
     stdio: ["ignore", "ignore", "pipe"],
   });
-  child.unref();
+  child.nodeChildProcess.unref();
   let stderrText = "";
   const stderr = child.stderr;
   stderr?.setEncoding("utf8");
@@ -128,7 +130,19 @@ export function formatOpenPathError(error: unknown): string {
   return String(error);
 }
 
-export function isHeadlessOpenPathError(message: string): boolean {
+export function isHeadlessOpenPathError(
+  error: unknown,
+  command: OpenPathCommand,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (
+    platform === "linux" &&
+    command.command === "xdg-open" &&
+    extractErrorCode(error) === "ENOENT"
+  ) {
+    return true;
+  }
+  const message = formatOpenPathError(error);
   return message.includes("xdg-open") && message.includes("no method available");
 }
 

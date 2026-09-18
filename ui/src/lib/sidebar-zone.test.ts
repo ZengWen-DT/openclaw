@@ -63,4 +63,39 @@ describe("reconcileSidebarZone", () => {
       reconcileSidebarZone(["route:usage", "route:plugins"], [], ["usage"]).sidebarEntries,
     ).toEqual(["route:usage"]);
   });
+
+  it("migrates shipped Workboard placements to plugin destinations", () => {
+    const result = reconcileSidebarZone(
+      ["route:usage", "route:workboard", "workboard:ops"],
+      [],
+      SIDEBAR_NAV_ROUTES,
+      new Set(),
+      new Set(["workboard/workboard", "workboard/board-ops"]),
+    );
+    expect(result.sidebarEntries).toEqual([
+      "route:usage",
+      "plugin:workboard/workboard",
+      "plugin:workboard/board-ops",
+    ]);
+    expect(result.entries).toEqual([
+      { type: "route", route: "usage" },
+      { type: "plugin", key: "workboard/workboard" },
+      { type: "plugin", key: "workboard/board-ops" },
+    ]);
+  });
+
+  it("preserves unavailable plugin positions through reloads and permission loss", () => {
+    const entries = ["plugin:example/review", "route:usage"];
+    expect(reconcileSidebarZone(entries, [], SIDEBAR_NAV_ROUTES)).toEqual({
+      entries: [{ type: "route", route: "usage" }],
+      sidebarEntries: entries,
+    });
+    expect(
+      reconcileSidebarZone(entries, [], SIDEBAR_NAV_ROUTES, new Set(), new Set(["example/review"]))
+        .entries,
+    ).toEqual([
+      { type: "plugin", key: "example/review" },
+      { type: "route", route: "usage" },
+    ]);
+  });
 });

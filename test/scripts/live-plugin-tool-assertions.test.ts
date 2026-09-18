@@ -5,9 +5,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
 
 const ASSERTIONS_SCRIPT = "scripts/e2e/lib/live-plugin-tool/assertions.mjs";
 const DISABLE_EXPERIMENTAL_WARNING = "--disable-warning=ExperimentalWarning";
+const testNodeExecPath = resolveTestNodeExecPath();
 
 function nodeOptionsWithoutExperimentalWarnings(extra?: string): string {
   const current = [process.env.NODE_OPTIONS, extra].filter(Boolean).join(" ");
@@ -26,7 +28,7 @@ function runAssertion(root: string, env: Record<string, string> = {}) {
 }
 
 function runAssertionCommand(command: string, root: string, env: Record<string, string> = {}) {
-  return spawnSync(process.execPath, [ASSERTIONS_SCRIPT, command], {
+  return spawnSync(testNodeExecPath, [ASSERTIONS_SCRIPT, command], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -123,7 +125,7 @@ describe("live plugin tool assertions", () => {
     }
   });
 
-  it("reads causal tool evidence from the canonical SQLite transcript", () => {
+  it("reads Code Mode exec evidence from the canonical SQLite transcript", () => {
     const root = mkdtempSync(path.join(tmpdir(), "openclaw-live-plugin-tool-"));
     const databasePath = path.join(
       root,
@@ -161,7 +163,7 @@ describe("live plugin tool assertions", () => {
                 {
                   type: "tool_use",
                   id: "call-live-plugin-tool",
-                  name: "e2e_slug_probe",
+                  name: "exec",
                 },
               ],
             },
@@ -174,6 +176,33 @@ describe("live plugin tool assertions", () => {
             message: {
               role: "tool",
               tool_call_id: "call-live-plugin-tool",
+              content: "Code cell still running: cell-live-plugin-tool",
+            },
+          }),
+        );
+        insert.run(
+          "live-plugin-tool",
+          3,
+          JSON.stringify({
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "wait-live-plugin-tool",
+                  name: "wait",
+                },
+              ],
+            },
+          }),
+        );
+        insert.run(
+          "live-plugin-tool",
+          4,
+          JSON.stringify({
+            message: {
+              role: "tool",
+              tool_call_id: "wait-live-plugin-tool",
               content: "live-plugin-slug",
             },
           }),

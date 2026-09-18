@@ -1,7 +1,8 @@
 /** SQLite persistence and stable cursor queries for metadata-only audit events. */
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { Insertable, Selectable } from "kysely";
+import type { Selectable } from "kysely";
+import { AUDIT_ACTIVITY_MESSAGE_KIND } from "../../packages/gateway-protocol/src/schema/audit-activity.js";
 import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
@@ -14,11 +15,13 @@ import {
   runOpenClawStateWriteTransaction,
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
+import { getAuditEventQueries, type AuditEventInsert } from "./audit-event-queries.js";
 import {
   AUDIT_EVENT_SCHEMA_VERSION,
   AUDIT_INBOUND_MESSAGE_COMPLETED_REASONS,
   AUDIT_INBOUND_MESSAGE_SKIPPED_REASONS,
   AUDIT_OUTBOUND_MESSAGE_SUPPRESSED_REASONS,
+  isOutboundMessageProgressInput,
   type AgentRunAuditEventRecord,
   type AuditEventInput,
   type AuditEventListFilters,
@@ -34,12 +37,17 @@ import {
   loadOrCreateAuditIdentityKey,
   pseudonymizeAuditIdentity,
 } from "./audit-identity.js";
+import {
+  ensureTerminalMessageExecutionBindingSchema,
+  planMessageExecutionBinding,
+  recordConfirmedTerminalMessageExecutionBinding,
+} from "./message-execution-binding.js";
 
 type AuditEventsTable = OpenClawStateKyselyDatabase["audit_events"];
 type AuditDatabase = Pick<OpenClawStateKyselyDatabase, "audit_events">;
 type AuditEventRow = Selectable<AuditEventsTable>;
 
-const AUDIT_EVENT_RETENTION_MS = 30 * 24 * 60 * 60_000;
+export const AUDIT_EVENT_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const AUDIT_EVENT_MAX_ROWS = 100_000;
 const AUDIT_EVENT_PRUNE_BATCH_ROWS = 1_024;
 // The single audit writer owns one DB handle. Invalidate on out-of-band
@@ -365,24 +373,43 @@ function parseInboundMessageRow(row: AuditEventRow): InboundMessageAuditEventRec
 }
 
 function parseOutboundMessageRow(row: AuditEventRow): OutboundMessageAuditEventRecord {
-  requiredEnum(row, row.action, "action", ["message.outbound.finished"]);
+  const action = requiredEnum(row, row.action, "action", [
+    "message.outbound.queued",
+    "message.outbound.platform-started",
+    "message.outbound.finished",
+  ]);
   requiredEnum(row, row.direction, "direction", ["outbound"]);
   const actorType = requiredEnum(row, row.actor_type, "actorType", ["agent", "system"]);
   const actorId = requiredText(row, row.actor_id, "actorId");
   const commonFields = parseMessageRecordFields(row);
   const common = {
     ...commonFields,
-    action: "message.outbound.finished" as const,
+    action,
     direction: "outbound" as const,
     actorType,
     actorId,
   };
+  if (row.status === "started") {
+    requireNull(row, "delivery_kind");
+    requireNullColumns(row, ["error_code", "reason_code", "failure_stage"]);
+    if (action === "message.outbound.queued") {
+      requiredEnum(row, row.message_outcome, "outcome", ["queued"]);
+      return { ...common, action, status: "started", outcome: "queued" };
+    }
+    if (action === "message.outbound.platform-started") {
+      requiredEnum(row, row.message_outcome, "outcome", ["platform_started"]);
+      return { ...common, action, status: "started", outcome: "platform_started" };
+    }
+    return corruptAuditRow(row, "invalid outbound lifecycle action");
+  }
+  requiredEnum(row, action, "action", ["message.outbound.finished"]);
+  const terminalCommon = { ...common, action: "message.outbound.finished" as const };
   if (row.status === "succeeded") {
     const deliveryKind = optionalEnum(row, row.delivery_kind, "deliveryKind", DELIVERY_KINDS);
     requiredEnum(row, row.message_outcome, "outcome", ["sent"]);
     requireNullColumns(row, ["error_code", "reason_code", "failure_stage"]);
     return {
-      ...common,
+      ...terminalCommon,
       status: "succeeded",
       outcome: "sent",
       ...(deliveryKind ? { deliveryKind } : {}),
@@ -399,7 +426,7 @@ function parseOutboundMessageRow(row: AuditEventRow): OutboundMessageAuditEventR
       AUDIT_OUTBOUND_MESSAGE_SUPPRESSED_REASONS,
     );
     return {
-      ...common,
+      ...terminalCommon,
       status: "blocked",
       outcome: "suppressed",
       reasonCode,
@@ -415,7 +442,7 @@ function parseOutboundMessageRow(row: AuditEventRow): OutboundMessageAuditEventR
     ]);
     const failureStage = requiredEnum(row, row.failure_stage, "failureStage", FAILURE_STAGES);
     return {
-      ...common,
+      ...terminalCommon,
       status: "failed",
       outcome: "failed",
       errorCode,
@@ -429,7 +456,7 @@ function parseOutboundMessageRow(row: AuditEventRow): OutboundMessageAuditEventR
     requireNullColumns(row, ["error_code", "reason_code"]);
     const failureStage = requiredEnum(row, row.failure_stage, "failureStage", FAILURE_STAGES);
     return {
-      ...common,
+      ...terminalCommon,
       status: "unknown",
       outcome: "unknown",
       failureStage,
@@ -438,7 +465,7 @@ function parseOutboundMessageRow(row: AuditEventRow): OutboundMessageAuditEventR
   return corruptAuditRow(row, "invalid outbound status");
 }
 
-function rowToAuditEvent(row: AuditEventRow): AuditEventRecord {
+export function rowToAuditEvent(row: AuditEventRow): AuditEventRecord {
   if (row.kind === "agent_run") {
     return parseAgentRunRow(row);
   }
@@ -484,8 +511,9 @@ function projectMessageIdentities(db: DatabaseSync, input: MessageAuditEventInpu
   };
 }
 
-function bindAuditEvent(db: DatabaseSync, input: AuditEventInput): Insertable<AuditEventsTable> {
-  const message = input.kind === "message" ? projectMessageIdentities(db, input) : undefined;
+function bindAuditEvent(db: DatabaseSync, input: AuditEventInput) {
+  const message =
+    input.kind === AUDIT_ACTIVITY_MESSAGE_KIND ? projectMessageIdentities(db, input) : undefined;
   return {
     event_id: randomUUID(),
     source_id: input.sourceId,
@@ -499,13 +527,13 @@ function bindAuditEvent(db: DatabaseSync, input: AuditEventInput): Insertable<Au
     actor_type: input.actorType,
     actor_id: message?.actorId ?? input.actorId,
     agent_id: input.agentId ?? null,
-    session_key: input.kind === "message" ? null : (input.sessionKey ?? null),
-    session_id: input.kind === "message" ? null : (input.sessionId ?? null),
+    session_key: input.kind === AUDIT_ACTIVITY_MESSAGE_KIND ? null : (input.sessionKey ?? null),
+    session_id: input.kind === AUDIT_ACTIVITY_MESSAGE_KIND ? null : (input.sessionId ?? null),
     run_id: input.runId ?? null,
     tool_call_id: input.kind === "tool_action" ? (input.toolCallId ?? null) : null,
     tool_name: input.kind === "tool_action" ? input.toolName : null,
-    direction: input.kind === "message" ? input.direction : null,
-    channel: input.kind === "message" ? input.channel : null,
+    direction: input.kind === AUDIT_ACTIVITY_MESSAGE_KIND ? input.direction : null,
+    channel: input.kind === AUDIT_ACTIVITY_MESSAGE_KIND ? input.channel : null,
     conversation_kind: input.kind === "message" ? input.conversationKind : null,
     message_outcome: input.kind === "message" ? input.outcome : null,
     reason_code: input.kind === "message" ? (input.reasonCode ?? null) : null,
@@ -517,43 +545,47 @@ function bindAuditEvent(db: DatabaseSync, input: AuditEventInput): Insertable<Au
     conversation_ref: message?.conversationRef ?? null,
     message_ref: message?.messageRef ?? null,
     target_ref: message?.targetRef ?? null,
-  };
+  } satisfies AuditEventInsert;
 }
 
 function countAuditEvents(db: DatabaseSync): number {
-  const kysely = getAuditKysely(db);
   const row = executeSqliteQueryTakeFirstSync(
     db,
-    kysely
+    getAuditKysely(db)
       .selectFrom("audit_events")
       .select((expression) => expression.fn.countAll<number>().as("count")),
   );
   return normalizeSqliteNumber(row?.count ?? null) ?? 0;
 }
 
-function pruneAuditEventsAfterInsert(
-  db: DatabaseSync,
-  now: number,
-  limits: { maxRows: number; pruneBatchRows: number } = {
-    maxRows: AUDIT_EVENT_MAX_ROWS,
-    pruneBatchRows: AUDIT_EVENT_PRUNE_BATCH_ROWS,
-  },
-): void {
+function deleteExpiredAuditEvents(db: DatabaseSync, now: number) {
   const kysely = getAuditKysely(db);
-  const expired = executeSqliteQuerySync(
+  const expiredSequences = kysely
+    .selectFrom("audit_events")
+    .select("sequence")
+    .where("occurred_at", "<", now - AUDIT_EVENT_RETENTION_MS)
+    .orderBy("occurred_at", "asc")
+    .orderBy("sequence", "asc")
+    .limit(AUDIT_EVENT_PRUNE_BATCH_ROWS);
+  return executeSqliteQuerySync(
     db,
-    kysely.deleteFrom("audit_events").where("occurred_at", "<", now - AUDIT_EVENT_RETENTION_MS),
+    kysely.deleteFrom("audit_events").where("sequence", "in", expiredSequences),
   );
+}
+
+function pruneAuditEventsAfterInsert(db: DatabaseSync, now: number): void {
+  const kysely = getAuditKysely(db);
+  const expired = deleteExpiredAuditEvents(db, now);
   const cachedCount = auditEventRowCounts.get(db);
   let rowCount =
     cachedCount === undefined
       ? countAuditEvents(db)
       : Math.max(0, cachedCount + 1 - Number(expired.numAffectedRows ?? 0n));
-  if (rowCount <= limits.maxRows) {
+  if (rowCount <= AUDIT_EVENT_MAX_ROWS) {
     auditEventRowCounts.set(db, rowCount);
     return;
   }
-  const retainedRows = Math.max(0, limits.maxRows - limits.pruneBatchRows);
+  const retainedRows = Math.max(0, AUDIT_EVENT_MAX_ROWS - AUDIT_EVENT_PRUNE_BATCH_ROWS);
   const overflowRow = executeSqliteQueryTakeFirstSync(
     db,
     kysely
@@ -579,32 +611,37 @@ export function recordAuditEvent(
   input: AuditEventInput,
   options: OpenClawStateDatabaseOptions = {},
 ): AuditEventRecord | undefined {
+  if (isOutboundMessageProgressInput(input)) {
+    throw new Error("outbound message progress belongs to its companion store");
+  }
+  const executionToken =
+    input.kind === "message" && input.direction === "outbound"
+      ? planMessageExecutionBinding(input.executionIdentityToken, input.runId)
+      : undefined;
+  if (executionToken) {
+    ensureTerminalMessageExecutionBindingSchema(options);
+  }
   let countCacheDatabase: DatabaseSync | undefined;
   try {
     return runOpenClawStateWriteTransaction(({ db }) => {
       countCacheDatabase = db;
-      const insert = executeSqliteQuerySync(
-        db,
-        getAuditKysely(db)
-          .insertInto("audit_events")
-          .values(bindAuditEvent(db, input))
-          .onConflict((conflict) => conflict.column("source_id").doNothing()),
-      );
-      if (insert.insertId === undefined) {
+      // Read losslessly so Node's rowid decoding cannot preempt the safe-integer guard.
+      const values = bindAuditEvent(db, input);
+      const queries = getAuditEventQueries(db);
+      const insert = queries.insert(values);
+      if (insert === undefined) {
         return undefined;
       }
-      const insertedSequence = Number(insert.insertId);
+      const insertedSequence = Number(insert.sequence);
       if (!Number.isSafeInteger(insertedSequence) || insertedSequence < 1) {
         throw new Error("audit event sequence is outside the supported integer range");
       }
       pruneAuditEventsAfterInsert(db, Date.now());
-      const row = executeSqliteQueryTakeFirstSync(
-        db,
-        getAuditKysely(db)
-          .selectFrom("audit_events")
-          .selectAll()
-          .where("sequence", "=", insertedSequence),
-      );
+      const row = queries.read(insertedSequence);
+      recordConfirmedTerminalMessageExecutionBinding(db, {
+        eventId: row?.event_id,
+        token: executionToken,
+      });
       return row ? rowToAuditEvent(row) : undefined;
     }, options);
   } catch (error) {
@@ -630,7 +667,10 @@ export function listAuditEvents(params: {
   let query = getAuditKysely(db)
     .selectFrom("audit_events")
     .selectAll()
-    .where("occurred_at", ">=", retainedAfter);
+    .where("occurred_at", ">=", retainedAfter)
+    // Nonterminal outbound facts belong to the lazy progress owner. Excluding
+    // transitional rows keeps the released activity contract terminal-only.
+    .where("action", "not in", ["message.outbound.queued", "message.outbound.platform-started"]);
   if (params.cursor !== undefined) {
     query = query.where("sequence", "<", params.cursor);
   }
@@ -676,20 +716,16 @@ export function listAuditEvents(params: {
   };
 }
 
-/** Delete expired metadata during Gateway startup and periodic worker maintenance. */
+/** Delete one bounded batch during Gateway startup and periodic audit maintenance. */
 export function pruneExpiredAuditEvents(
   params: {
     now?: number;
     database?: OpenClawStateDatabaseOptions;
   } = {},
-): void {
-  runOpenClawStateWriteTransaction(({ db }) => {
-    executeSqliteQuerySync(
-      db,
-      getAuditKysely(db)
-        .deleteFrom("audit_events")
-        .where("occurred_at", "<", (params.now ?? Date.now()) - AUDIT_EVENT_RETENTION_MS),
-    );
+): number {
+  return runOpenClawStateWriteTransaction(({ db }) => {
+    const deleted = deleteExpiredAuditEvents(db, params.now ?? Date.now());
     auditEventRowCounts.delete(db);
+    return Number(deleted.numAffectedRows ?? 0n);
   }, params.database);
 }

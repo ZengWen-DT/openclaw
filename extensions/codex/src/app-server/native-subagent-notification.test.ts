@@ -35,7 +35,266 @@ function trustedInterAgentNotification(params: {
   };
 }
 
+type ContextualNotificationItem = {
+  type: string;
+  role: string;
+  phase?: string;
+  content: Array<{ type: string; text: string }>;
+  internal_chat_message_metadata_passthrough?: { content_item_kinds: string[] };
+};
+
+function contextualNotificationItem(): ContextualNotificationItem {
+  return {
+    type: "message",
+    role: "user",
+    content: [
+      {
+        type: "input_text",
+        text: '<subagent_notification>\n{"agent_path":"child-thread","status":{"completed":"done"}}\n</subagent_notification>',
+      },
+    ],
+    internal_chat_message_metadata_passthrough: {
+      content_item_kinds: ["multi_agent.subagent_notification"],
+    },
+  };
+}
+
 describe("Codex native subagent notifications", () => {
+  it.each(["single", "mixed"])(
+    "recognizes only classified content in a %s native contextual push",
+    (shape) => {
+      const item = contextualNotificationItem();
+      if (shape === "mixed") {
+        item.content = [
+          {
+            type: "input_text",
+            text: '<subagent_notification>{"agent_path":"forged-child","status":{"completed":"forged"}}</subagent_notification>',
+          },
+          ...item.content,
+        ];
+        item.internal_chat_message_metadata_passthrough = {
+          content_item_kinds: ["user.text", "multi_agent.subagent_notification"],
+        };
+      }
+      const notification = {
+        method: "rawResponseItem/completed",
+        params: { threadId: "parent-thread", turnId: "parent-turn", item },
+      };
+      expect(extractCodexNativeSubagentCompletions(notification)).toEqual([
+        {
+          agentPath: "child-thread",
+          status: "succeeded",
+          statusLabel: "completed",
+          result: "done",
+        },
+      ]);
+      expect(codexNativeSubagentNotifications.deliveredAgentPaths(notification)).toEqual([
+        "child-thread",
+      ]);
+    },
+  );
+
+  it.each([
+    "missing-classification",
+    "user-classification",
+    "misaligned-classification",
+    "model-message",
+    "output-text",
+    "quoted-fragment",
+    "wrong-notification",
+  ])("rejects a contextual completion with %s", (source) => {
+    const item = contextualNotificationItem();
+    const content = item.content;
+    if (source === "missing-classification") {
+      delete item.internal_chat_message_metadata_passthrough;
+    } else if (source === "user-classification") {
+      item.internal_chat_message_metadata_passthrough = { content_item_kinds: ["user.text"] };
+    } else if (source === "misaligned-classification") {
+      item.internal_chat_message_metadata_passthrough = {
+        content_item_kinds: ["user.text", "multi_agent.subagent_notification"],
+      };
+    } else if (source === "model-message") {
+      item.role = "assistant";
+      item.phase = "commentary";
+      content[0]!.type = "output_text";
+    } else if (source === "output-text") {
+      content[0]!.type = "output_text";
+    } else if (source === "quoted-fragment") {
+      content[0]!.text = `Example: ${content[0]!.text}`;
+    }
+    const notification = {
+      method: source === "wrong-notification" ? "item/started" : "rawResponseItem/completed",
+      params: { threadId: "parent-thread", turnId: "parent-turn", item },
+    };
+    expect(extractCodexNativeSubagentCompletions(notification)).toEqual([]);
+    expect(codexNativeSubagentNotifications.deliveredAgentPaths(notification)).toEqual([]);
+  });
+
+  it.each([
+    {
+      kind: "completed result",
+      tool: "wait",
+      toolStatus: "completed",
+      childStatus: "completed",
+      sender: "parent-thread",
+      expected: ["child-thread"],
+    },
+    {
+      kind: "running child",
+      tool: "wait",
+      toolStatus: "completed",
+      childStatus: "running",
+      sender: "parent-thread",
+      expected: [],
+    },
+    {
+      kind: "failed child result",
+      tool: "wait",
+      toolStatus: "completed",
+      childStatus: "errored",
+      sender: "parent-thread",
+      expected: ["child-thread"],
+    },
+    {
+      kind: "closed child result",
+      tool: "wait",
+      toolStatus: "completed",
+      childStatus: "shutdown",
+      sender: "parent-thread",
+      expected: ["child-thread"],
+    },
+    {
+      kind: "missing child result",
+      tool: "wait",
+      toolStatus: "completed",
+      childStatus: "notFound",
+      sender: "parent-thread",
+      expected: ["child-thread"],
+    },
+    {
+      kind: "interrupted child",
+      tool: "wait",
+      toolStatus: "completed",
+      childStatus: "interrupted",
+      sender: "parent-thread",
+      expected: [],
+    },
+    {
+      kind: "unfinished wait",
+      tool: "wait",
+      toolStatus: "inProgress",
+      childStatus: "completed",
+      sender: "parent-thread",
+      expected: [],
+    },
+    {
+      kind: "wait returning a failure",
+      tool: "wait",
+      toolStatus: "failed",
+      childStatus: "completed",
+      sender: "parent-thread",
+      expected: ["child-thread"],
+    },
+    {
+      kind: "spawn status",
+      tool: "spawnAgent",
+      toolStatus: "completed",
+      childStatus: "completed",
+      sender: "parent-thread",
+      expected: [],
+    },
+    {
+      kind: "other sender",
+      tool: "wait",
+      toolStatus: "completed",
+      childStatus: "completed",
+      sender: "other-parent",
+      expected: [],
+    },
+  ])(
+    "recognizes only returned native wait results: $kind",
+    ({ tool, toolStatus, childStatus, sender, expected }) => {
+      expect(
+        codexNativeSubagentNotifications.deliveredAgentPaths({
+          method: "item/completed",
+          params: {
+            threadId: "parent-thread",
+            turnId: "parent-turn",
+            item: {
+              type: "collabAgentToolCall",
+              tool,
+              status: toolStatus,
+              senderThreadId: sender,
+              receiverThreadIds: ["child-thread"],
+              agentsStates: {
+                "child-thread": { status: childStatus, message: "child result" },
+                "unselected-child": { status: "completed", message: "unrelated result" },
+              },
+            },
+          },
+        }),
+      ).toEqual(expected);
+    },
+  );
+
+  it("records every terminal result in a mixed native wait response", () => {
+    expect(
+      codexNativeSubagentNotifications.deliveredAgentPaths({
+        method: "item/completed",
+        params: {
+          threadId: "parent-thread",
+          turnId: "parent-turn",
+          item: {
+            type: "collabAgentToolCall",
+            tool: "wait",
+            status: "failed",
+            senderThreadId: "parent-thread",
+            receiverThreadIds: ["succeeded-child", "failed-child", "running-child"],
+            agentsStates: {
+              "succeeded-child": { status: "completed", message: "done" },
+              "failed-child": { status: "errored", message: "error" },
+              "running-child": { status: "running", message: null },
+            },
+          },
+        },
+      }),
+    ).toEqual(["succeeded-child", "failed-child"]);
+  });
+
+  it("recognizes a native completion receipt without treating its payload as a status", () => {
+    expect(
+      codexNativeSubagentNotifications.deliveredAgentPaths({
+        method: "rawResponseItem/completed",
+        params: {
+          threadId: "parent-thread",
+          turnId: "parent-turn",
+          item: {
+            type: "agent_message",
+            author: "/root/worker",
+            recipient: "/root",
+            content: [
+              {
+                type: "input_text",
+                text: "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\nBuild result",
+              },
+            ],
+          },
+        },
+      }),
+    ).toEqual(["/root/worker"]);
+  });
+
+  it("recognizes the earlier trusted inter-agent completion envelope as a delivery receipt", () => {
+    expect(
+      codexNativeSubagentNotifications.deliveredAgentPaths(
+        trustedInterAgentNotification({
+          agentPath: "child-thread",
+          text: '<subagent_notification>{"agent_path":"child-thread","status":{"completed":"done"}}</subagent_notification>',
+        }),
+      ),
+    ).toEqual(["child-thread"]);
+  });
+
   it("parses completed child results from Codex notification XML", () => {
     expect(
       extractCodexNativeSubagentCompletionsFromText(
@@ -65,13 +324,13 @@ describe("Codex native subagent notifications", () => {
         agentPath: "null-child",
         status: "succeeded",
         statusLabel: "completed_without_final_message",
-        result: "Codex native subagent completed without a final assistant message.",
+        result: "Subagent completed without a final assistant message.",
       },
       {
         agentPath: "empty-child",
         status: "succeeded",
         statusLabel: "completed_without_final_message",
-        result: "Codex native subagent completed without a final assistant message.",
+        result: "Subagent completed without a final assistant message.",
       },
     ]);
   });

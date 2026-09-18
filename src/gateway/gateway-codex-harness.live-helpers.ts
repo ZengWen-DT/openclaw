@@ -1,6 +1,10 @@
 import { extractShellWrapperInlineCommand } from "../infra/shell-wrapper-resolution.js";
 import { splitShellArgs } from "../utils/shell-argv.js";
 
+// Codex 0.144.6 retains at most 1 MiB per exec stream. Leave headroom so this
+// soak measures compaction behavior instead of the dependency's output boundary.
+export const CODEX_HARNESS_MAX_LARGE_OUTPUT_BYTES = 800_000;
+
 /**
  * Text matchers shared by live Codex harness tests.
  *
@@ -92,6 +96,7 @@ export function shouldUseCodexHarnessSubagentOnlyFastPath(params: {
   guardianProbe: boolean;
   imageProbe: boolean;
   mcpProbe: boolean;
+  multiSessionProbe: boolean;
   resumeStress: boolean;
   subagentProbe: boolean;
 }): boolean {
@@ -103,6 +108,7 @@ export function shouldUseCodexHarnessSubagentOnlyFastPath(params: {
     !params.guardianProbe &&
     !params.imageProbe &&
     !params.mcpProbe &&
+    !params.multiSessionProbe &&
     !params.resumeStress &&
     !params.explicitOptOut
   );
@@ -163,6 +169,10 @@ export function isExpectedNativeCommand(command: string, expectedCommand: string
   const wrappedCommand = extractShellWrapperInlineCommand(commandArgv);
   const wrappedArgv = wrappedCommand ? splitShellArgs(wrappedCommand) : null;
   return wrappedArgv ? shellArgvMatches(wrappedArgv, expectedArgv) : false;
+}
+
+export function buildCodexHarnessAppServerArgs(overrides: readonly string[]): string[] {
+  return ["app-server", "--listen", "stdio://", ...overrides.flatMap((value) => ["-c", value])];
 }
 
 export function buildCodexHarnessLargeOutputCommand(params: {

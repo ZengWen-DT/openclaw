@@ -2,10 +2,51 @@
 
 import { render } from "lit";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { i18n } from "../i18n/index.ts";
+import { i18n, t } from "../i18n/index.ts";
+import { pt_BR } from "../i18n/locales/pt-BR.ts";
+import type { AgentSelect } from "./agent-select.ts";
 import { renderSettingsSidebar } from "./settings-sidebar.ts";
+import "./tooltip.ts";
 
 let container: HTMLDivElement;
+
+const saveIndicator = () => ({
+  status: "idle" as const,
+  lastError: null,
+  needsApply: false,
+  applying: false,
+  applyDisabled: false,
+  onRetry: vi.fn(),
+  onSave: vi.fn(),
+  onReload: vi.fn(),
+  onApply: vi.fn(),
+});
+
+const sidebarAgentProps = () => ({
+  agents: [
+    { id: "main", name: "Main" },
+    { id: "research", name: "Research" },
+  ],
+  agentIdentity: {
+    get: () => null,
+    entries: () => [],
+    ensure: async () => {},
+    invalidate: () => {},
+    subscribe: () => () => {},
+  },
+  settingsAgentSelection: {
+    state: { selectedId: "main", scopeId: "main" },
+    intentRevision: 0,
+    set: vi.fn(),
+    setScope: vi.fn(),
+    subscribe: () => () => {},
+  },
+});
+
+const inactiveRefresh = {
+  refreshRequired: false,
+  onRefresh: async () => false,
+};
 
 beforeEach(async () => {
   await i18n.setLocale("en");
@@ -13,27 +54,102 @@ beforeEach(async () => {
   document.body.append(container);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  i18n.registerTranslation("pt-BR", pt_BR);
+  await i18n.setLocale("en");
   container.remove();
 });
 
 describe("settings sidebar search", () => {
+  it("keeps save recovery available in the embedded page header", async () => {
+    const onRetry = vi.fn();
+    render(
+      renderSettingsSidebar({
+        ...sidebarAgentProps(),
+        presentation: "embed-page",
+        basePath: "",
+        activeRouteId: "appearance",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
+        updateAvailable: null,
+        updateBusy: false,
+        onUpdate: vi.fn(),
+        ...inactiveRefresh,
+        searchQuery: "",
+        onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
+        onNavigate: vi.fn(),
+        onSearchQueryChange: vi.fn(),
+        preloadTimers: new Map(),
+        saveIndicator: { ...saveIndicator(), status: "error", lastError: "Save failed", onRetry },
+      }),
+      container,
+    );
+    expect(container.querySelector(".settings-sidebar")).toBeNull();
+    await vi.waitFor(() => {
+      const retry = container.querySelector<HTMLButtonElement>(
+        ".native-embed-header .settings-save-indicator__action",
+      );
+      expect(retry?.textContent?.trim()).toBe("Retry");
+    });
+    container.querySelector<HTMLButtonElement>(".settings-save-indicator__action")!.click();
+    expect(onRetry).toHaveBeenCalledOnce();
+  });
+
+  it("keeps Models selected while its setup flow is open", () => {
+    render(
+      renderSettingsSidebar({
+        ...sidebarAgentProps(),
+        basePath: "",
+        activeRouteId: "model-setup",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
+        updateAvailable: null,
+        updateBusy: false,
+        onUpdate: vi.fn(),
+        ...inactiveRefresh,
+        searchQuery: "",
+        onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
+        onNavigate: vi.fn(),
+        onSearchQueryChange: vi.fn(),
+        preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
+      }),
+      container,
+    );
+
+    const active = container.querySelector<HTMLAnchorElement>(
+      '.settings-sidebar__item[href="/settings/model-providers"]',
+    );
+    expect(active?.classList.contains("settings-sidebar__item--active")).toBe(true);
+    expect(active?.getAttribute("aria-current")).toBe("page");
+    expect(active?.textContent?.trim()).toBe("Models");
+  });
+
   it("links Ask OpenClaw to the shared custodian route", () => {
     const onNavigate = vi.fn();
     render(
       renderSettingsSidebar({
+        ...sidebarAgentProps(),
         basePath: "",
-        activeRouteId: "config",
-        connected: true,
-        version: "",
+        activeRouteId: "appearance",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
         updateAvailable: null,
-        updateRunning: false,
+        updateBusy: false,
         onUpdate: vi.fn(),
+        ...inactiveRefresh,
         searchQuery: "",
         onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
         onNavigate,
         onSearchQueryChange: vi.fn(),
         preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
       }),
       container,
     );
@@ -49,25 +165,30 @@ describe("settings sidebar search", () => {
   it("does not match the middle of a word for a short query", () => {
     render(
       renderSettingsSidebar({
+        ...sidebarAgentProps(),
         basePath: "",
-        activeRouteId: "config",
-        connected: true,
-        version: "",
+        activeRouteId: "appearance",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
         updateAvailable: null,
-        updateRunning: false,
+        updateBusy: false,
         onUpdate: vi.fn(),
+        ...inactiveRefresh,
         searchQuery: "cp",
         searchBlockMatches: [
           {
-            routeId: "config",
+            routeId: "connection",
             label: "Gateway Host",
-            hash: "#settings-general-system",
+            hash: "#settings-connection-host",
           },
         ],
         onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
         onNavigate: vi.fn(),
         onSearchQueryChange: vi.fn(),
         preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
       }),
       container,
     );
@@ -77,26 +198,30 @@ describe("settings sidebar search", () => {
         ".settings-sidebar__item-label, .settings-sidebar__subitem-label",
       ),
     ].map((item) => item.textContent?.trim());
-    expect(resultLabels).toEqual(["General", "Gateway Host"]);
+    expect(resultLabels).toEqual(["Gateway", "Gateway Host"]);
   });
 
   it("ranks matching pages before matching blocks and navigates to the block", () => {
     const onNavigate = vi.fn();
     render(
       renderSettingsSidebar({
+        ...sidebarAgentProps(),
         basePath: "",
-        activeRouteId: "config",
-        connected: true,
-        version: "",
+        activeRouteId: "appearance",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
         updateAvailable: null,
-        updateRunning: false,
+        updateBusy: false,
         onUpdate: vi.fn(),
+        ...inactiveRefresh,
         searchQuery: "mcp",
         searchBlockMatches: [
           {
-            routeId: "config",
-            label: "Automations",
-            hash: "#settings-general-automations",
+            routeId: "appearance",
+            label: "Language",
+            search: "?section=__appearance__",
+            hash: "#settings-language",
           },
           {
             routeId: "mcp",
@@ -106,9 +231,11 @@ describe("settings sidebar search", () => {
           },
         ],
         onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
         onNavigate,
         onSearchQueryChange: vi.fn(),
         preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
       }),
       container,
     );
@@ -118,15 +245,18 @@ describe("settings sidebar search", () => {
         ".settings-sidebar__item-label, .settings-sidebar__subitem-label",
       ),
     ].map((item) => item.textContent?.trim());
-    expect(resultLabels).toEqual(["MCP", "General", "Automations"]);
-    expect(container.querySelector(".settings-sidebar__item--active")).toBeNull();
+    expect(resultLabels).toEqual(["MCP", "Appearance", "Language"]);
+    const active = container.querySelector(".settings-sidebar__item--active");
+    expect(active?.textContent).toContain("Appearance");
+    expect(active?.getAttribute("aria-current")).toBe("page");
 
-    const automations = container.querySelector<HTMLAnchorElement>(
-      '.settings-sidebar__subitem[href="/settings/general#settings-general-automations"]',
+    const language = container.querySelector<HTMLAnchorElement>(
+      '.settings-sidebar__subitem[href="/settings/appearance?section=__appearance__#settings-language"]',
     );
-    automations?.click();
-    expect(onNavigate).toHaveBeenCalledWith("config", {
-      hash: "#settings-general-automations",
+    language?.click();
+    expect(onNavigate).toHaveBeenCalledWith("appearance", {
+      search: "?section=__appearance__",
+      hash: "#settings-language",
     });
   });
 
@@ -134,13 +264,16 @@ describe("settings sidebar search", () => {
     const onNavigate = vi.fn();
     render(
       renderSettingsSidebar({
+        ...sidebarAgentProps(),
         basePath: "",
-        activeRouteId: "config",
-        connected: true,
-        version: "",
+        activeRouteId: "appearance",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
         updateAvailable: null,
-        updateRunning: false,
+        updateBusy: false,
         onUpdate: vi.fn(),
+        ...inactiveRefresh,
         searchQuery: "infrastructure",
         searchBlockMatches: [
           {
@@ -151,9 +284,11 @@ describe("settings sidebar search", () => {
           },
         ],
         onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
         onNavigate,
         onSearchQueryChange: vi.fn(),
         preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
       }),
       container,
     );
@@ -176,27 +311,146 @@ describe("settings sidebar search", () => {
     });
   });
 
+  it("finds Agent Defaults by page name after its sidebar demotion", () => {
+    render(
+      renderSettingsSidebar({
+        ...sidebarAgentProps(),
+        basePath: "",
+        activeRouteId: "agents",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
+        updateAvailable: null,
+        updateBusy: false,
+        onUpdate: vi.fn(),
+        ...inactiveRefresh,
+        searchQuery: "agent defaults",
+        onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
+        onNavigate: vi.fn(),
+        onSearchQueryChange: vi.fn(),
+        preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
+      }),
+      container,
+    );
+
+    const result = container.querySelector<HTMLAnchorElement>(
+      '.settings-sidebar__item[href="/settings/ai-agents"]',
+    );
+    expect(result?.textContent?.trim()).toBe("Agent Defaults");
+  });
+
+  it("excludes admin-only pages and config blocks from non-admin search", () => {
+    render(
+      renderSettingsSidebar({
+        ...sidebarAgentProps(),
+        basePath: "",
+        activeRouteId: "appearance",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
+        updateAvailable: null,
+        updateBusy: false,
+        onUpdate: vi.fn(),
+        ...inactiveRefresh,
+        canAdmin: false,
+        searchQuery: "security",
+        searchBlockMatches: [
+          {
+            routeId: "security",
+            label: "Security policy",
+            hash: "#config-section-security",
+          },
+        ],
+        onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
+        onNavigate: vi.fn(),
+        onSearchQueryChange: vi.fn(),
+        preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
+      }),
+      container,
+    );
+
+    expect(container.querySelector('a[href="/settings/security"]')).toBeNull();
+    expect(container.querySelector('a[href$="#config-section-security"]')).toBeNull();
+    expect(container.querySelector('a[href="/settings/approvals"]')).not.toBeNull();
+  });
+
+  it("keeps Memory search results on the canonical Settings tab path", () => {
+    const onNavigate = vi.fn();
+    render(
+      renderSettingsSidebar({
+        ...sidebarAgentProps(),
+        basePath: "/ui",
+        activeRouteId: "memory",
+        activePathname: "/ui/settings/memory/settings",
+        activeHash: "#memory-backend",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
+        updateAvailable: null,
+        updateBusy: false,
+        onUpdate: vi.fn(),
+        ...inactiveRefresh,
+        searchQuery: "backend",
+        searchBlockMatches: [
+          {
+            routeId: "memory",
+            label: "Memory",
+            pathname: "/ui/settings/memory/settings",
+            hash: "#memory-backend",
+          },
+        ],
+        onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
+        onNavigate,
+        onSearchQueryChange: vi.fn(),
+        preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
+      }),
+      container,
+    );
+
+    const link = container.querySelector<HTMLAnchorElement>(
+      '.settings-sidebar__subitem[href="/ui/settings/memory/settings#memory-backend"]',
+    );
+    expect(link).not.toBeNull();
+    expect(link?.getAttribute("aria-current")).toBe("location");
+    link?.click();
+    expect(onNavigate).toHaveBeenCalledWith("memory", {
+      pathname: "/ui/settings/memory/settings",
+      hash: "#memory-backend",
+    });
+  });
+
   it("filters localized routes and groups while preserving navigation", () => {
     let searchQuery = "";
     const onNavigate = vi.fn();
     const rerender = () => {
       render(
         renderSettingsSidebar({
+          ...sidebarAgentProps(),
           basePath: "",
-          activeRouteId: "config",
-          connected: true,
-          version: "",
+          activeRouteId: "appearance",
+          offline: false,
+          lastError: null,
+          gatewayVersion: "",
           updateAvailable: null,
-          updateRunning: false,
+          updateBusy: false,
           onUpdate: vi.fn(),
+          ...inactiveRefresh,
           searchQuery,
           onExit: vi.fn(),
+          onRetryConnect: vi.fn(),
           onNavigate,
           onSearchQueryChange: (nextQuery) => {
             searchQuery = nextQuery;
             rerender();
           },
           preloadTimers: new Map(),
+          saveIndicator: saveIndicator(),
         }),
         container,
       );
@@ -223,13 +477,21 @@ describe("settings sidebar search", () => {
     expect(allLabels).not.toContain("Activity");
     expect(allLabels).not.toContain("Sessions");
     expect(allLabels).toContain("Privacy & Security");
-    expect(allLabels.indexOf("About")).toBe(allLabels.indexOf("Logs") + 1);
+    expect(allLabels.indexOf("Updates")).toBe(allLabels.indexOf("Logs") + 1);
+    expect(allLabels.indexOf("About")).toBe(allLabels.indexOf("Updates") + 1);
 
     enterQuery("  ThEmE  ");
     expect(labels()).toEqual(["Appearance"]);
 
     enterQuery("connections");
-    expect(labels()).toEqual(["Connection", "Channels", "Communications", "Devices"]);
+    expect(labels()).toEqual([
+      "Gateway",
+      "Channels",
+      "Communications",
+      "Talk",
+      "Devices",
+      "Cloud workers",
+    ]);
 
     enterQuery("does-not-exist");
     expect(labels()).toEqual([]);
@@ -248,36 +510,260 @@ describe("settings sidebar search", () => {
     expect(onNavigate).toHaveBeenCalledWith("channels");
   });
 
-  it("keeps the update card above the settings footer", async () => {
-    const onUpdate = vi.fn();
+  it("clears a focused search before Escape exits Settings", () => {
+    let searchQuery = "gateway";
+    const onExit = vi.fn();
+    const rerender = () => {
+      render(
+        renderSettingsSidebar({
+          ...sidebarAgentProps(),
+          basePath: "",
+          activeRouteId: "appearance",
+          offline: false,
+          lastError: null,
+          gatewayVersion: "",
+          updateAvailable: null,
+          updateBusy: false,
+          onUpdate: vi.fn(),
+          ...inactiveRefresh,
+          searchQuery,
+          onExit,
+          onRetryConnect: vi.fn(),
+          onNavigate: vi.fn(),
+          onSearchQueryChange: (nextQuery) => {
+            searchQuery = nextQuery;
+            rerender();
+          },
+          preloadTimers: new Map(),
+          saveIndicator: saveIndicator(),
+        }),
+        container,
+      );
+    };
+
+    rerender();
+    const input = container.querySelector<HTMLInputElement>(".settings-sidebar__search-input");
+    expect(input).not.toBeNull();
+    input?.focus();
+
+    input?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    expect(searchQuery).toBe("");
+    expect(document.activeElement).toBe(input);
+    expect(onExit).not.toHaveBeenCalled();
+
+    input?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    expect(onExit).toHaveBeenCalledOnce();
+  });
+
+  it("renders refreshed settings route titles from the active locale", async () => {
+    i18n.registerTranslation("pt-BR", {
+      routeTitles: {
+        notifications: "Notificacoes",
+        modelProviders: "Provedores de modelos",
+        advanced: "Avancado",
+      },
+    });
+    await i18n.setLocale("pt-BR");
+
     render(
       renderSettingsSidebar({
+        ...sidebarAgentProps(),
         basePath: "",
-        activeRouteId: "config",
-        connected: true,
-        version: "1.0.0",
-        updateAvailable: {
-          currentVersion: "1.0.0",
-          latestVersion: "2.0.0",
-          channel: "stable",
-        },
-        updateRunning: false,
-        onUpdate,
+        activeRouteId: "appearance",
+        offline: false,
+        lastError: null,
+        gatewayVersion: "",
+        updateAvailable: null,
+        updateBusy: false,
+        onUpdate: vi.fn(),
+        ...inactiveRefresh,
         searchQuery: "",
         onExit: vi.fn(),
+        onRetryConnect: vi.fn(),
         onNavigate: vi.fn(),
         onSearchQueryChange: vi.fn(),
         preloadTimers: new Map(),
+        saveIndicator: saveIndicator(),
       }),
       container,
     );
 
-    const card = container.querySelector<HTMLElement & { updateComplete: Promise<boolean> }>(
-      "openclaw-sidebar-update-card",
+    const labels = [...container.querySelectorAll(".settings-sidebar__item-label")].map((item) =>
+      item.textContent?.trim(),
     );
-    await card?.updateComplete;
-    expect(card?.nextElementSibling?.classList.contains("settings-sidebar__footer")).toBe(true);
-    card?.querySelector<HTMLButtonElement>(".sidebar-update-card__action")?.click();
-    expect(onUpdate).toHaveBeenCalledOnce();
+    expect(labels).toContain("Notificacoes");
+    expect(labels).toContain("Provedores de modelos");
+    expect(labels).toContain("Avancado");
+  });
+
+  it("shows the offline retry action without an online status", () => {
+    const onRetryConnect = vi.fn();
+    const renderSidebar = (
+      offline: boolean,
+      lastError: string | null,
+      queuedOutboxCount = 0,
+      restartPending = false,
+      suspensionPhase?: Parameters<typeof renderSettingsSidebar>[0]["suspensionPhase"],
+    ) =>
+      render(
+        renderSettingsSidebar({
+          ...sidebarAgentProps(),
+          basePath: "",
+          activeRouteId: "appearance",
+          offline,
+          restartPending,
+          suspensionPhase,
+          queuedOutboxCount,
+          lastError,
+          gatewayVersion: "1.0.0",
+          updateAvailable: null,
+          updateBusy: false,
+          onUpdate: vi.fn(),
+          ...inactiveRefresh,
+          searchQuery: "",
+          onExit: vi.fn(),
+          onRetryConnect,
+          onNavigate: vi.fn(),
+          onSearchQueryChange: vi.fn(),
+          preloadTimers: new Map(),
+          saveIndicator: { ...saveIndicator(), status: "saving" },
+        }),
+        container,
+      );
+
+    renderSidebar(false, null, 3);
+    expect(container.querySelector(".sidebar-footer-bar__status")).toBeNull();
+    expect(container.querySelector("openclaw-settings-save-indicator")).not.toBeNull();
+
+    renderSidebar(false, null, 0, false, "prepared");
+    expect(container.querySelector(".sidebar-footer-bar__status")?.textContent).toBe("Suspended");
+    expect(container.querySelector("openclaw-settings-save-indicator")).toBeNull();
+    renderSidebar(false, null, 0, false, "accepting");
+    expect(container.querySelector(".sidebar-footer-bar__status")).toBeNull();
+    expect(container.querySelector("openclaw-settings-save-indicator")).not.toBeNull();
+
+    // A Gateway-confirmed suspension outranks the ordinary offline pill while reconnecting.
+    renderSidebar(true, "connection refused?token=settings-secret", 3, false, "prepared");
+    expect(container.querySelector(".sidebar-footer-bar__status--suspended")?.textContent).toBe(
+      "Suspended",
+    );
+    expect(container.querySelector("button.sidebar-footer-bar__status")).toBeNull();
+    expect(container.querySelector("openclaw-settings-save-indicator")).toBeNull();
+
+    renderSidebar(true, "connection refused?token=settings-secret", 3);
+    expect(container.querySelector("openclaw-settings-save-indicator")).toBeNull();
+    const button = container.querySelector<HTMLButtonElement>(".sidebar-footer-bar__status");
+    expect(button?.hasAttribute("title")).toBe(false);
+    expect(
+      (button?.closest("openclaw-tooltip") as (HTMLElement & { content?: string }) | null)?.content,
+    ).toBe("connection refused?[redacted-credential]");
+    expect(button?.textContent).toContain("3 queued");
+    expect(button?.getAttribute("aria-label")).toBe("Offline — Retry now — 3 queued");
+    button?.click();
+    expect(onRetryConnect).toHaveBeenCalledOnce();
+
+    renderSidebar(true, null, 3, true, "prepared");
+    expect(container.querySelector(".sidebar-footer-bar__status--restarting")?.textContent).toBe(
+      "Restarting…",
+    );
+    expect(container.querySelector("button.sidebar-footer-bar__status")).toBeNull();
+  });
+});
+
+describe("Settings agent selector", () => {
+  const renderSidebar = (overrides: Partial<Parameters<typeof renderSettingsSidebar>[0]> = {}) => {
+    const props = {
+      ...sidebarAgentProps(),
+      basePath: "",
+      activeRouteId: "model-providers" as const,
+      offline: false,
+      lastError: null,
+      gatewayVersion: "",
+      updateAvailable: null,
+      updateBusy: false,
+      onUpdate: vi.fn(),
+      ...inactiveRefresh,
+      searchQuery: "",
+      onExit: vi.fn(),
+      onRetryConnect: vi.fn(),
+      onNavigate: vi.fn(),
+      onSearchQueryChange: vi.fn(),
+      preloadTimers: new Map(),
+      saveIndicator: saveIndicator(),
+      ...overrides,
+    };
+    render(renderSettingsSidebar(props), container);
+    return props;
+  };
+
+  it.each(["sidebar", "embed-list", "embed-page"] as const)(
+    "uses the shared selection in the %s presentation",
+    async (presentation) => {
+      const props = renderSidebar({ presentation });
+      expect(container.querySelectorAll("openclaw-agent-select")).toHaveLength(1);
+      const selector = container.querySelector<AgentSelect>("openclaw-agent-select")!;
+      await selector.updateComplete;
+      expect(
+        selector.querySelector(".agent-select__trigger")?.getAttribute("aria-label"),
+      ).toContain("Main");
+      const research = selector.querySelector<HTMLElement>('[aria-label="Research"]')!;
+      research.click();
+      expect(props.settingsAgentSelection.set).toHaveBeenCalledWith("research");
+      expect(props.onNavigate).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([0, 1])(
+    "keeps a disabled shared selector visible with %i selectable agents",
+    async (count) => {
+      renderSidebar({
+        agents: [
+          ...[{ id: "main", name: "Main" }].slice(0, count),
+          { id: "system", name: "System", kind: "system" },
+        ],
+        settingsAgentSelection: {
+          ...sidebarAgentProps().settingsAgentSelection,
+          state: { selectedId: count ? "main" : null, scopeId: count ? "main" : null },
+        },
+      });
+      const selector = container.querySelector<AgentSelect>("openclaw-agent-select")!;
+      await selector.updateComplete;
+      expect(selector.querySelector<HTMLButtonElement>(".agent-select__trigger")?.disabled).toBe(
+        true,
+      );
+      expect(selector.querySelectorAll("[data-agent-option]")).toHaveLength(count);
+      expect(selector.options.some((option) => option.value === "system")).toBe(false);
+    },
+  );
+
+  it("preserves creator grouping without hiding dangling or cyclic agents", async () => {
+    renderSidebar({
+      agents: [
+        { id: "main", name: "Main" },
+        { id: "orphan", name: "Orphan", creatorAgentId: "deleted" },
+        { id: "research", name: "Research", creatorAgentId: "main" },
+        { id: "cycle-a", creatorAgentId: "cycle-b" },
+        { id: "cycle-b", creatorAgentId: "cycle-a" },
+        { id: "system", kind: "system" },
+      ],
+    });
+    const selector = container.querySelector<AgentSelect>("openclaw-agent-select")!;
+    await selector.updateComplete;
+    expect(selector.options.map((option) => option.value)).toEqual([
+      "main",
+      "research",
+      "orphan",
+      "cycle-a",
+      "cycle-b",
+    ]);
+    const rows = selector.querySelectorAll("[data-agent-option]");
+    expect(rows[1]?.querySelector(".agent-select__option-description")?.textContent?.trim()).toBe(
+      t("agents.createdBy", { id: "main" }),
+    );
+    expect(rows[2]?.querySelector(".agent-select__option-description")).toBeNull();
   });
 });

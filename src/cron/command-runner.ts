@@ -109,12 +109,18 @@ export async function runCronCommandJob(params: {
       ...(params.abortSignal ? { signal: params.abortSignal } : {}),
       killProcessTree: true,
     });
+    const termination =
+      result.termination === "signal" &&
+      params.abortSignal?.reason instanceof Error &&
+      params.abortSignal.reason.name === "TimeoutError"
+        ? "timeout"
+        : result.termination;
     const ok =
       result.code === 0 &&
       !result.killed &&
-      result.termination !== "timeout" &&
-      result.termination !== "no-output-timeout" &&
-      result.termination !== "signal";
+      termination !== "timeout" &&
+      termination !== "no-output-timeout" &&
+      termination !== "signal";
     const status: CronRunStatus = ok ? "ok" : "error";
     const summary = buildCronCommandSummary({
       stdout: result.stdout,
@@ -127,11 +133,28 @@ export async function runCronCommandJob(params: {
       : commandErrorMessage({
           code: result.code,
           signal: result.signal,
-          termination: result.termination,
+          termination,
         });
+    const failureNotificationDetail =
+      termination === "timeout"
+        ? ({ kind: "command-timeout", mode: "wall-clock" } as const)
+        : termination === "no-output-timeout"
+          ? ({ kind: "command-timeout", mode: "no-output" } as const)
+          : termination === "exit" && typeof result.code === "number" && result.code !== 0
+            ? ({ kind: "command-exit", exitCode: result.code } as const)
+            : undefined;
     return {
       status,
       ...(error ? { error } : {}),
+      ...(failureNotificationDetail
+        ? {
+            failureNotificationDetail,
+            errorClassification:
+              failureNotificationDetail.kind === "command-timeout"
+                ? ({ kind: "reason", reason: "timeout" } as const)
+                : ({ kind: "permanent" } as const),
+          }
+        : {}),
       ...(summary ? { summary } : {}),
       diagnostics: buildDiagnostics({
         command,
@@ -149,6 +172,9 @@ export async function runCronCommandJob(params: {
     return {
       status: "error",
       error,
+      ...(err instanceof Error && "code" in err && err.code === "ENOENT"
+        ? { errorClassification: { kind: "permanent" as const } }
+        : {}),
       diagnostics: {
         summary: error,
         entries: [

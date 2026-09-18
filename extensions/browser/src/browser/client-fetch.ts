@@ -4,39 +4,51 @@
  * Sends requests to either an absolute HTTP browser-control URL or the local
  * in-process dispatcher, adding loopback auth and operator-facing diagnostics.
  */
-import { parseBrowserHttpUrl } from "openclaw/plugin-sdk/browser-config";
-import { extractErrorCode, formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { parseBrowserHttpUrl } from "openclaw/plugin-sdk/browser-cdp";
+import {
+  extractErrorCode,
+  formatErrorMessage,
+  toErrorObject,
+} from "openclaw/plugin-sdk/error-runtime";
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { formatCliCommand } from "../cli/command-format.js";
+import { formatCliCommand } from "openclaw/plugin-sdk/setup-tools";
+import { fetchWithSsrFGuard, isLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
+import {
+  normalizeOptionalString,
+  normalizeLowercaseStringOrEmpty,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getRuntimeConfig } from "../config/config.js";
-import { isLoopbackHost } from "../gateway/net.js";
 import { getBridgeAuthForPort } from "./bridge-auth-registry.js";
 import { resolveBrowserConfig, resolveProfile } from "./config.js";
 import { resolveBrowserControlAuth } from "./control-auth.js";
 import {
   parseBrowserErrorPayload,
-  type BrowserNoDisplayErrorMetadata,
+  type BrowserActErrorCode,
+  type BrowserErrorPayload,
+  type BrowserErrorMetadata,
   type BrowserNoDisplayErrorDetails,
 } from "./errors.js";
 import { resolveBrowserRateLimitMessage } from "./rate-limit-message.js";
+import { getBrowserRequestScope } from "./request-scope.js";
 
 // Application-level error from the browser control service (service is reachable
 // but returned an error response). Must NOT be wrapped with "Can't reach ..." messaging.
 export class BrowserServiceError extends Error {
   readonly status?: number;
-  readonly reason?: BrowserNoDisplayErrorMetadata["reason"];
+  readonly code?: BrowserActErrorCode;
+  readonly unrecognizedCode?: true;
+  readonly reason?: BrowserErrorMetadata["reason"];
   readonly details?: BrowserNoDisplayErrorDetails;
 
-  constructor(message: string, metadata?: BrowserNoDisplayErrorMetadata, status?: number) {
+  constructor(message: string, metadata?: BrowserErrorPayload, status?: number) {
     super(message);
     this.name = "BrowserServiceError";
     this.status = status;
-    this.reason = metadata?.reason;
-    this.details = metadata?.details;
+    this.code = metadata?.code;
+    this.unrecognizedCode = metadata?.unrecognizedCode;
+    this.reason = metadata && "reason" in metadata ? metadata.reason : undefined;
+    this.details = metadata && "details" in metadata ? metadata.details : undefined;
   }
 }
 
@@ -50,16 +62,10 @@ function browserServiceErrorFromPayload(
   const modelHint = resolveBrowserServiceModelHint(message, status);
   return new BrowserServiceError(
     modelHint ? appendBrowserToolModelHint(message, modelHint) : message,
-    parsed && "reason" in parsed ? parsed : undefined,
+    parsed ?? undefined,
     status,
   );
 }
-
-type LoopbackBrowserAuthDeps = {
-  getRuntimeConfig: typeof getRuntimeConfig;
-  resolveBrowserControlAuth: typeof resolveBrowserControlAuth;
-  getBridgeAuthForPort: typeof getBridgeAuthForPort;
-};
 
 function isAbsoluteHttp(url: string): boolean {
   return /^https?:\/\//i.test(url.trim());
@@ -73,10 +79,9 @@ function isLoopbackHttpUrl(url: string): boolean {
   }
 }
 
-function withLoopbackBrowserAuthImpl(
+function withLoopbackBrowserAuth(
   url: string,
   init: (RequestInit & { timeoutMs?: number }) | undefined,
-  deps: LoopbackBrowserAuthDeps,
 ): RequestInit & { timeoutMs?: number } {
   const headers = new Headers(init?.headers ?? {});
   if (headers.has("authorization") || headers.has("x-openclaw-password")) {
@@ -87,8 +92,8 @@ function withLoopbackBrowserAuthImpl(
   }
 
   try {
-    const cfg = deps.getRuntimeConfig();
-    const auth = deps.resolveBrowserControlAuth(cfg);
+    const cfg = getRuntimeConfig();
+    const auth = resolveBrowserControlAuth(cfg);
     if (auth.token) {
       headers.set("Authorization", `Bearer ${auth.token}`);
       return { ...init, headers };
@@ -105,7 +110,7 @@ function withLoopbackBrowserAuthImpl(
   // Fall back to the in-memory registry if config auth is not available.
   try {
     const { port } = parseBrowserHttpUrl(url, "browser control URL");
-    const bridgeAuth = deps.getBridgeAuthForPort(port);
+    const bridgeAuth = getBridgeAuthForPort(port);
     if (bridgeAuth?.token) {
       headers.set("Authorization", `Bearer ${bridgeAuth.token}`);
     } else if (bridgeAuth?.password) {
@@ -116,17 +121,6 @@ function withLoopbackBrowserAuthImpl(
   }
 
   return { ...init, headers };
-}
-
-function withLoopbackBrowserAuth(
-  url: string,
-  init: (RequestInit & { timeoutMs?: number }) | undefined,
-): RequestInit & { timeoutMs?: number } {
-  return withLoopbackBrowserAuthImpl(url, init, {
-    getRuntimeConfig,
-    resolveBrowserControlAuth,
-    getBridgeAuthForPort,
-  });
 }
 
 const BROWSER_TOOL_PERSISTENT_MODEL_HINT =
@@ -146,6 +140,18 @@ const BROWSER_PERSISTENT_FAILURE_RE =
 const BROWSER_ERROR_BODY_LIMIT_BYTES = 16 * 1024;
 // `response/body` supports 5M characters; 32 MiB covers worst-case JSON escaping while staying bounded.
 const BROWSER_SUCCESS_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
+
+function decodeBrowserControlResponseUtf8(body: Uint8Array, status: number): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    throw browserServiceErrorFromPayload(
+      undefined,
+      `Browser control response was not valid UTF-8 (HTTP ${status})`,
+      status,
+    );
+  }
+}
 
 function isRateLimitStatus(status: number): boolean {
   return status === 429;
@@ -374,7 +380,7 @@ async function fetchHttpJson<T>(
       const body = await readResponseWithLimit(res, BROWSER_ERROR_BODY_LIMIT_BYTES).catch(
         () => undefined,
       );
-      const text = body ? new TextDecoder().decode(body) : "";
+      const text = body ? decodeBrowserControlResponseUtf8(body, res.status) : "";
       let parsed: unknown;
       if (text) {
         try {
@@ -389,7 +395,7 @@ async function fetchHttpJson<T>(
       onOverflow: ({ maxBytes }) =>
         new BrowserServiceError(`Browser control response exceeded ${maxBytes} bytes`),
     });
-    return JSON.parse(new TextDecoder().decode(body)) as T;
+    return JSON.parse(decodeBrowserControlResponseUtf8(body, res.status)) as T;
   } finally {
     clearTimeout(t);
     await release?.();
@@ -405,9 +411,13 @@ export async function fetchBrowserJson<T>(
   init?: RequestInit & { timeoutMs?: number },
 ): Promise<T> {
   const timeoutMs = resolveBrowserFetchTimeoutMs(init?.timeoutMs);
+  const scope = getBrowserRequestScope();
   let isDispatcherPath = false;
   try {
     if (isAbsoluteHttp(url)) {
+      if (scope) {
+        throw new Error("Dashboard browser requests must stay on the local managed browser");
+      }
       const httpInit = withLoopbackBrowserAuth(url, init);
       return await fetchHttpJson<T>(url, { ...httpInit, timeoutMs });
     }
@@ -417,6 +427,9 @@ export async function fetchBrowserJson<T>(
     const query: Record<string, unknown> = {};
     for (const [key, value] of parsed.searchParams.entries()) {
       query[key] = value;
+    }
+    if (scope) {
+      query.managedOnly = true;
     }
     let body = init?.body;
     if (typeof body === "string") {
@@ -442,15 +455,12 @@ export async function fetchBrowserJson<T>(
     let abortListener: (() => void) | undefined;
     const abortPromise: Promise<never> = abortCtrl.signal.aborted
       ? Promise.reject(
-          toLintErrorObject(abortCtrl.signal.reason ?? new Error("aborted"), "Non-Error rejection"),
+          toErrorObject(abortCtrl.signal.reason ?? new Error("aborted"), "Non-Error rejection"),
         )
       : new Promise((_, reject) => {
           abortListener = () =>
             reject(
-              toLintErrorObject(
-                abortCtrl.signal.reason ?? new Error("aborted"),
-                "Non-Error rejection",
-              ),
+              toErrorObject(abortCtrl.signal.reason ?? new Error("aborted"), "Non-Error rejection"),
             );
           abortCtrl.signal.addEventListener("abort", abortListener, { once: true });
         });
@@ -471,6 +481,7 @@ export async function fetchBrowserJson<T>(
       query,
       body,
       signal: abortCtrl.signal,
+      ...(scope ? { assertCurrent: scope.assertCurrent } : {}),
     });
 
     const result = await Promise.race([dispatchPromise, abortPromise]).finally(() => {
@@ -506,18 +517,4 @@ export async function fetchBrowserJson<T>(
     }
     throw enhanceBrowserFetchError(url, err, timeoutMs);
   }
-}
-
-function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
 }

@@ -1,40 +1,45 @@
 /**
  * Shared ClickClack config, runtime account, API object, and target types.
  */
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type {
+  ChannelBotLoopProtectionConfig,
+  OpenClawConfig,
+} from "openclaw/plugin-sdk/config-contracts";
+import type { tryReadSecretFileSync } from "openclaw/plugin-sdk/secret-file-runtime";
+import type { ClickClackAccountConfigInput } from "./config-schema.js";
 
 /** Session-linked ClickClack discussion settings for one account. */
-type ClickClackDiscussionsConfig = {
-  enabled?: boolean;
-  workspace?: string;
-  controlUrlBase?: string;
-  section?: string;
-};
+type ClickClackDiscussionsConfig = NonNullable<ClickClackAccountConfigInput["discussions"]>;
+
+/** Per-channel group policy for a ClickClack group/channel. */
+export type ClickClackGroupConfig = NonNullable<ClickClackAccountConfigInput["groups"]>[string];
 
 /** User-configurable settings for one ClickClack account. */
-export type ClickClackAccountConfig = {
-  name?: string;
-  enabled?: boolean;
-  baseUrl?: string;
-  apiBaseUrl?: string;
+export type ClickClackAccountConfig = Omit<
+  ClickClackAccountConfigInput,
+  "configWrites" | "token" | "discussions" | "groups"
+> & {
+  /** Megabyte cap for media this channel accepts and delivers. */
+  mediaMaxMb?: number;
   token?: unknown;
-  tokenFile?: string;
-  workspace?: string;
-  botUserId?: string;
-  agentId?: string;
-  replyMode?: "agent" | "model";
-  model?: string;
-  systemPrompt?: string;
-  toolsAllow?: string[];
-  defaultTo?: string;
-  allowFrom?: string[];
-  reconnectMs?: number;
+  /** Accept messages authored by other ClickClack bots. */
+  allowBots?: boolean | "mentions";
+  /** Sliding-window bot-pair loop guard for accepted bot messages. */
+  botLoopProtection?: ChannelBotLoopProtectionConfig;
   /** Opt-in: publish durable agent activity (commentary + tool) rows. */
   agentActivity?: boolean;
+  /** Opt-in: publish ephemeral native progress while an agent turn runs. */
+  nativeProgress?: boolean;
   /** Publish the native command catalog to ClickClack composer autocomplete. */
   commandMenu?: boolean;
   /** Create and synchronize one managed ClickClack channel per OpenClaw session. */
   discussions?: ClickClackDiscussionsConfig;
+  /** Require a direct mention before dispatching group messages (default false). */
+  requireMention?: boolean;
+  /** Mention patterns for this account in group channels. */
+  mentionPatterns?: string[];
+  /** Per-channel group policy overrides keyed by ClickClack channel ID. */
+  groups?: Record<string, ClickClackGroupConfig>;
 };
 
 /** Root ClickClack channel config with optional named accounts. */
@@ -59,8 +64,15 @@ export type ResolvedClickClackAccount = {
   baseUrl: string;
   apiEndpoint: string;
   token: string;
+  tokenSource?: "env" | "tokenFile" | "config" | "none";
+  tokenStatus?: "available" | "configured_unavailable" | "missing";
+  credentialDiagnostics?: Extract<
+    ReturnType<typeof tryReadSecretFileSync>,
+    { status: "configured_unavailable" }
+  >["diagnostic"][];
   workspace: string;
   botUserId?: string;
+  botHandle?: string;
   agentId?: string;
   replyMode: "agent" | "model";
   model?: string;
@@ -68,8 +80,11 @@ export type ResolvedClickClackAccount = {
   toolsAllow?: string[];
   defaultTo: string;
   allowFrom: string[];
+  allowBots: boolean | "mentions";
+  botLoopProtection?: ChannelBotLoopProtectionConfig;
   reconnectMs: number;
   agentActivity: boolean;
+  nativeProgress?: boolean;
   commandMenu: boolean;
   discussions: {
     enabled: boolean;
@@ -78,6 +93,9 @@ export type ResolvedClickClackAccount = {
     section: string;
   };
   config: ClickClackAccountConfig;
+  requireMention: boolean;
+  mentionPatterns: string[];
+  groups: Record<string, ClickClackGroupConfig>;
 };
 
 /** User object returned by the ClickClack API. */
@@ -105,6 +123,8 @@ export type ClickClackBotCommand = {
 
 /** One-time bot token and installer context returned by setup-code claim. */
 export type ClickClackSetupCodeClaim = {
+  contract_version?: 1;
+  api_base_url?: string;
   token: string;
   bot: {
     id: string;
@@ -144,7 +164,9 @@ export type ClickClackChannel = {
   external_ref?: string;
   external_url?: string;
   sidebar_section?: string;
+  display_title?: string;
   archived?: boolean;
+  archived_at?: string | null;
   created_at: string;
 };
 
@@ -162,6 +184,7 @@ export type ClickClackMessage = {
   body: string;
   body_format: "markdown";
   created_at: string;
+  kind?: "message" | "agent_commentary" | "agent_tool";
   author?: ClickClackUser;
   thread_state?: {
     root_message_id: string;

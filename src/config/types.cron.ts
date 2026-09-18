@@ -1,37 +1,22 @@
 // Defines cron scheduling configuration types.
+
+import type { z } from "zod";
 import type { SecretInput } from "./types.secrets.js";
+import type { SsrFPolicyConfig } from "./types.ssrf.js";
+import type { OpenClawSchemaShape } from "./zod-schema.root-shape.js";
 
-export type CronFailureAlertConfig = {
-  enabled?: boolean;
-  after?: number;
-  cooldownMs?: number;
-  includeSkipped?: boolean;
-  mode?: "announce" | "webhook";
-  accountId?: string;
-};
+type CronSchemaInput = NonNullable<z.input<typeof OpenClawSchemaShape.cron>>;
 
-export type CronFailureDestinationConfig = {
-  channel?: string;
-  to?: string;
-  accountId?: string;
-  mode?: "announce" | "webhook";
-};
+export type CronFailureAlertConfig = NonNullable<CronSchemaInput["failureAlert"]>;
 
-export type CronConfig = {
-  enabled?: boolean;
-  store?: string;
-  triggers?: {
-    enabled?: boolean;
-  };
+export type CronFailureDestinationConfig = Pick<
+  CronFailureAlertConfig,
+  "channel" | "to" | "accountId" | "mode"
+>;
+
+export type CronConfig = Omit<CronSchemaInput, "webhookToken" | "webhookSsrfPolicy"> & {
   /** Bearer token for cron webhook POST delivery. */
   webhookToken?: SecretInput;
-  /**
-   * How long to retain completed cron run sessions before automatic pruning.
-   * Accepts a duration string (e.g. "24h", "7d", "1h30m") or `false` to disable pruning.
-   * Default: "24h".
-   */
-  sessionRetention?: string | false;
-  failureAlert?: CronFailureAlertConfig;
-  /** Default destination for failure notifications across all cron jobs. */
-  failureDestination?: CronFailureDestinationConfig;
+  /** SSRF policy for all outbound cron webhook deliveries. */
+  webhookSsrfPolicy?: SsrFPolicyConfig;
 };

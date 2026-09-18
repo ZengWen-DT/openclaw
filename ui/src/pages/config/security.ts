@@ -4,6 +4,7 @@
 import { html, type TemplateResult } from "lit";
 import { icons } from "../../components/icons.ts";
 import {
+  renderSettingsDefaultDescription,
   renderSettingsRow,
   renderSettingsSection,
   renderSettingsSegmented,
@@ -12,14 +13,15 @@ import {
   renderSettingsValue,
 } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
-import { PROFILE_OPTIONS } from "../../lib/agents/display.ts";
+import { PROFILE_OPTIONS } from "../../lib/agents/tool-catalog.ts";
 
 export type SecurityOverview = {
   gatewayAuth: string;
   execPolicy: string;
-  deviceAuth: boolean;
   browserEnabled: boolean;
+  browserEnabledOverridden: boolean;
   toolProfile: string;
+  toolProfileOverridden: boolean;
 };
 
 type SecurityViewProps = {
@@ -34,13 +36,23 @@ type SecurityViewProps = {
 };
 
 function renderSecurityOverview(props: SecurityViewProps) {
-  const { gatewayAuth, execPolicy, deviceAuth, browserEnabled, toolProfile } = props.security;
-  const normalizedToolProfile = toolProfile.trim() || "full";
+  const {
+    gatewayAuth,
+    execPolicy,
+    browserEnabled,
+    browserEnabledOverridden,
+    toolProfile,
+    toolProfileOverridden,
+  } = props.security;
+  const normalizedToolProfile = toolProfile.trim();
   const profileOptions = PROFILE_OPTIONS.map((profile) => ({
     value: profile.id as string,
     label: t(profile.labelKey),
   }));
-  if (!profileOptions.some((option) => option.value === normalizedToolProfile)) {
+  if (
+    normalizedToolProfile &&
+    !profileOptions.some((option) => option.value === normalizedToolProfile)
+  ) {
     profileOptions.push({ value: normalizedToolProfile, label: normalizedToolProfile });
   }
   return renderSettingsSection({ title: t("quickSettings.security.title") }, [
@@ -58,12 +70,16 @@ function renderSecurityOverview(props: SecurityViewProps) {
     }),
     renderSettingsToggleRow({
       title: t("quickSettings.security.browserEnabled"),
+      description: renderSettingsDefaultDescription(t("common.enabled"), browserEnabledOverridden),
       checked: browserEnabled,
       disabled: props.configBusy,
       onChange: (enabled) => props.onBrowserEnabledToggle?.(enabled),
     }),
     renderSettingsRow({
       title: t("quickSettings.security.toolProfile"),
+      description: toolProfileOverridden
+        ? undefined
+        : t("quickSettings.security.toolProfileDefault"),
       stacked: true,
       control: renderSettingsSegmented({
         value: normalizedToolProfile,
@@ -73,22 +89,15 @@ function renderSecurityOverview(props: SecurityViewProps) {
       }),
     }),
     renderSettingsRow({
-      title: t("quickSettings.security.deviceAuth"),
-      control: renderSettingsStatus({
-        kind: deviceAuth ? "ok" : "warn",
-        label: deviceAuth ? t("common.enabled") : t("common.disabled"),
-      }),
-    }),
-    renderSettingsRow({
-      title: t("nodes.pairing.title"),
+      title: t("devices.pairing.title"),
       control: html`
         <button
           class="btn"
-          title=${props.canPairDevice ? "" : t("nodes.pairing.adminRequired")}
+          title=${props.canPairDevice ? "" : t("devices.pairing.adminRequired")}
           ?disabled=${!props.canPairDevice}
           @click=${props.onPairMobile}
         >
-          ${icons.smartphone} ${t("nodes.pairing.button")}
+          ${icons.smartphone} ${t("devices.pairing.button")}
         </button>
       `,
     }),

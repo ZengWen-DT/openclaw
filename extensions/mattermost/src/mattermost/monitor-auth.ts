@@ -1,58 +1,19 @@
 // Mattermost plugin module implements monitor auth behavior.
-import { parseAccessGroupAllowFromEntry } from "openclaw/plugin-sdk/access-groups";
 import {
   type ChannelIngressDecision,
   type ChannelIngressEventInput,
-  type ChannelIngressIdentifierKind,
   resolveStableChannelMessageIngress,
-  type StableChannelIngressIdentityParams,
 } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import {
-  normalizeLowercaseStringOrEmpty,
-  uniqueStrings,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
+  resolveChannelContextVisibilityMode,
+  shouldIncludeSupplementalContext,
+} from "openclaw/plugin-sdk/context-visibility-runtime";
+import { uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ResolvedMattermostAccount } from "./accounts.js";
 import type { MattermostChannel } from "./client.js";
+import { mattermostIngressIdentity, normalizeMattermostAllowEntry } from "./ingress-identity.js";
 import type { ChatType, OpenClawConfig } from "./runtime-api.js";
 import { isDangerousNameMatchingEnabled, resolveAllowlistMatchSimple } from "./runtime-api.js";
-
-const MATTERMOST_USER_NAME_KIND =
-  "plugin:mattermost-user-name" as const satisfies ChannelIngressIdentifierKind;
-const mattermostIngressIdentity = {
-  key: "sender-id",
-  normalize: normalizeMattermostAllowEntry,
-  aliases: [
-    {
-      key: "sender-name",
-      kind: MATTERMOST_USER_NAME_KIND,
-      normalizeEntry: normalizeMattermostAllowEntry,
-      normalizeSubject: normalizeMattermostAllowEntry,
-      dangerous: true,
-    },
-  ],
-  isWildcardEntry: (entry) => normalizeMattermostAllowEntry(entry) === "*",
-  resolveEntryId: ({ entryIndex, fieldKey }) =>
-    `mattermost-entry-${entryIndex + 1}:${fieldKey === "sender-name" ? "name" : "user"}`,
-} satisfies StableChannelIngressIdentityParams;
-
-export function normalizeMattermostAllowEntry(entry: string): string {
-  const trimmed = entry.trim();
-  if (!trimmed) {
-    return "";
-  }
-  if (trimmed === "*") {
-    return "*";
-  }
-  const accessGroupName = parseAccessGroupAllowFromEntry(trimmed);
-  if (accessGroupName) {
-    return `accessGroup:${accessGroupName}`;
-  }
-  const normalized = trimmed
-    .replace(/^(mattermost|user):/i, "")
-    .replace(/^@/, "")
-    .trim();
-  return normalized ? normalizeLowercaseStringOrEmpty(normalized) : "";
-}
 
 export function normalizeMattermostAllowList(entries: Array<string | number>): string[] {
   const normalized = entries
@@ -90,7 +51,7 @@ export function isMattermostSenderAllowed(params: {
   return match.allowed;
 }
 
-export function mapMattermostChannelTypeToChatType(channelType?: string | null): ChatType {
+function mapMattermostChannelTypeToChatType(channelType?: string | null): ChatType {
   const normalized = channelType?.trim().toUpperCase();
   if (!normalized) {
     return "direct";
@@ -217,6 +178,29 @@ export async function resolveMattermostMonitorInboundAccess(params: {
     },
   });
   return ingress;
+}
+
+/** Live and recovered history share the same trigger-versus-visibility policy. */
+export function shouldRetainMattermostSenderHistory(params: {
+  cfg: OpenClawConfig;
+  accountId: string;
+  kind: ChatType;
+  ingress: ChannelIngressDecision;
+}): boolean {
+  return (
+    params.ingress.decision === "allow" ||
+    (params.kind !== "direct" &&
+      params.ingress.reasonCode === "group_policy_not_allowlisted" &&
+      shouldIncludeSupplementalContext({
+        mode: resolveChannelContextVisibilityMode({
+          cfg: params.cfg,
+          channel: "mattermost",
+          accountId: params.accountId,
+        }),
+        kind: "history",
+        senderAllowed: false,
+      }))
+  );
 }
 
 function resolveMattermostCommandDenyReason(params: {

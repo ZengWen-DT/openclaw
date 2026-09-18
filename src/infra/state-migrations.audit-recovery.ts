@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
+import { syncDirectoryIfSupported } from "./directory-durability.js";
+import { readFileWindowFully } from "./file-read.js";
 import { root as createFsSafeRoot } from "./fs-safe.js";
-import { syncDirectoryBestEffort } from "./sqlite-snapshot.js";
 import {
   legacyAuditRawCheckpointKey,
   legacyAuditRawCheckpointsMatch,
@@ -46,16 +47,17 @@ function auditRecoveryJournalTargetsSnapshot(
   );
 }
 
-function auditRecoveryCheckpointPrefixMatches(
+export function auditRecoveryCheckpointPrefixMatches(
   snapshot: LegacyAuditSourceSnapshot,
   checkpoint: LegacyAuditRawCheckpoint,
 ): boolean {
   if (snapshot.rawBytes.length < checkpoint.size) {
     return false;
   }
+  const prefix = snapshot.rawBytes.subarray(0, checkpoint.size);
   return (
-    createHash("sha256").update(snapshot.rawBytes.subarray(0, checkpoint.size)).digest("hex") ===
-    checkpoint.contentHash
+    createHash("sha256").update(prefix).digest("hex") === checkpoint.contentHash ||
+    createHash("sha256").update(prefix.toString("utf8")).digest("hex") === checkpoint.contentHash
   );
 }
 
@@ -63,7 +65,7 @@ async function syncAuditRecoveryDirectory(
   root: AuditMigrationRoot,
   relativePath: string,
 ): Promise<void> {
-  await syncDirectoryBestEffort(path.join(root.rootReal, path.dirname(relativePath)));
+  await syncDirectoryIfSupported(path.join(root.rootReal, path.dirname(relativePath)));
 }
 
 export async function readLegacyAuditSourceSnapshot(
@@ -110,14 +112,8 @@ export async function readLegacyAuditSourcePrefixSnapshotForBackup(
       throw new Error("legacy audit source is not a regular file");
     }
     const rawBytes = Buffer.allocUnsafe(before.size);
-    let offset = 0;
-    while (offset < rawBytes.length) {
-      const length = Math.min(64 * 1024, rawBytes.length - offset);
-      const { bytesRead } = await opened.handle.read(rawBytes, offset, length, offset);
-      if (bytesRead === 0) {
-        throw new Error("legacy audit source was truncated while backup was reading it");
-      }
-      offset += bytesRead;
+    if ((await readFileWindowFully(opened.handle, rawBytes, 0)) !== rawBytes.length) {
+      throw new Error("legacy audit source was truncated while backup was reading it");
     }
     const after = await opened.handle.stat();
     if (before.dev !== after.dev || before.ino !== after.ino || after.size < before.size) {
@@ -235,7 +231,9 @@ async function writeAuditRecoveryProgress(params: {
     mkdir: false,
     mode: 0o600,
   });
-  const opened = await params.root.open(progressRelativePath);
+  const opened = await params.root.openWritable(progressRelativePath, {
+    writeMode: "update",
+  });
   try {
     await opened.handle.chmod(0o600);
     await opened.handle.sync();
@@ -353,7 +351,9 @@ async function stageAuditRecoveryRestore(params: {
     },
   });
   await params.root.create(stagingRelativePath, journalRaw, { mode: 0o600 });
-  const staged = await params.root.open(stagingRelativePath);
+  const staged = await params.root.openWritable(stagingRelativePath, {
+    writeMode: "update",
+  });
   try {
     await staged.handle.chmod(0o600);
     await staged.handle.sync();
@@ -682,29 +682,4 @@ export function findPreviousLegacyAuditRawCheckpoint(
     .entries()
     .toReversed()
     .find((entry) => entry.value.generationKey === generationKey)?.value;
-}
-
-export function recordsAfterLegacyAuditRawCheckpoint<T>(params: {
-  checkpoint: LegacyAuditRawCheckpoint;
-  snapshot: LegacyAuditSourceSnapshot;
-  records: readonly T[];
-}): readonly T[] | undefined {
-  const rawBytes = params.snapshot.rawBytes;
-  if (rawBytes.length < params.checkpoint.size) {
-    return undefined;
-  }
-  const prefixHash = createHash("sha256")
-    .update(rawBytes.subarray(0, params.checkpoint.size))
-    .digest("hex");
-  const legacyUtf8PrefixHash = createHash("sha256")
-    .update(rawBytes.subarray(0, params.checkpoint.size).toString("utf8"))
-    .digest("hex");
-  if (
-    (prefixHash !== params.checkpoint.contentHash &&
-      legacyUtf8PrefixHash !== params.checkpoint.contentHash) ||
-    params.records.length < params.checkpoint.recordCount
-  ) {
-    return undefined;
-  }
-  return params.records.slice(params.checkpoint.recordCount);
 }

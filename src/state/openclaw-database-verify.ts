@@ -1,4 +1,4 @@
-import type { Worker } from "node:worker_threads";
+import type { ChildProcess } from "node:child_process";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   applyOpenClawDatabaseVerificationResults,
@@ -6,6 +6,7 @@ import {
   OPENCLAW_DATABASE_VERIFY_INITIAL_DELAY_MS,
   OPENCLAW_DATABASE_VERIFY_INTERVAL_MS,
   runDatabaseVerifyWorker,
+  terminateDatabaseVerifyWorker,
 } from "./openclaw-database-verify.impl.js";
 
 const log = createSubsystemLogger("state/database-verify");
@@ -14,12 +15,15 @@ const log = createSubsystemLogger("state/database-verify");
 export function startOpenClawDatabaseIntegrityVerifier(options: { env: NodeJS.ProcessEnv }): {
   stop: () => Promise<void>;
 } {
-  let activeWorker: Worker | undefined;
+  let activeWorker: ChildProcess | undefined;
+  let activeRun: Promise<void> | undefined;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   const schedule = (delayMs: number) => {
-    timer = setTimeout(() => void run(), delayMs);
+    timer = setTimeout(() => {
+      activeRun = run();
+    }, delayMs);
     timer.unref?.();
   };
   const run = async () => {
@@ -33,7 +37,7 @@ export function startOpenClawDatabaseIntegrityVerifier(options: { env: NodeJS.Pr
           },
         });
         if (!stopped) {
-          applyOpenClawDatabaseVerificationResults({ ...options, results, targets });
+          await applyOpenClawDatabaseVerificationResults({ ...options, results, targets });
         }
       }
     } catch (error) {
@@ -56,8 +60,14 @@ export function startOpenClawDatabaseIntegrityVerifier(options: { env: NodeJS.Pr
         clearTimeout(timer);
         timer = undefined;
       }
-      await activeWorker?.terminate();
-      activeWorker = undefined;
+      try {
+        if (activeWorker) {
+          await terminateDatabaseVerifyWorker(activeWorker);
+        }
+      } finally {
+        // Worker exit can precede async confirmation and result application.
+        await activeRun;
+      }
     },
   };
 }

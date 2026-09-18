@@ -1,18 +1,25 @@
 // Vitest extension codex app server attempt light config wires the extension codex app server attempt light test shard.
+import { databaseWorkerExtensionTestFiles } from "./vitest.extension-database-workers-paths.mjs";
 import { createScopedVitestConfig } from "./vitest.scoped-config.ts";
 
-function createExtensionCodexAppServerAttemptLightVitestConfig(
+export function createExtensionCodexAppServerAttemptLightVitestConfig(
   env: Record<string, string | undefined> = process.env,
 ) {
   return createScopedVitestConfig(
     [
       "extensions/codex/src/app-server/attempt-client-cleanup.test.ts",
       "extensions/codex/src/app-server/attempt-diagnostics.test.ts",
+      "extensions/codex/src/app-server/attempt-preparation-timing.test.ts",
       "extensions/codex/src/app-server/attempt-steering.test.ts",
+      "extensions/codex/src/app-server/run-attempt-client-prewarm.test.ts",
+      "extensions/codex/src/app-server/run-attempt-connection.test.ts",
+      "extensions/codex/src/app-server/run-attempt-state.test.ts",
+      "extensions/codex/src/app-server/run-attempt-tools.test.ts",
     ],
     {
       dir: "extensions",
       env,
+      exclude: databaseWorkerExtensionTestFiles,
       fileParallelism: false,
       name: "extension-codex-app-server-attempt-light",
       passWithNoTests: true,

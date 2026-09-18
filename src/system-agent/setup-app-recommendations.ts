@@ -1,8 +1,9 @@
+import { extractBalancedJsonPrefix, safeParseJson } from "@openclaw/normalization-core";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import pLimit from "p-limit";
 import { z } from "zod";
-import { searchClawHubSkills } from "../infra/clawhub.js";
+import { searchClawHubSkills } from "../infra/clawhub-skills.js";
 import type { InstalledAppsResult } from "../infra/installed-apps.js";
 import {
   getOfficialExternalPluginCatalogManifest,
@@ -56,6 +57,11 @@ type SetupAppCandidateGroup = {
 };
 
 export type SetupAppRecommendationMatch = OnboardingRecommendationMatch;
+
+/** Describes the long-running recommendation scan phase visible to callers. */
+export type SetupAppScanPhase =
+  | { kind: "candidates"; appCount: number; sampleLabels: string[] }
+  | { kind: "matching"; appCount: number };
 
 export type SetupAppRecommendationsResult =
   | {
@@ -280,18 +286,10 @@ async function gatherSetupAppCandidates(params: {
 }
 
 // Models routinely wrap JSON in markdown fences or prose despite "JSON only"
-// instructions; parse the outermost object instead of the raw text.
+// instructions; parse the first complete object instead of the raw text.
 function parseMatcherJson(text: string): unknown {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end <= start) {
-    return null;
-  }
-  try {
-    return JSON.parse(text.slice(start, end + 1));
-  } catch {
-    return null;
-  }
+  const json = extractBalancedJsonPrefix(text, { openers: ["{"] })?.json;
+  return json ? (safeParseJson(json) ?? null) : null;
 }
 
 function buildMatcherPrompt(groups: SetupAppCandidateGroup[]): string {
@@ -312,6 +310,7 @@ function buildMatcherPrompt(groups: SetupAppCandidateGroup[]): string {
 export async function getSetupAppRecommendations(params: {
   inventorySource: () => Promise<InstalledAppsResult | SetupAppInventoryItem[]>;
   runtime: RuntimeEnv;
+  onPhase?: (phase: SetupAppScanPhase) => void;
   deps?: RecommendationDeps;
 }): Promise<SetupAppRecommendationsResult> {
   const inventory = await params.inventorySource();
@@ -326,6 +325,11 @@ export async function getSetupAppRecommendations(params: {
   if (apps.length === 0) {
     return { status: "skipped", reason: "no-apps" };
   }
+  params.onPhase?.({
+    kind: "candidates",
+    appCount: apps.length,
+    sampleLabels: apps.slice(0, 3).map((app) => app.label),
+  });
   const groups = await gatherSetupAppCandidates({ apps, deps: params.deps });
   if (groups.every((group) => group.candidates.length === 0)) {
     return { status: "skipped", reason: "no-candidates" };
@@ -338,6 +342,7 @@ export async function getSetupAppRecommendations(params: {
     (async (prompt: string) => await completeSetupInference({ prompt, runtime: params.runtime }));
   let completion: Awaited<ReturnType<typeof complete>>;
   try {
+    params.onPhase?.({ kind: "matching", appCount: apps.length });
     completion = await complete(buildMatcherPrompt(groups));
   } catch {
     return { status: "skipped", reason: "model-failed" };

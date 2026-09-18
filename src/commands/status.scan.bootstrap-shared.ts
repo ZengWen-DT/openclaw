@@ -1,12 +1,17 @@
 // Shared bootstrap for status scans.
 // Starts update, Tailscale, agent, and gateway probes with cold-start shortcuts for first-run users.
 
+import { measureCliCommandStartup } from "../cli/command-startup-timing.js";
 import type { OpenClawConfig } from "../config/types.js";
 import type { UpdateCheckResult } from "../infra/update-check.js";
 import { runExec } from "../process/exec.js";
 import { createEmptyTaskAuditSummary } from "../tasks/task-registry.audit.shared.js";
 import { createEmptyTaskRegistrySummary } from "../tasks/task-registry.summary.js";
-import { buildTailscaleHttpsUrl, resolveGatewayProbeSnapshot } from "./status.scan.shared.js";
+import {
+  buildTailscaleHttpsUrl,
+  resolveGatewayProbeSnapshot,
+  type GatewayProbeSnapshot,
+} from "./status.scan.shared.js";
 
 function buildColdStartUpdateResult(): UpdateCheckResult {
   return {
@@ -66,6 +71,8 @@ type StatusScanExecRunner = (
 type StatusScanCoreBootstrapParams<TAgentStatus> = {
   coldStart: boolean;
   cfg: OpenClawConfig;
+  configPath: string;
+  env: NodeJS.ProcessEnv;
   hasConfiguredChannels: boolean;
   opts: { timeoutMs?: number; all?: boolean };
   skipUpdateCheck?: boolean;
@@ -73,6 +80,7 @@ type StatusScanCoreBootstrapParams<TAgentStatus> = {
   includeRegistryUpdate?: boolean;
   includeLocalStatusRpcFallback?: boolean;
   gatewayProbeTimeoutMs?: number;
+  gatewaySnapshot?: GatewayProbeSnapshot;
   getTailnetHostname: (runner: StatusScanExecRunner) => Promise<string | null>;
   getUpdateCheckResult: (params: {
     timeoutMs: number;
@@ -94,7 +102,6 @@ export async function createStatusScanCoreBootstrap<TAgentStatus>(
     all: params.opts.all,
   });
   const statusTimeoutMs = params.opts.timeoutMs ?? 10_000;
-  const updateTimeoutMs = Math.min(params.opts.all ? 6500 : 2500, statusTimeoutMs);
   const tailscaleTimeoutMs = Math.min(1200, statusTimeoutMs);
   const tailscaleDnsPromise =
     tailscaleMode === "off"
@@ -109,7 +116,7 @@ export async function createStatusScanCoreBootstrap<TAgentStatus>(
   const updatePromise = skipNetworkUpdate
     ? Promise.resolve(buildColdStartUpdateResult())
     : params.getUpdateCheckResult({
-        timeoutMs: updateTimeoutMs,
+        timeoutMs: statusTimeoutMs,
         fetchGit: params.fetchGitUpdate ?? true,
         includeRegistry: params.includeRegistryUpdate ?? true,
         updateConfigChannel: params.cfg.update?.channel ?? null,
@@ -117,17 +124,26 @@ export async function createStatusScanCoreBootstrap<TAgentStatus>(
   const agentStatusPromise = skipColdStartNetworkChecks
     ? Promise.resolve(buildColdStartAgentLocalStatuses() as TAgentStatus)
     : params.getAgentLocalStatuses(params.cfg);
-  const gatewayProbePromise = resolveGatewayProbeSnapshot({
-    cfg: params.cfg,
-    opts: {
-      ...params.opts,
-      ...(params.gatewayProbeTimeoutMs !== undefined
-        ? { timeoutMs: params.gatewayProbeTimeoutMs }
-        : {}),
-      ...(skipColdStartNetworkChecks ? { skipProbe: true } : {}),
-      localStatusRpcFallback: params.includeLocalStatusRpcFallback !== false,
-    },
-  });
+  const gatewayProbePromise = params.gatewaySnapshot
+    ? Promise.resolve(params.gatewaySnapshot)
+    : measureCliCommandStartup(
+        "status.gateway-probe",
+        () =>
+          resolveGatewayProbeSnapshot({
+            cfg: params.cfg,
+            configPath: params.configPath,
+            env: params.env,
+            opts: {
+              ...params.opts,
+              ...(params.gatewayProbeTimeoutMs !== undefined
+                ? { timeoutMs: params.gatewayProbeTimeoutMs }
+                : {}),
+              ...(skipColdStartNetworkChecks ? { skipProbe: true } : {}),
+              localStatusRpcFallback: params.includeLocalStatusRpcFallback !== false,
+            },
+          }),
+        { config: params.cfg, env: params.env },
+      );
 
   return {
     tailscaleMode,
@@ -140,7 +156,6 @@ export async function createStatusScanCoreBootstrap<TAgentStatus>(
       buildTailscaleHttpsUrl({
         tailscaleMode,
         tailscaleDns: await tailscaleDnsPromise,
-        serviceName: params.cfg.gateway?.tailscale?.serviceName,
         controlUiBasePath: params.cfg.gateway?.controlUi?.basePath,
       }),
   };

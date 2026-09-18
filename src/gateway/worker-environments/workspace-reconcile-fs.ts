@@ -1,11 +1,13 @@
-import { createHash } from "node:crypto";
-import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { isPathInside, resolveOpenedFileRealPathForHandle } from "../../infra/fs-safe.js";
+import { FsSafeError, type Root } from "../../infra/fs-safe.js";
+import { hasNodeErrorCode } from "../../infra/path-guards.js";
+import { WorkerTaskError } from "../../infra/worker-task-pool.js";
+import type { createStagedInputPathMatcher } from "../../media/staged-inputs.js";
 import { runCommandBuffered } from "../../process/exec.js";
+import type { WorkspaceNode } from "./workspace-manifest-comparison.js";
+import { computeWorkspaceFileSnapshot } from "./workspace-manifest-worker.js";
 import {
-  gitFileMode,
   MAX_RECONCILIATION_FILE_BYTES,
   type WorkerWorkspaceManifestEntry,
 } from "./workspace-manifest.js";
@@ -17,82 +19,82 @@ export function localPath(root: string, relative: string): string {
   return path.join(root, ...relative.split("/"));
 }
 
+export async function removeEmptyWorkspaceDirectory(root: Root, entryPath: string): Promise<void> {
+  let children: string[];
+  try {
+    children = await root.list(entryPath);
+  } catch (error) {
+    if (error instanceof FsSafeError && ["not-found", "path-alias"].includes(error.code)) {
+      return;
+    }
+    throw error;
+  }
+  if (children.length > 0) {
+    // Conflicted descendants deliberately keep their containing directory
+    // even when the cloud result removed that directory.
+    return;
+  }
+  try {
+    await root.remove(entryPath);
+  } catch (error) {
+    if (error instanceof FsSafeError && ["not-found", "path-alias"].includes(error.code)) {
+      return;
+    }
+    const racedChildren = await root.list(entryPath).catch(() => undefined);
+    if (racedChildren?.length) {
+      return;
+    }
+    throw error;
+  }
+}
+
 type WorkspaceFileSnapshot =
   | { type: "file"; mode: number; size: number; sha256: string }
   | { type: "unsupported" };
 
-async function readOpenedWorkspaceFile(params: {
-  handle: Awaited<ReturnType<typeof fs.open>>;
-  expectedPath: string;
-  root?: string;
-}): Promise<WorkspaceFileSnapshot> {
-  const before = await params.handle.stat();
-  const realPath = await resolveOpenedFileRealPathForHandle(params.handle, params.expectedPath);
-  if (!before.isFile() || (params.root && !isPathInside(params.root, realPath))) {
-    throw new Error("Gateway workspace file changed while it was being read");
-  }
-  if (before.size > MAX_RECONCILIATION_FILE_BYTES) {
-    return { type: "unsupported" };
-  }
-  const hash = createHash("sha256");
-  const buffer = Buffer.allocUnsafe(64 * 1024);
-  let size = 0;
-  for (;;) {
-    const { bytesRead } = await params.handle.read(buffer, 0, buffer.length, size);
-    if (bytesRead === 0) {
-      break;
-    }
-    size += bytesRead;
-    if (size > MAX_RECONCILIATION_FILE_BYTES) {
-      return { type: "unsupported" };
-    }
-    hash.update(buffer.subarray(0, bytesRead));
-  }
-  const after = await params.handle.stat();
-  if (
-    after.size !== size ||
-    after.size !== before.size ||
-    after.mtimeMs !== before.mtimeMs ||
-    after.ctimeMs !== before.ctimeMs ||
-    after.ino !== before.ino ||
-    after.dev !== before.dev
-  ) {
-    throw new Error("Gateway workspace file changed while it was being read");
-  }
-  return {
-    type: "file",
-    mode: gitFileMode(after.mode & 0o777),
-    size,
-    sha256: hash.digest("hex"),
-  };
-}
-
-export async function readWorkspaceFileSnapshot(
+async function readWorkspaceFileSnapshot(
   root: string,
   entryPath: string,
 ): Promise<WorkspaceFileSnapshot> {
   const absolute = localPath(root, entryPath);
-  const handle = await fs.open(
-    absolute,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-  );
-  try {
-    return await readOpenedWorkspaceFile({ handle, expectedPath: absolute, root });
-  } finally {
-    await handle.close();
+  return await computeWorkspaceFileSnapshot(absolute, MAX_RECONCILIATION_FILE_BYTES, root);
+}
+
+export async function localWorkspaceNode(root: string, entryPath: string): Promise<WorkspaceNode> {
+  const absolute = localPath(root, entryPath);
+  const stats = await fs.lstat(absolute).catch((error: unknown) => {
+    if (hasNodeErrorCode(error, "ENOENT") || hasNodeErrorCode(error, "ENOTDIR")) {
+      return undefined;
+    }
+    throw error;
+  });
+  if (!stats) {
+    return undefined;
   }
+  if (stats.isDirectory() && !stats.isSymbolicLink()) {
+    return { path: entryPath, type: "directory" };
+  }
+  if (stats.isSymbolicLink()) {
+    return { path: entryPath, type: "symlink", mode: 0o777, target: await fs.readlink(absolute) };
+  }
+  if (!stats.isFile()) {
+    return { path: entryPath, type: "unsupported" };
+  }
+  const snapshot = await readWorkspaceFileSnapshot(root, entryPath);
+  if (snapshot.type === "unsupported") {
+    return { path: entryPath, type: "unsupported" };
+  }
+  return {
+    path: entryPath,
+    type: "file",
+    mode: snapshot.mode,
+    size: snapshot.size,
+    sha256: snapshot.sha256,
+  };
 }
 
 async function readAbsoluteFileSnapshot(absolute: string): Promise<WorkspaceFileSnapshot> {
-  const handle = await fs.open(
-    absolute,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-  );
-  try {
-    return await readOpenedWorkspaceFile({ handle, expectedPath: absolute });
-  } finally {
-    await handle.close();
-  }
+  return await computeWorkspaceFileSnapshot(absolute, MAX_RECONCILIATION_FILE_BYTES);
 }
 
 export async function absoluteEntryMatches(
@@ -109,7 +111,12 @@ export async function absoluteEntryMatches(
   if (!stats.isFile() || stats.isSymbolicLink()) {
     return false;
   }
-  const snapshot = await readAbsoluteFileSnapshot(absolute).catch(() => undefined);
+  const snapshot = await readAbsoluteFileSnapshot(absolute).catch((error: unknown) => {
+    if (error instanceof WorkerTaskError) {
+      throw error;
+    }
+    return undefined;
+  });
   return (
     snapshot?.type === "file" &&
     snapshot.mode === entry.mode &&
@@ -125,7 +132,12 @@ export async function entryMatches(
   if (entry.type === "symlink") {
     return await absoluteEntryMatches(localPath(root, entry.path), entry);
   }
-  const snapshot = await readWorkspaceFileSnapshot(root, entry.path).catch(() => undefined);
+  const snapshot = await readWorkspaceFileSnapshot(root, entry.path).catch((error: unknown) => {
+    if (error instanceof WorkerTaskError) {
+      throw error;
+    }
+    return undefined;
+  });
   return (
     snapshot?.type === "file" &&
     snapshot.mode === entry.mode &&
@@ -190,23 +202,24 @@ export async function directoryContainsOnlyJournalPaths(
   directory: string,
   paths: ReadonlySet<string>,
   directories: ReadonlySet<string>,
+  isRetainedInput: ReturnType<typeof createStagedInputPathMatcher>,
 ): Promise<boolean> {
   for (const name of await fs.readdir(localPath(root, directory))) {
     const child = `${directory}/${name}`;
-    if (isDerivedWorkspacePath(child)) {
+    if (isDerivedWorkspacePath(child, await isRetainedInput(child))) {
       continue;
     }
     const stats = await fs.lstat(localPath(root, child));
     if (stats.isDirectory() && !stats.isSymbolicLink()) {
       if (
         !directories.has(child) &&
-        !(await directoryContainsOnlyDerivedWorkspaceEntries(root, child))
+        !(await directoryContainsOnlyDerivedWorkspaceEntries(root, child, isRetainedInput))
       ) {
         return false;
       }
       if (
         directories.has(child) &&
-        !(await directoryContainsOnlyJournalPaths(root, child, paths, directories))
+        !(await directoryContainsOnlyJournalPaths(root, child, paths, directories, isRetainedInput))
       ) {
         return false;
       }
@@ -220,12 +233,13 @@ export async function directoryContainsOnlyJournalPaths(
 export async function directoryContainsOnlyDerivedWorkspaceEntries(
   root: string,
   directory: string,
+  isRetainedInput: ReturnType<typeof createStagedInputPathMatcher>,
 ): Promise<boolean> {
   const names = await fs.readdir(localPath(root, directory));
   let foundDerivedEntry = false;
   for (const name of names) {
     const child = `${directory}/${name}`;
-    if (isDerivedWorkspacePath(child)) {
+    if (isDerivedWorkspacePath(child, await isRetainedInput(child))) {
       foundDerivedEntry = true;
       continue;
     }
@@ -233,7 +247,7 @@ export async function directoryContainsOnlyDerivedWorkspaceEntries(
     if (
       !stats.isDirectory() ||
       stats.isSymbolicLink() ||
-      !(await directoryContainsOnlyDerivedWorkspaceEntries(root, child))
+      !(await directoryContainsOnlyDerivedWorkspaceEntries(root, child, isRetainedInput))
     ) {
       return false;
     }

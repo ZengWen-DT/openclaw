@@ -1,16 +1,12 @@
 import Foundation
 import OpenClawChatUI
-import OpenClawProtocol
 
 extension MacGatewayChatTransport {
     func acquireNewSessionRouteLease() async -> OpenClawChatNewSessionRouteLease? {
-        guard let serverLease = await GatewayConnection.shared.captureServerLease() else { return nil }
-        if let outboxGatewayID {
-            let currentGatewayID = await MainActor.run { MacChatTranscriptCache.currentGatewayID() }
-            guard currentGatewayID == outboxGatewayID else { return nil }
-        }
+        guard let serverLease = await self.connection.captureServerLease() else { return nil }
+        guard await self.currentOutboxGatewayMatchesConnection() else { return nil }
         let request: @Sendable (OpenClawChatGatewayRequest) async throws -> Data = { request in
-            try await GatewayConnection.shared.request(
+            try await self.connection.request(
                 method: request.method,
                 params: request.params,
                 timeoutMs: request.timeoutMs,
@@ -19,15 +15,7 @@ extension MacGatewayChatTransport {
         return OpenClawChatNewSessionRouteLease(
             listAgents: {
                 let data = try await request(OpenClawChatGatewayRequests.agentsList())
-                let result = try JSONDecoder().decode(AgentsListResult.self, from: data)
-                return OpenClawChatAgentsListResponse(
-                    defaultId: result.defaultid,
-                    agents: result.agents.map {
-                        OpenClawChatAgentChoice(
-                            id: $0.id,
-                            name: $0.name,
-                            workspaceGit: $0.workspacegit)
-                    })
+                return try OpenClawChatGatewayPayloadCodec.decodeAgentsList(data)
             },
             createSession: { key, label, explicitAgentID, parentSessionKey, worktree, worktreeBaseRef in
                 let agentID = explicitAgentID
@@ -46,13 +34,10 @@ extension MacGatewayChatTransport {
     }
 
     func acquireSessionGroupsRouteLease() async -> OpenClawChatSessionGroupsRouteLease? {
-        guard let serverLease = await GatewayConnection.shared.captureServerLease() else { return nil }
-        if let outboxGatewayID {
-            let currentGatewayID = await MainActor.run { MacChatTranscriptCache.currentGatewayID() }
-            guard currentGatewayID == outboxGatewayID else { return nil }
-        }
+        guard let serverLease = await self.connection.captureServerLease() else { return nil }
+        guard await self.currentOutboxGatewayMatchesConnection() else { return nil }
         let request: @Sendable (OpenClawChatGatewayRequest) async throws -> Data = { request in
-            try await GatewayConnection.shared.request(
+            try await self.connection.request(
                 method: request.method,
                 params: request.params,
                 timeoutMs: request.timeoutMs,
@@ -78,35 +63,17 @@ extension MacGatewayChatTransport {
     }
 
     func acquireSessionMutationRouteLease() async -> OpenClawChatSessionMutationRouteLease? {
-        guard let serverLease = await GatewayConnection.shared.captureServerLease() else { return nil }
-        if let outboxGatewayID {
-            let currentGatewayID = await MainActor.run { MacChatTranscriptCache.currentGatewayID() }
-            guard currentGatewayID == outboxGatewayID else { return nil }
-        }
+        guard let serverLease = await self.connection.captureServerLease() else { return nil }
+        guard await self.currentOutboxGatewayMatchesConnection() else { return nil }
+        let unreadAckContract = await self.connection.supportsServerCapability(
+            .sessionUnreadAckContract,
+            ifCurrentServerLease: serverLease)
         let transport = self
         return OpenClawChatSessionMutationRouteLease(
-            patchSession: { key, label, category, pinned, archived, unread in
-                let target = transport.sessionTarget(for: key)
-                let request = OpenClawChatGatewayRequests.patchSession(
-                    sessionKey: target.sessionKey,
-                    agentID: target.agentID,
-                    label: label,
-                    category: category,
-                    pinned: pinned,
-                    archived: archived,
-                    unread: unread)
-                _ = try await GatewayConnection.shared.request(
-                    method: request.method,
-                    params: request.params,
-                    timeoutMs: request.timeoutMs,
-                    ifCurrentServerLease: serverLease)
-            },
-            deleteSession: { key in
-                let target = transport.sessionTarget(for: key)
-                let request = OpenClawChatGatewayRequests.deleteSession(
-                    sessionKey: target.sessionKey,
-                    agentID: target.agentID)
-                _ = try await GatewayConnection.shared.request(
+            sessionTarget: { transport.sessionTarget(for: $0) },
+            unreadAckContract: unreadAckContract,
+            request: { request in
+                try await self.connection.request(
                     method: request.method,
                     params: request.params,
                     timeoutMs: request.timeoutMs,
@@ -114,17 +81,12 @@ extension MacGatewayChatTransport {
             })
     }
 
-    private func requestSessionAction(_ request: OpenClawChatGatewayRequest) async throws -> Data {
-        guard let serverLease = await GatewayConnection.shared.captureServerLease() else {
+    func requestChatSessionAction(_ request: OpenClawChatGatewayRequest) async throws -> Data {
+        guard let serverLease = await self.connection.captureServerLease() else {
             throw OpenClawChatTransportSendError.notDispatched
         }
-        if let outboxGatewayID {
-            let currentGatewayID = await MainActor.run { MacChatTranscriptCache.currentGatewayID() }
-            guard currentGatewayID == outboxGatewayID else {
-                throw OpenClawChatTransportSendError.notDispatched
-            }
-        }
-        return try await GatewayConnection.shared.request(
+        try await self.requireCurrentOutboxGateway()
+        return try await self.connection.request(
             method: request.method,
             params: request.params,
             timeoutMs: request.timeoutMs,
@@ -132,59 +94,20 @@ extension MacGatewayChatTransport {
     }
 
     func forkSession(parentKey: String) async throws -> String {
-        let target = self.sessionTarget(for: parentKey)
+        try await self.forkSession(parentKey: parentKey, fromLastCompleted: false)
+    }
+
+    func forkSession(parentKey: String, fromLastCompleted: Bool) async throws -> String {
+        try await self.forkSession(parentKey: parentKey, fromLastCompleted: fromLastCompleted, agentID: nil)
+    }
+
+    func forkSession(parentKey: String, fromLastCompleted: Bool, agentID: String?) async throws -> String {
+        let target = self.sessionTarget(for: parentKey, overrideAgentID: agentID)
         let request = OpenClawChatGatewayRequests.forkSession(
             parentSessionKey: target.sessionKey,
-            agentID: target.agentID)
-        let data = try await self.requestSessionAction(request)
+            agentID: target.agentID,
+            fromLastCompleted: fromLastCompleted)
+        let data = try await self.requestChatSessionAction(request)
         return try JSONDecoder().decode(OpenClawChatCreateSessionResponse.self, from: data).key
-    }
-
-    func rewindSession(
-        sessionKey: String,
-        entryId: String) async throws -> OpenClawChatRewindResponse
-    {
-        let target = self.sessionTarget(for: sessionKey)
-        let request = Self.rewindSessionRequest(
-            sessionKey: target.sessionKey,
-            agentID: target.agentID,
-            entryId: entryId)
-        let data = try await self.requestSessionAction(request)
-        return try JSONDecoder().decode(OpenClawChatRewindResponse.self, from: data)
-    }
-
-    func forkSessionAtMessage(
-        sessionKey: String,
-        entryId: String) async throws -> OpenClawChatForkAtMessageResponse
-    {
-        let target = self.sessionTarget(for: sessionKey)
-        let request = Self.forkSessionAtMessageRequest(
-            sessionKey: target.sessionKey,
-            agentID: target.agentID,
-            entryId: entryId)
-        let data = try await self.requestSessionAction(request)
-        return try JSONDecoder().decode(OpenClawChatForkAtMessageResponse.self, from: data)
-    }
-
-    static func rewindSessionRequest(
-        sessionKey: String,
-        agentID: String?,
-        entryId: String) -> OpenClawChatGatewayRequest
-    {
-        OpenClawChatGatewayRequests.rewindSession(
-            sessionKey: sessionKey,
-            agentID: agentID,
-            entryId: entryId)
-    }
-
-    static func forkSessionAtMessageRequest(
-        sessionKey: String,
-        agentID: String?,
-        entryId: String) -> OpenClawChatGatewayRequest
-    {
-        OpenClawChatGatewayRequests.forkAtMessage(
-            sessionKey: sessionKey,
-            agentID: agentID,
-            entryId: entryId)
     }
 }

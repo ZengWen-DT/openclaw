@@ -1,8 +1,28 @@
 import type { SessionEvent } from "@github/copilot-sdk";
 // Copilot tests cover event bridge plugin behavior.
 import { expectDefined } from "@openclaw/normalization-core";
+import type {
+  AgentHarnessTaskRecord,
+  AgentHarnessTaskRuntime,
+  AgentHarnessTaskRuntimeScope,
+} from "openclaw/plugin-sdk/agent-harness-task-runtime";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { attachEventBridge, type SessionLike } from "./event-bridge.js";
+import { createCopilotNativeSubagentTaskMirror } from "./native-subagent-task-mirror.js";
+
+const nativeTaskRuntime = vi.hoisted<{
+  current?: Pick<
+    AgentHarnessTaskRuntime,
+    "tryCreateRunningTaskRun" | "finalizeTaskRunByRunId" | "listTaskRecords"
+  >;
+}>(() => ({}));
+
+vi.mock("openclaw/plugin-sdk/agent-harness-task-runtime", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("openclaw/plugin-sdk/agent-harness-task-runtime")>();
+  return { ...actual, createAgentHarnessTaskRuntime: () => nativeTaskRuntime.current };
+});
 
 const MODEL_REF = {
   api: "openai-responses",
@@ -10,10 +30,17 @@ const MODEL_REF = {
   provider: "github-copilot",
 } as const;
 const REGISTERED_EVENT_TYPES = [
+  "user.message",
+  "system.message",
+  "skill.invoked",
+  "system.notification",
   "assistant.message_delta",
   "assistant.reasoning_delta",
+  "assistant.reasoning",
+  "assistant.turn_start",
   "assistant.message",
   "assistant.usage",
+  "tool.user_requested",
   "tool.execution_start",
   "tool.execution_complete",
   "session.plan_changed",
@@ -33,24 +60,6 @@ type FakeSession = SessionLike & {
   emit: (eventType: string, event: SessionEvent) => void;
   listenerCount: (eventType: string) => number;
 };
-
-function createDeferred<T>() {
-  let rejectPromise: ((reason?: unknown) => void) | undefined;
-  let resolvePromise: ((value: T | PromiseLike<T>) => void) | undefined;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  return {
-    promise,
-    reject(reason?: unknown) {
-      rejectPromise?.(reason);
-    },
-    resolve(value: T) {
-      resolvePromise?.(value);
-    },
-  };
-}
 
 function flushAsync() {
   const tick = () => Promise.resolve();
@@ -122,6 +131,7 @@ function createFakeSession(
     },
     off,
     on,
+    send: vi.fn().mockResolvedValue("sdk-user"),
     sendAndWait: vi.fn().mockResolvedValue(undefined),
     sessionId: "sdk-session-id",
   };
@@ -132,6 +142,98 @@ afterEach(() => {
 });
 
 describe("attachEventBridge", () => {
+  it.each([
+    { terminal: "subagent.completed", failureMode: "empty" },
+    { terminal: "subagent.failed", failureMode: "throw" },
+  ] as const)(
+    "retries the original $terminal result after a swallowed $failureMode callback",
+    async ({ terminal, failureMode }) => {
+      const session = createFakeSession();
+      let now = 100;
+      let task: AgentHarnessTaskRecord | undefined;
+      let attempts = 0;
+      nativeTaskRuntime.current = {
+        tryCreateRunningTaskRun(params) {
+          task = {
+            taskId: "owned-task",
+            runId: params.runId,
+            runtime: "subagent",
+            taskKind: "copilot-native",
+            requesterSessionKey: "agent:parent:session",
+            ownerKey: "agent:parent:session",
+            scopeKind: "session",
+            task: params.task,
+            status: "running",
+            deliveryStatus: "not_applicable",
+            notifyPolicy: "silent",
+            createdAt: now,
+          };
+          return task;
+        },
+        finalizeTaskRunByRunId(params) {
+          attempts += 1;
+          if (attempts === 1) {
+            if (failureMode === "throw") {
+              throw new Error("store unavailable");
+            }
+            return [];
+          }
+          task = {
+            ...expectDefined(task, "persisted native task"),
+            status: params.status,
+            endedAt: params.endedAt,
+            lastEventAt: params.lastEventAt,
+            error: params.error,
+            terminalSummary: params.terminalSummary ?? undefined,
+          };
+          return [task];
+        },
+        listTaskRecords: () => (task ? [task] : []),
+      };
+      const mirror = expectDefined(
+        createCopilotNativeSubagentTaskMirror({
+          now: () => now,
+          scope: {} as AgentHarnessTaskRuntimeScope,
+        }),
+        "native task mirror",
+      );
+      const bridge = attachEventBridge(session, {
+        getSdkSessionId: () => "sdk-session-id",
+        isAborted: () => false,
+        onNativeSubagentEvent: (event) => mirror.handleEvent(event),
+      });
+      const data = {
+        agentDescription: "inspect",
+        agentDisplayName: "Researcher",
+        agentName: "researcher",
+        toolCallId: "call-1",
+      };
+      session.emit("subagent.started", makeEvent("subagent.started", data));
+      session.emit(
+        terminal,
+        makeEvent(terminal, { ...data, error: "child failed", totalTokens: 30 }),
+      );
+      expect(task?.status).toBe("running");
+      expect(attempts).toBe(1);
+      bridge.detach();
+      now = 200;
+      mirror.finalizeActiveRuns();
+      expect(task).toMatchObject({
+        status: terminal === "subagent.completed" ? "succeeded" : "failed",
+        endedAt: 100,
+        lastEventAt: 100,
+        error: terminal === "subagent.failed" ? "child failed" : undefined,
+        terminalSummary:
+          terminal === "subagent.completed"
+            ? "Subagent completed (30 tokens)."
+            : "Subagent failed.",
+      });
+      await session.disconnect();
+      mirror.finalizeActiveRuns();
+      expect(attempts).toBe(2);
+    },
+  );
+
   it("assistant.message_delta accumulates text per messageId in arrival order", () => {
     const session = createFakeSession();
     const bridge = attachEventBridge(session, {
@@ -187,7 +289,15 @@ describe("attachEventBridge", () => {
 
     expect(bridge.snapshot().assistantTexts).toEqual(["root"]);
     expect(bridge.snapshot().startedCount).toBe(0);
-    expect(bridge.snapshot().toolMetas).toEqual([{ meta: "child write", toolName: "write" }]);
+    expect(bridge.snapshot().toolMetas).toEqual([
+      { meta: "child write", toolName: "write", isError: false },
+    ]);
+    expect(
+      bridge.recordSendResult({
+        ...makeAssistantMessageEvent("child final"),
+        agentId: "child-1",
+      } as SessionEvent),
+    ).toBe(false);
     await bridge.awaitDeltaChain();
     expect(onAssistantDelta).toHaveBeenCalledTimes(1);
   });
@@ -213,6 +323,42 @@ describe("attachEventBridge", () => {
     );
 
     expect(bridge.snapshot().assistantTexts).toEqual(["ab", "x"]);
+  });
+
+  it("ignored child and ephemeral users do not split a root assistant API call", () => {
+    const session = createFakeSession();
+    const bridge = attachEventBridge(session, {
+      getSdkSessionId: () => "sdk-session-id",
+      isAborted: () => false,
+    });
+
+    session.emit("assistant.message", {
+      ...makeAssistantMessageEvent("first", {
+        apiCallId: "shared-call",
+        messageId: "chunk-a",
+      }),
+      id: "assistant-chunk-a",
+    } as SessionEvent);
+    session.emit("user.message", {
+      ...makeEvent("user.message", { content: "child" }),
+      agentId: "child-1",
+    } as SessionEvent);
+    session.emit("user.message", {
+      ...makeEvent("user.message", { content: "ephemeral" }),
+      ephemeral: true,
+    } as SessionEvent);
+    session.emit("assistant.message", {
+      ...makeAssistantMessageEvent("second", {
+        apiCallId: "shared-call",
+        messageId: "chunk-b",
+      }),
+      id: "assistant-chunk-b",
+    } as SessionEvent);
+    bridge.flushTranscriptProjection();
+
+    expect(bridge.buildAssistantMessage({ modelRef: MODEL_REF, now: () => 9 })?.content).toEqual([
+      { type: "text", text: "firstsecond" },
+    ]);
   });
 
   it("onAssistantDelta receives appended text, live sessionId, and current usage", async () => {
@@ -411,6 +557,27 @@ describe("attachEventBridge", () => {
     expect(longerBridge.finalizeAssistantTexts()).toEqual(["longer text"]);
   });
 
+  it("does not let an ephemeral assistant replace the final root response", () => {
+    const session = createFakeSession();
+    const bridge = attachEventBridge(session, {
+      getSdkSessionId: () => "sdk-session-id",
+      isAborted: () => false,
+    });
+    const persisted = makeAssistantMessageEvent("persisted final");
+    session.emit("assistant.message", persisted);
+
+    expect(
+      bridge.recordSendResult({
+        ...makeAssistantMessageEvent("ephemeral final"),
+        ephemeral: true,
+        id: "ephemeral-final",
+      } as SessionEvent),
+    ).toBe(false);
+    expect(bridge.buildAssistantMessage({ modelRef: MODEL_REF, now: () => 9 })?.content).toEqual([
+      { text: "persisted final", type: "text" },
+    ]);
+  });
+
   it("assistant.message with toolRequests produces toolCall content and toolUse stopReason", () => {
     const session = createFakeSession();
     const bridge = attachEventBridge(session, {
@@ -605,7 +772,9 @@ describe("attachEventBridge", () => {
       isAborted: () => false,
     });
 
-    bridge.recordSendResult(makeAssistantMessageEvent("done", { outputTokens: 7 }));
+    bridge.recordSendResult(
+      makeAssistantMessageEvent("done", { apiCallId: "usage-without-id", outputTokens: 7 }),
+    );
     session.emit(
       "assistant.usage",
       makeEvent("assistant.usage", {
@@ -724,7 +893,7 @@ describe("attachEventBridge", () => {
     );
 
     expect(bridge.snapshot().toolMetas).toEqual([
-      { meta: "details", toolName: "bash" },
+      { meta: "details", toolName: "bash", isError: false },
       { meta: "failed", toolName: "read", isError: true },
     ]);
   });
@@ -1040,6 +1209,41 @@ describe("attachEventBridge", () => {
     expect(onAssistantDelta).not.toHaveBeenCalled();
     expect(bridge.finalizeAssistantTexts()).toEqual([]);
     expect(bridge.buildAssistantMessage({ modelRef: MODEL_REF, now: () => 13 })).toBeUndefined();
+  });
+
+  it("keeps ephemeral deltas live without folding their text into the terminal message", async () => {
+    const session = createFakeSession();
+    const onAssistantDelta = vi.fn();
+    const bridge = attachEventBridge(session, {
+      getSdkSessionId: () => "sdk-session-id",
+      isAborted: () => false,
+      onAssistantDelta,
+    });
+
+    session.emit("assistant.message_delta", {
+      ...makeEvent("assistant.message_delta", {
+        deltaContent: "hidden text",
+        messageId: "ephemeral-message",
+      }),
+      ephemeral: true,
+    } as SessionEvent);
+    session.emit("assistant.reasoning_delta", {
+      ...makeEvent("assistant.reasoning_delta", {
+        deltaContent: "hidden reasoning",
+        reasoningId: "ephemeral-reasoning",
+      }),
+      ephemeral: true,
+    } as SessionEvent);
+    bridge.recordSendResult(makeAssistantMessageEvent("visible"));
+    await bridge.awaitDeltaChain();
+
+    expect(onAssistantDelta).toHaveBeenCalledWith(
+      expect.objectContaining({ delta: "hidden text", text: "hidden text" }),
+    );
+    expect(bridge.buildAssistantMessage({ modelRef: MODEL_REF, now: () => 13 })?.content).toEqual([
+      { type: "thinking", thinking: "hidden reasoning" },
+      { type: "text", text: "visible" },
+    ]);
   });
 
   it("detach is idempotent after the first unsubscribe pass", () => {

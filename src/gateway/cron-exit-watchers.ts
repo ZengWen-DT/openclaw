@@ -1,6 +1,7 @@
 import type { CronJob } from "../cron/types.js";
 import { markOpenClawExecEnv } from "../infra/openclaw-exec-env.js";
 import type { ManagedRun, ProcessSupervisor } from "../process/supervisor/index.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { resolveExitWatchShell } from "./cron-exit-watch-shell.js";
 
 /**
@@ -10,6 +11,7 @@ import { resolveExitWatchShell } from "./cron-exit-watch-shell.js";
  * watch ends and the job fires like any other exit.
  */
 const ON_EXIT_WATCH_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const ON_EXIT_WATCH_RETRY_BACKOFF_MS = [1_000, 5_000, 30_000, 5 * 60_000] as const;
 
 type Logger = {
   info: (obj: unknown, msg?: string) => void;
@@ -27,11 +29,31 @@ export type CronExitResult = {
   noOutputTimedOut: boolean;
 };
 
-type CronExitWatchers = {
+export type CronExitWatcherHandlers = {
+  getProcessSupervisor: () => ProcessSupervisor;
+  fireOnExit: (
+    job: OnExitCronJob,
+    exit: CronExitResult,
+    controls: {
+      signal: AbortSignal;
+      commitGuard: () => void;
+      onTerminalWriteStarted: () => void;
+      onReserved: () => void;
+    },
+  ) => Promise<void>;
+  updateWatcherState?: (
+    job: OnExitCronJob,
+    patch: Pick<CronJob["state"], "lastError" | "consecutiveErrors">,
+  ) => Promise<CronJob | void>;
+  logger: Logger;
+};
+
+export type CronExitWatchers = {
   reconcile: (jobs: CronJob[]) => void;
   cancel: (jobId: string) => void;
-  cancelAll: () => void;
+  cancelAll: () => Promise<void>;
   activeJobIds: () => string[];
+  updateHandlers: (handlers: CronExitWatcherHandlers) => Promise<void> | void;
 };
 
 const SCOPE_PREFIX = "cron-exit";
@@ -44,14 +66,31 @@ function isWatchableExitJob(job: CronJob): job is OnExitCronJob {
   return job.enabled && job.schedule.kind === "on-exit";
 }
 
-export function createCronExitWatchers(params: {
-  getProcessSupervisor: () => ProcessSupervisor;
-  persistCompletion: (jobId: string) => Promise<void>;
-  fireOnExit: (job: CronJob, exit: CronExitResult) => void | Promise<void>;
-  logger: Logger;
-  shell?: { command: string; argsFor: (command: string) => string[] };
-}): CronExitWatchers {
+export function createCronExitWatchers(
+  params: CronExitWatcherHandlers & {
+    shell?: { command: string; argsFor: (command: string) => string[] };
+    retryBackoffMs?: readonly number[];
+  },
+): CronExitWatchers {
+  let handlers: CronExitWatcherHandlers = params;
+  const ownerSettlements = new Set<Promise<void>>();
+  const settleOwnerCallback = async <T>(operation: Promise<T>): Promise<T> => {
+    const settlement = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    ownerSettlements.add(settlement);
+    try {
+      return await operation;
+    } finally {
+      ownerSettlements.delete(settlement);
+    }
+  };
   const shell = params.shell ?? resolveExitWatchShell();
+  const retryBackoffMs =
+    params.retryBackoffMs && params.retryBackoffMs.length > 0
+      ? params.retryBackoffMs
+      : ON_EXIT_WATCH_RETRY_BACKOFF_MS;
   // jobId -> watcher state. `armToken` identifies the current arm so an async
   // spawn/wait that loses ownership (the job was cancelled or re-armed for a
   // changed command) becomes a no-op. The slot is reserved synchronously in
@@ -64,9 +103,13 @@ export function createCronExitWatchers(params: {
     fired: boolean;
     terminalPersisting: boolean;
     cancelled: boolean;
+    admission: AbortController | undefined;
     lifecycleSettled: boolean;
+    settlement: ReturnType<typeof createDeferredCore>;
     command: string;
     cwd: string | undefined;
+    consecutiveFailures: number;
+    retryTimer: NodeJS.Timeout | undefined;
   };
   const active = new Map<string, WatcherSlot>();
   // A cancelled child can keep running until the supervisor observes exit.
@@ -74,34 +117,49 @@ export function createCronExitWatchers(params: {
   // suspension still sees every predecessor that is settling.
   const settlingCancelledSlots = new Set<WatcherSlot>();
 
-  const cancel = (jobId: string) => {
-    const slot = active.get(jobId);
-    if (!slot) {
+  const cancel = (jobId: string, preserveReserved = false) => {
+    const slots = new Set(
+      Array.from(settlingCancelledSlots).filter((slot) => slot.job.id === jobId),
+    );
+    const current = active.get(jobId);
+    if (current) {
+      slots.add(current);
+    }
+    if (slots.size === 0) {
       return;
     }
-    slot.cancelled = true;
-    if (!slot.lifecycleSettled) {
-      settlingCancelledSlots.add(slot);
+    for (const slot of slots) {
+      slot.cancelled = true;
+      if (!preserveReserved || !slot.fired) {
+        slot.admission?.abort();
+      }
+      if (slot.retryTimer) {
+        clearTimeout(slot.retryTimer);
+        slot.retryTimer = undefined;
+      }
+      if (!slot.lifecycleSettled) {
+        settlingCancelledSlots.add(slot);
+      }
+      // Retain write-capable callbacks as suspension blockers through settlement.
+      if (!slot.terminalPersisting && active.get(jobId) === slot) {
+        active.delete(jobId);
+      }
+      slot.run?.cancel("manual-cancel");
     }
-    // Terminal persistence is user-visible state. Keep the slot as a suspend
-    // blocker until that write settles even when hot reload cancels the watcher.
-    if (!slot.terminalPersisting) {
-      active.delete(jobId);
-    }
-    // Cancel an already-spawned child; an in-flight spawn (run undefined) is
-    // killed by the arm() ownership check once it resolves.
-    slot.run?.cancel("manual-cancel");
     try {
-      params.getProcessSupervisor().cancelScope(scopeKey(jobId), "manual-cancel");
+      handlers.getProcessSupervisor().cancelScope(scopeKey(jobId), "manual-cancel");
     } catch (err) {
-      params.logger.warn({ err: String(err), jobId }, "cron-exit: cancel watcher failed");
+      handlers.logger.warn({ err: String(err), jobId }, "cron-exit: cancel watcher failed");
     }
   };
 
-  const arm = (job: OnExitCronJob) => {
+  const arm = (job: OnExitCronJob, consecutiveFailures = 0) => {
     const command = job.schedule.command;
     const cwd = job.schedule.cwd;
     const armToken: object = {};
+    const predecessors = Array.from(settlingCancelledSlots)
+      .filter((previous) => previous.job.id === job.id)
+      .map((previous) => previous.settlement.promise);
     // Reserve the slot synchronously so a concurrent cancel/replace can observe
     // and act on this arm before the child is spawned.
     const slot: WatcherSlot = {
@@ -111,18 +169,68 @@ export function createCronExitWatchers(params: {
       fired: false,
       terminalPersisting: false,
       cancelled: false,
+      admission: undefined,
       lifecycleSettled: false,
+      settlement: createDeferredCore(),
       command,
       cwd,
+      consecutiveFailures,
+      retryTimer: undefined,
     };
     active.set(job.id, slot);
     const owns = () => active.get(job.id) === slot && slot.armToken === armToken;
+    const persistWatcherState = async (
+      patch: Pick<CronJob["state"], "lastError" | "consecutiveErrors">,
+    ) => {
+      const owner = handlers;
+      if (!owner.updateWatcherState) {
+        return;
+      }
+      try {
+        const updated = await settleOwnerCallback(owner.updateWatcherState(slot.job, patch));
+        if (owns() && updated && isWatchableExitJob(updated)) {
+          slot.job = updated;
+        }
+      } catch (err) {
+        owner.logger.warn(
+          { err: String(err), jobId: slot.job.id },
+          "cron-exit: failed to persist watcher state",
+        );
+      }
+    };
+    const scheduleRetry = async (error: unknown, phase: "spawn" | "wait") => {
+      if (!owns() || slot.cancelled) {
+        return;
+      }
+      slot.consecutiveFailures += 1;
+      const errorText = `${phase} failed: ${String(error)}`;
+      await persistWatcherState({
+        lastError: `cron on-exit watcher ${errorText}`,
+        consecutiveErrors: slot.consecutiveFailures,
+      });
+      if (!owns() || slot.cancelled) {
+        return;
+      }
+      const delayMs =
+        retryBackoffMs[Math.min(slot.consecutiveFailures - 1, retryBackoffMs.length - 1)]!;
+      slot.retryTimer = setTimeout(() => {
+        slot.retryTimer = undefined;
+        if (!owns() || slot.cancelled) {
+          return;
+        }
+        active.delete(slot.job.id);
+        arm(slot.job, slot.consecutiveFailures);
+      }, delayMs);
+      slot.retryTimer.unref?.();
+      handlers.logger.warn(
+        { err: String(error), jobId: slot.job.id, retryInMs: delayMs },
+        `cron-exit: watcher ${phase} failed; retry scheduled`,
+      );
+    };
     void (async () => {
       let run: ManagedRun;
       try {
-        run = await params.getProcessSupervisor().spawn({
-          sessionId: `cron-exit:${job.id}`,
-          backendId: "cron-exit-watch",
+        run = await handlers.getProcessSupervisor().spawn({
           scopeKey: scopeKey(job.id),
           replaceExistingScope: true,
           mode: "child",
@@ -136,10 +244,10 @@ export function createCronExitWatchers(params: {
           captureOutput: true,
         });
       } catch (err) {
-        if (owns()) {
-          active.delete(job.id);
-        }
-        params.logger.warn({ err: String(err), jobId: job.id }, "cron-exit: watcher spawn failed");
+        // Keep the slot reserved as the retry placeholder; scheduleRetry re-arms
+        // with backoff so a transient supervisor failure cannot silently drop
+        // the watch (the job would otherwise never fire with no recorded cause).
+        await scheduleRetry(err, "spawn");
         return;
       }
       if (!owns()) {
@@ -155,68 +263,79 @@ export function createCronExitWatchers(params: {
         return;
       }
       slot.run = run;
-      params.logger.info({ jobId: job.id, runId: run.runId, command }, "cron-exit: watcher armed");
+      handlers.logger.info(
+        { jobId: job.id, runId: run.runId, command },
+        "cron-exit: watcher armed",
+      );
       let exit: Awaited<ReturnType<ManagedRun["wait"]>>;
       try {
         exit = await run.wait();
       } catch (err) {
         // run.wait() rejected (e.g. supervisor error) rather than resolving with
-        // an exit. Release the slot so a future reconcile can re-arm, and avoid
-        // an unhandled rejection. FAIL CLOSED: do not fire on an unknown outcome.
-        if (owns()) {
-          active.delete(job.id);
-        }
-        params.logger.warn(
-          { err: String(err), jobId: job.id },
-          "cron-exit: run.wait() rejected; released watcher slot without firing",
-        );
+        // an exit. FAIL CLOSED: do not fire on an unknown outcome; scheduleRetry
+        // re-arms the watch with backoff instead of dropping it silently.
+        await scheduleRetry(err, "wait");
         return;
       }
       if (!owns()) {
         return;
       }
-      params.logger.info(
-        { jobId: job.id, exitCode: exit.exitCode, reason: exit.reason },
-        "cron-exit: watched command exited; firing job",
-      );
-      slot.terminalPersisting = true;
-      // Persist the terminal one-shot state BEFORE firing. FAIL CLOSED: if the
-      // store write fails we do NOT wake — waking without a persisted terminal
-      // state would let a gateway restart re-arm and re-run the command.
-      try {
-        await params.persistCompletion(job.id);
-      } catch (err) {
-        if (owns()) {
-          active.delete(job.id);
-        }
-        params.logger.warn(
-          { err: String(err), jobId: job.id },
-          "cron-exit: persistCompletion failed; NOT firing (fail closed to avoid replay)",
-        );
-        return;
+      if (predecessors.length > 0) {
+        // Keep the exit pending until earlier payloads and their writes settle.
+        await Promise.all(predecessors);
       }
-      slot.terminalPersisting = false;
-      if (!owns() || slot.cancelled) {
-        if (active.get(job.id) === slot) {
+      while (owns() && !slot.cancelled) {
+        const owner = handlers;
+        const admission = new AbortController();
+        slot.admission = admission;
+        try {
+          await settleOwnerCallback(
+            owner.fireOnExit(
+              slot.job,
+              {
+                exitCode: exit.exitCode,
+                reason: exit.reason,
+                stdout: exit.stdout,
+                stderr: exit.stderr,
+                timedOut: exit.timedOut,
+                noOutputTimedOut: exit.noOutputTimedOut,
+              },
+              {
+                signal: admission.signal,
+                commitGuard: () => {
+                  if (admission.signal.aborted || (!slot.fired && (!owns() || slot.cancelled))) {
+                    throw new Error("cron on-exit watcher no longer owns this exit");
+                  }
+                },
+                onTerminalWriteStarted: () => {
+                  slot.terminalPersisting = true;
+                },
+                onReserved: () => {
+                  slot.fired = true;
+                  slot.terminalPersisting = true;
+                },
+              },
+            ),
+          );
+        } catch (err) {
+          if (!owns() || slot.cancelled) {
+            return;
+          }
+          if (owner !== handlers && !slot.fired) {
+            continue;
+          }
           active.delete(job.id);
+          owner.logger.warn(
+            { err: String(err), jobId: job.id },
+            "cron-exit: fireOnExit after exit failed",
+          );
+        } finally {
+          slot.admission = undefined;
+          slot.terminalPersisting = false;
         }
-        return;
-      }
-      slot.fired = true;
-      try {
-        await params.fireOnExit(slot.job, {
-          exitCode: exit.exitCode,
-          reason: exit.reason,
-          stdout: exit.stdout,
-          stderr: exit.stderr,
-          timedOut: exit.timedOut,
-          noOutputTimedOut: exit.noOutputTimedOut,
-        });
-      } catch (err) {
-        params.logger.warn(
-          { err: String(err), jobId: job.id },
-          "cron-exit: fireOnExit after exit failed",
-        );
+        if (owner === handlers || slot.fired) {
+          return;
+        }
       }
     })().finally(() => {
       slot.lifecycleSettled = true;
@@ -224,40 +343,56 @@ export function createCronExitWatchers(params: {
       if (slot.cancelled && active.get(job.id) === slot) {
         active.delete(job.id);
       }
+      slot.settlement.resolve(undefined);
     });
   };
 
   const reconcile = (jobs: CronJob[]) => {
+    const jobsById = new Map(jobs.map((job) => [job.id, job] as const));
     const want = new Map(jobs.filter(isWatchableExitJob).map((j) => [j.id, j] as const));
     // Cancel watchers whose job is gone or no longer watchable.
-    for (const jobId of Array.from(active.keys())) {
+    for (const [jobId, slot] of Array.from(active.entries())) {
       if (!want.has(jobId)) {
+        const storedJob = jobsById.get(jobId);
+        // A replacement can observe the terminal disable before its previous
+        // owner's completion callback has settled.
+        if (
+          slot.terminalPersisting &&
+          storedJob?.schedule.kind === "on-exit" &&
+          !storedJob.enabled &&
+          slot.command === storedJob.schedule.command &&
+          slot.cwd === storedJob.schedule.cwd
+        ) {
+          continue;
+        }
         cancel(jobId);
       }
     }
     for (const [jobId, job] of want) {
       const slot = active.get(jobId);
       if (slot) {
-        // Already tracked. A fired one-shot stays put (re-watch = re-add). If
-        // the watched command/cwd changed, cancel the stale watcher and re-arm.
-        if (slot.fired) {
-          continue;
-        }
         const { command, cwd } = job.schedule;
-        if (slot.command === command && slot.cwd === cwd) {
+        // Completion persists disabled before firing, so an enabled job after
+        // that point is a new arm, even while the previous payload is settling.
+        if (!slot.fired && slot.command === command && slot.cwd === cwd) {
           slot.job = job;
           continue;
         }
-        cancel(jobId);
+        cancel(jobId, slot.fired && slot.command === command && slot.cwd === cwd);
       }
       arm(job);
     }
   };
 
-  const cancelAll = () => {
-    for (const jobId of Array.from(active.keys())) {
+  const cancelAll = async () => {
+    const jobIds = new Set([
+      ...active.keys(),
+      ...Array.from(settlingCancelledSlots, (slot) => slot.job.id),
+    ]);
+    for (const jobId of jobIds) {
       cancel(jobId);
     }
+    await Promise.all(Array.from(settlingCancelledSlots, (slot) => slot.settlement.promise));
   };
 
   return {
@@ -273,5 +408,23 @@ export function createCronExitWatchers(params: {
           ...Array.from(settlingCancelledSlots, (slot) => slot.job.id),
         ]),
       ),
+    updateHandlers: (nextHandlers) => {
+      if (handlers !== nextHandlers) {
+        handlers = nextHandlers;
+        // Rebind receipt admission to the new scheduler while existing
+        // write-capable callbacks still drain through their captured owner.
+        for (const slot of active.values()) {
+          if (!slot.terminalPersisting) {
+            slot.admission?.abort();
+          }
+        }
+      }
+      if (ownerSettlements.size > 0) {
+        // Finish callbacks that already captured the old scheduler, but keep
+        // live watched children running under their newly adopted owner.
+        return Promise.all(ownerSettlements).then(() => undefined);
+      }
+      return undefined;
+    },
   };
 }

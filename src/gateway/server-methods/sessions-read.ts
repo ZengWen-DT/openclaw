@@ -1,67 +1,61 @@
 // Read-only session queries.
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   ErrorCodes,
   errorShape,
-  validateSessionsCleanupParams,
-  validateSessionsDescribeParams,
+  type SessionsListParams,
   validateSessionsListParams,
   validateSessionsPreviewParams,
   validateSessionsResolveParams,
   validateSessionsSearchParams,
 } from "../../../packages/gateway-protocol/src/index.js";
-import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import {
-  isConfiguredSessionStoreAgentId,
-  isPerAgentSessionStoreConfig,
   resolveExistingAgentSessionStoreTargetsSync,
-  runSessionsCleanup,
-  serializeSessionCleanupResult,
-  type SessionEntry,
+  resolveSessionStorePathCore,
 } from "../../config/sessions.js";
-import { listSessionEntries } from "../../config/sessions/session-accessor.js";
+import {
+  listSessionEntriesReadOnly,
+  withSessionEntryReadOnlyScope,
+} from "../../config/sessions/session-accessor.js";
+import { SessionTranscriptColdError } from "../../config/sessions/session-cold-storage-state.js";
 import { searchSessionTranscripts } from "../../config/sessions/session-transcript-search.js";
-import {
-  measureDiagnosticsTimelineSpan,
-  measureDiagnosticsTimelineSpanSync,
-} from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage } from "../../infra/errors.js";
-import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
-import { resolveRequestedSessionAgentId as resolveRequestedGlobalAgentId } from "../session-create-service.js";
 import {
-  resolveSessionStoreAgentId,
-  resolveSessionStoreKey,
-  resolveStoredSessionKeyForAgentStore,
-} from "../session-store-key.js";
+  isIncognitoSessionKey,
+  normalizeAgentId,
+  parseAgentSessionKey,
+} from "../../routing/session-key.js";
+import { hasOperatorBoundary } from "../operator-role-policy.js";
+import { resolveRequestedSessionAgentId as resolveRequestedGlobalAgentId } from "../session-request-agent.js";
+import { getSessionRowProjection } from "../session-row-projection-access.js";
 import {
-  readRecentSessionMessagesWithStatsAsync,
-  readSessionPreviewItemsFromTranscript,
-} from "../session-transcript-readers.js";
+  canAccessIncognitoSession,
+  createSessionListEntryFilter,
+  isGatewayAdmin,
+  resolveSessionSharingTarget,
+} from "../session-sharing.js";
+import { resolveSessionStoreAgentId } from "../session-store-key.js";
+import { readSessionPreviewItemsFromTranscript } from "../session-transcript-preview.js";
+import type { GatewaySessionStoreDiscoveryCache } from "../session-utils-store-lookup.js";
 import {
-  buildGatewaySessionRow,
-  listSessionsFromStoreAsync,
-  loadCombinedSessionStoreForGateway,
-  resolveFreshestSessionEntryFromStoreKeys,
-  resolveGatewaySessionStoreTarget,
+  listProjectedSessions,
+  resolveCanonicalSessionEntryFromStoreKeys,
   resolveGatewaySessionStoreTargetWithStore,
   type SessionsPreviewEntry,
   type SessionsPreviewResult,
 } from "../session-utils.js";
 import { resolveSessionKeyFromResolveParams } from "../sessions-resolve.js";
-import { projectWorkerSessionPlacement } from "../worker-environments/placement-projector.js";
-import { loadOptionalServerMethodModelCatalog } from "./optional-model-catalog.js";
-import { resolveVisibleActiveSessionRunState } from "./session-active-runs.js";
-import { emitSessionsChanged } from "./session-change-event.js";
-import {
-  filterSessionStoreToConfiguredAgents,
-  loadSessionEntriesForTarget,
-  requireSessionKey,
-} from "./sessions-shared.js";
+import { gatewayClientSessionCreator } from "./gateway-client-identity.js";
+import { withSessionListDiagnostics } from "./sessions-list-diagnostics.js";
+import { sessionMaintenanceHandlers } from "./sessions-maintenance.js";
+import { sessionByKeyReadHandlers } from "./sessions-read-by-key.js";
+import { resolveSessionSearchScope } from "./sessions-search-scope.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
 export const sessionReadHandlers: GatewayRequestHandlers = {
-  "sessions.search": async ({ params, respond, context }) => {
+  "sessions.search": async ({ params, respond, context, client }) => {
     if (!assertValidParams(params, validateSessionsSearchParams, "sessions.search", respond)) {
       return;
     }
@@ -71,33 +65,37 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       return;
     }
     const cfg = context.getRuntimeConfig();
-    const requestedAgentId = params.agentId ? normalizeAgentId(params.agentId) : undefined;
-    const sessionKeys = params.sessionKeys?.map((sessionKey) =>
-      requestedAgentId
-        ? resolveStoredSessionKeyForAgentStore({ cfg, agentId: requestedAgentId, sessionKey })
-        : resolveSessionStoreKey({ cfg, sessionKey }),
-    );
-    const agentIds = new Set(
-      sessionKeys?.map((sessionKey) =>
-        requestedAgentId && (sessionKey === "global" || sessionKey === "unknown")
-          ? requestedAgentId
-          : resolveSessionStoreAgentId(cfg, sessionKey),
-      ),
-    );
-    if (
-      agentIds.size > 1 ||
-      (requestedAgentId && [...agentIds].some((agentId) => agentId !== requestedAgentId))
-    ) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, "sessions.search supports one agent per call"),
-      );
+    const scope = resolveSessionSearchScope(cfg, params);
+    if (!scope.ok) {
+      respond(false, undefined, scope.error);
       return;
     }
-    const agentId =
-      requestedAgentId ?? agentIds.values().next().value ?? resolveDefaultAgentId(cfg);
-    const configured = isConfiguredSessionStoreAgentId(cfg, agentId);
+    const { agentId, configured, requestedAgentId, sessionKeys } = scope;
+    const restrictIncognito =
+      Boolean(gatewayClientSessionCreator(client)) && !isGatewayAdmin(client);
+    const roleVisibilityFilter = hasOperatorBoundary(client, cfg)
+      ? createSessionListEntryFilter({ client, cfg })
+      : undefined;
+    const restrictVisibility = restrictIncognito || Boolean(roleVisibilityFilter);
+    const targetDiscoveryCache: GatewaySessionStoreDiscoveryCache = new Map();
+    const canSearchSessionKey = (sessionKey: string) => {
+      if (
+        isIncognitoSessionKey(sessionKey) &&
+        !canAccessIncognitoSession({ cfg, client: client ?? null, sessionKey, agentId })
+      ) {
+        return false;
+      }
+      if (!roleVisibilityFilter) {
+        return true;
+      }
+      const target = resolveSessionSharingTarget({
+        cfg,
+        sessionKey,
+        agentId,
+        targetDiscoveryCache,
+      });
+      return Boolean(target && roleVisibilityFilter(target.storeKey, target.entry));
+    };
     if (requestedAgentId && !params.sessionKeys && configured) {
       respond(
         false,
@@ -106,53 +104,61 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const scopedSessionKeys = configured
-      ? sessionKeys
-      : sessionKeys?.filter((sessionKey) => {
-          const sessionAgentId =
-            requestedAgentId && (sessionKey === "global" || sessionKey === "unknown")
-              ? requestedAgentId
-              : resolveSessionStoreAgentId(cfg, sessionKey);
-          return sessionAgentId === agentId;
-        });
-    if (!configured && scopedSessionKeys?.length === 0) {
-      respond(true, { results: [] }, undefined);
-      return;
-    }
-    const existingTargets = configured
-      ? []
+    const scopedSessionKeys = (
+      configured
+        ? sessionKeys
+        : sessionKeys?.filter((sessionKey) => {
+            const sessionAgentId =
+              requestedAgentId && (sessionKey === "global" || sessionKey === "unknown")
+                ? requestedAgentId
+                : resolveSessionStoreAgentId(cfg, sessionKey);
+            return sessionAgentId === agentId;
+          })
+    )?.filter(canSearchSessionKey);
+    const searchTargets = configured
+      ? [{ agentId, storePath: resolveSessionStorePathCore(cfg.session?.store, { agentId }) }]
       : resolveExistingAgentSessionStoreTargetsSync(cfg, agentId);
-    if (!configured && existingTargets.length === 0) {
+    if (!configured && (searchTargets.length === 0 || scopedSessionKeys?.length === 0)) {
       respond(true, { results: [] }, undefined);
       return;
     }
     try {
-      const searchTargets = configured ? [undefined] : existingTargets;
+      let archivedTranscriptsExcluded = 0;
       const targetResults = searchTargets.flatMap((target) => {
         const targetSessionKeys =
           scopedSessionKeys ??
-          (target && !isPerAgentSessionStoreConfig(cfg.session?.store)
-            ? listSessionEntries({ agentId: target.agentId, storePath: target.storePath })
-                .map((entry) => entry.sessionKey)
-                .filter((sessionKey) => {
-                  const parsed = parseAgentSessionKey(sessionKey);
-                  return !parsed || normalizeAgentId(parsed.agentId) === agentId;
+          (restrictVisibility
+            ? withSessionEntryReadOnlyScope(target, () =>
+                listSessionEntriesReadOnly({
+                  agentId: target.agentId,
+                  storePath: target.storePath,
+                  projection: "list",
+                  clone: false,
                 })
+                  .map((entry) => entry.sessionKey)
+                  .filter((sessionKey) => {
+                    // A shared physical store can include rows owned by another agent.
+                    const parsed = parseAgentSessionKey(sessionKey);
+                    if (parsed && normalizeAgentId(parsed.agentId) !== agentId) {
+                      return false;
+                    }
+                    return canSearchSessionKey(sessionKey);
+                  }),
+              )
             : undefined);
         if (targetSessionKeys?.length === 0) {
           return [];
         }
-        return [
-          searchSessionTranscripts({
-            agentId: target?.agentId ?? agentId,
-            query,
-            // Over-fetch retired multi-store searches so deduplication can still fill the caller's
-            // requested page when the same transcript was copied during a store migration.
-            limit: configured ? params.limit : 25,
-            ...(targetSessionKeys ? { sessionKeys: targetSessionKeys } : {}),
-            ...(target ? { storePath: target.storePath } : {}),
-          }),
-        ];
+        const result = searchSessionTranscripts({
+          ...target,
+          query,
+          // Over-fetch retired multi-store searches so deduplication can still fill the caller's
+          // requested page when the same transcript was copied during a store migration.
+          limit: configured ? params.limit : 25,
+          ...(targetSessionKeys ? { sessionKeys: targetSessionKeys } : {}),
+        });
+        archivedTranscriptsExcluded += result.archivedTranscriptsExcluded ?? 0;
+        return [result];
       });
       const limit = params.limit ?? 10;
       const sortedHits = targetResults
@@ -174,6 +180,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       });
       respond(true, {
         results: hits.slice(0, limit),
+        ...(archivedTranscriptsExcluded ? { archivedTranscriptsExcluded } : {}),
         ...(targetResults.some((result) => result.indexing) ? { indexing: true } : {}),
         ...(targetResults.some((result) => result.truncated) || hits.length > limit
           ? { truncated: true }
@@ -183,167 +190,34 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error)));
     }
   },
-  "sessions.list": async ({ params, respond, context }) => {
+  "sessions.list": withSessionListDiagnostics(async (args, diagnostics) => {
+    const { params, respond, client, context } = args;
     if (!assertValidParams(params, validateSessionsListParams, "sessions.list", respond)) {
       return;
     }
-    const p = params;
-    const cfg = context.getRuntimeConfig();
-    const configuredAgentsOnly = p.configuredAgentsOnly === true;
-    const payload = await measureDiagnosticsTimelineSpan(
-      "gateway.sessions.list",
-      async () => {
-        const { storePath, store } = measureDiagnosticsTimelineSpanSync(
-          "gateway.sessions.list.store_load",
-          () =>
-            loadCombinedSessionStoreForGateway(cfg, {
-              agentId: p.agentId,
-            }),
-          {
-            config: cfg,
-            phase: "sessions.list",
-            attributes: {
-              agentId: p.agentId ?? null,
-              configuredAgentsOnly,
-            },
-          },
-        );
-        const listStore = configuredAgentsOnly
-          ? filterSessionStoreToConfiguredAgents(cfg, store)
-          : store;
-        const modelCatalog = await measureDiagnosticsTimelineSpan(
-          "gateway.sessions.list.model_catalog",
-          () => loadOptionalServerMethodModelCatalog(context, "sessions.list"),
-          {
-            config: cfg,
-            phase: "sessions.list",
-          },
-        );
-        const result = await measureDiagnosticsTimelineSpan(
-          "gateway.sessions.list.rows",
-          () =>
-            listSessionsFromStoreAsync({
-              cfg,
-              storePath,
-              store: listStore,
-              modelCatalog,
-              opts: p,
-            }),
-          {
-            config: cfg,
-            phase: "sessions.list",
-            attributes: {
-              storeEntries: Object.keys(listStore).length,
-            },
-          },
-        );
-        const placementsBySessionId = context.workerSessionPlacementService?.getMany(
-          result.sessions.flatMap((session) => (session.sessionId ? [session.sessionId] : [])),
-        );
-        const sessions = measureDiagnosticsTimelineSpanSync(
-          "gateway.sessions.list.active_run_flags",
-          () => {
-            return result.sessions.map((session) => {
-              const placementRecord = session.sessionId
-                ? placementsBySessionId?.get(session.sessionId)
-                : undefined;
-              const activeRunState = resolveVisibleActiveSessionRunState({
-                context,
-                requestedKey: session.key,
-                canonicalKey: session.key,
-                sessionId: session.sessionId,
-                ...(session.key === "global" && p.agentId ? { agentId: p.agentId } : {}),
-                defaultAgentId: resolveDefaultAgentId(cfg),
-              });
-              return Object.assign({}, session, {
-                hasActiveRun: activeRunState.active,
-                ...(placementRecord
-                  ? { placement: projectWorkerSessionPlacement(placementRecord) }
-                  : {}),
-                ...(activeRunState.runIds.length > 0
-                  ? { activeRunIds: activeRunState.runIds }
-                  : {}),
-              });
-            });
-          },
-          {
-            config: cfg,
-            phase: "sessions.list",
-            attributes: {
-              sessions: result.sessions.length,
-            },
-          },
-        );
-        return {
-          ...result,
-          sessions,
-        };
-      },
-      {
-        config: cfg,
-        phase: "sessions.list",
-        attributes: {
-          agentId: p.agentId ?? null,
-          configuredAgentsOnly,
-        },
-      },
-    );
-    respond(true, payload, undefined);
-  },
-  "sessions.cleanup": async ({ params, respond, context }) => {
-    if (!assertValidParams(params, validateSessionsCleanupParams, "sessions.cleanup", respond)) {
-      return;
+    const projection = getSessionRowProjection(context);
+    if (!projection) {
+      throw new Error("Session projection is unavailable before Gateway startup completes");
     }
-    const p = params;
-    try {
-      const { mode, appliedSummaries } = await runSessionsCleanup({
-        cfg: context.getRuntimeConfig(),
-        opts: {
-          agent: p.agent,
-          allAgents: p.allAgents,
-          enforce: p.enforce,
-          activeKey: p.activeKey,
-          fixMissing: p.fixMissing,
-          fixDmScope: p.fixDmScope,
-        },
-      });
-      const result = serializeSessionCleanupResult({
-        mode,
-        dryRun: false,
-        summaries: appliedSummaries,
-      });
-      respond(true, result, undefined);
-      for (const summary of appliedSummaries) {
-        emitSessionsChanged(context, {
-          reason: "cleanup",
-          sessionKey: undefined,
-        });
-        if (summary.wouldMutate) {
-          context.logGateway.debug(
-            `sessions.cleanup applied ${summary.storePath}: ${summary.beforeCount} -> ${summary.afterCount}`,
-          );
-        }
-      }
-    } catch (error) {
-      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(error)));
-    }
-  },
-  "sessions.preview": ({ params, respond, context }) => {
+    await listProjectedSessions({
+      projection,
+      opts: params as SessionsListParams,
+      context,
+      client,
+      diagnostics,
+      onResult: (result) => respond(true, result),
+    });
+  }),
+  "sessions.preview": async ({ params, respond, context, client }) => {
     if (!assertValidParams(params, validateSessionsPreviewParams, "sessions.preview", respond)) {
       return;
     }
-    const p = params;
-    const keysRaw = Array.isArray(p.keys) ? p.keys : [];
-    const keys = keysRaw
+    const keys = (Array.isArray(params.keys) ? params.keys : [])
       .map((key) => normalizeOptionalString(key ?? ""))
       .filter((key): key is string => Boolean(key))
       .slice(0, 64);
-    const limit =
-      typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.max(1, p.limit) : 12;
-    const maxChars =
-      typeof p.maxChars === "number" && Number.isFinite(p.maxChars)
-        ? Math.max(20, p.maxChars)
-        : 240;
+    const limit = params.limit ?? 12;
+    const maxChars = params.maxChars ?? 240;
 
     if (keys.length === 0) {
       respond(true, { ts: Date.now(), previews: [] } satisfies SessionsPreviewResult, undefined);
@@ -351,27 +225,32 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
     }
 
     const cfg = context.getRuntimeConfig();
-    const storeCache = new Map<string, Record<string, SessionEntry>>();
+    const roleVisibilityFilter = hasOperatorBoundary(client, cfg)
+      ? createSessionListEntryFilter({ client, cfg })
+      : undefined;
     const previews: SessionsPreviewEntry[] = [];
 
     for (const key of keys) {
+      if (previews.length > 0) {
+        await yieldToEventLoop();
+      }
+      const requestedAgent = resolveRequestedGlobalAgentId(cfg, key);
+      if (!requestedAgent.ok) {
+        respond(false, undefined, requestedAgent.error);
+        return;
+      }
       try {
-        const cachedStoreTarget = resolveGatewaySessionStoreTargetWithStore({
+        // Each preview resumes after a yield; read its canonical row from the current store.
+        const target = resolveGatewaySessionStoreTargetWithStore({
           cfg,
           key,
+          agentId: requestedAgent.agentId,
+          exactRead: true,
+          readOnly: true,
+          projection: "list",
         });
-        // Fixed stores share a legacy path but resolve to owner-specific SQLite databases. Keep
-        // synthetic misses from poisoning another agent's real store entry in this batch.
-        const storeCacheKey = `${cachedStoreTarget.agentId}\u0000${cachedStoreTarget.storePath}`;
-        const store = storeCache.get(storeCacheKey) ?? cachedStoreTarget.store;
-        storeCache.set(storeCacheKey, store);
-        const target = resolveGatewaySessionStoreTarget({
-          cfg,
-          key,
-          store,
-        });
-        const entry = resolveFreshestSessionEntryFromStoreKeys(store, target.storeKeys);
-        if (!entry?.sessionId) {
+        const entry = resolveCanonicalSessionEntryFromStoreKeys(target.store, target.storeKeys);
+        if (!entry?.sessionId || roleVisibilityFilter?.(target.canonicalKey, entry) === false) {
           previews.push({ key, status: "missing", items: [] });
           continue;
         }
@@ -386,62 +265,32 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
           limit,
           maxChars,
         );
+        previews.push({ key, status: items.length > 0 ? "ok" : "empty", items });
+      } catch (error) {
         previews.push({
           key,
-          status: items.length > 0 ? "ok" : "empty",
-          items,
+          status: error instanceof SessionTranscriptColdError ? "cold" : "error",
+          items: [],
         });
-      } catch {
-        previews.push({ key, status: "error", items: [] });
       }
     }
 
     respond(true, { ts: Date.now(), previews } satisfies SessionsPreviewResult, undefined);
   },
-  "sessions.describe": ({ params, respond, context }) => {
-    if (!assertValidParams(params, validateSessionsDescribeParams, "sessions.describe", respond)) {
-      return;
-    }
-    const p = params;
-    const key = requireSessionKey(p.key, respond);
-    if (!key) {
-      return;
-    }
-    const cfg = context.getRuntimeConfig();
-    const { target, storePath, store, entry } = loadSessionEntriesForTarget({ key, cfg });
-    if (!entry) {
-      respond(true, { session: null }, undefined);
-      return;
-    }
-    const row = buildGatewaySessionRow({
-      cfg,
-      storePath,
-      store,
-      key: target.canonicalKey,
-      entry,
-      includeDerivedTitles: p.includeDerivedTitles,
-      includeLastMessage: p.includeLastMessage,
-      transcriptUsageMaxBytes: 64 * 1024,
-    });
-    const placement = row.sessionId
-      ? context.workerSessionPlacementService?.getMany([row.sessionId]).get(row.sessionId)
-      : undefined;
-    respond(
-      true,
-      {
-        session: placement ? { ...row, placement: projectWorkerSessionPlacement(placement) } : row,
-      },
-      undefined,
-    );
-  },
-  "sessions.resolve": async ({ params, respond, context }) => {
+  "sessions.resolve": async ({ params, respond, context, client }) => {
     if (!assertValidParams(params, validateSessionsResolveParams, "sessions.resolve", respond)) {
       return;
     }
-    const p = params;
-    const cfg = context.getRuntimeConfig();
-
-    const resolved = await resolveSessionKeyFromResolveParams({ cfg, p });
+    const projection = getSessionRowProjection(context);
+    if (!projection) {
+      throw new Error("Session projection is unavailable before Gateway startup completes");
+    }
+    const resolved = await resolveSessionKeyFromResolveParams({
+      cfg: context.getRuntimeConfig(),
+      projection,
+      client,
+      p: params,
+    });
     if (!resolved.ok) {
       respond(false, undefined, resolved.error);
       return;
@@ -450,57 +299,14 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       respond(true, { ok: false }, undefined);
       return;
     }
-    respond(true, { ok: true, key: resolved.key }, undefined);
+    if ("ambiguous" in resolved) {
+      respond(true, { ok: false, candidates: resolved.candidates }, undefined);
+      return;
+    }
+    respond(true, resolved, undefined);
   },
-  "sessions.get": async ({ params, respond, context }) => {
-    const p = params as {
-      key?: unknown;
-      sessionKey?: unknown;
-      limit?: unknown;
-      agentId?: unknown;
-    };
-    const key = requireSessionKey(p.key ?? p.sessionKey, respond);
-    if (!key) {
-      return;
-    }
-    const limit =
-      typeof p.limit === "number" && Number.isFinite(p.limit)
-        ? Math.max(1, Math.floor(p.limit))
-        : 200;
-
-    const cfg = context.getRuntimeConfig();
-    const requestedAgent = resolveRequestedGlobalAgentId(
-      cfg,
-      key,
-      normalizeOptionalString(p.agentId),
-    );
-    if (!requestedAgent.ok) {
-      respond(false, undefined, requestedAgent.error);
-      return;
-    }
-    const { storePath, entry } = loadSessionEntriesForTarget({
-      key,
-      cfg,
-      agentId: requestedAgent.agentId,
-    });
-    if (!entry?.sessionId) {
-      respond(true, { messages: [] }, undefined);
-      return;
-    }
-    const { messages } = await readRecentSessionMessagesWithStatsAsync(
-      {
-        agentId: requestedAgent.agentId,
-        sessionEntry: entry,
-        sessionId: entry.sessionId,
-        sessionKey: key,
-        storePath,
-      },
-      {
-        maxMessages: limit,
-        maxLines: limit * 20 + 20,
-        allowResetArchiveFallback: true,
-      },
-    );
-    respond(true, { messages }, undefined);
-  },
+  ...sessionByKeyReadHandlers,
+  ...sessionMaintenanceHandlers,
 };
+
+export const sessionsListHandler = sessionReadHandlers["sessions.list"]!;

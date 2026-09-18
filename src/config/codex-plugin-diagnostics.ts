@@ -48,6 +48,7 @@ function codexPluginEntryEnabled(cfg: OpenClawConfig): boolean | undefined {
 function configuredRuntimeNeedsCodex(params: {
   cfg: OpenClawConfig;
   env: NodeJS.ProcessEnv;
+  agentId?: string;
   modelId?: string;
   runtimeId?: string;
 }): boolean {
@@ -63,6 +64,7 @@ function configuredRuntimeNeedsCodex(params: {
       provider: OPENAI_PROVIDER_ID,
       modelId: params.modelId,
       config: params.cfg,
+      agentId: params.agentId,
       env: params.env,
     }) === CODEX_PLUGIN_ID
   );
@@ -87,6 +89,7 @@ export function configuredModelRouteNeedsCodex(params: {
   return configuredRuntimeNeedsCodex({
     cfg: params.cfg,
     env: params.env,
+    agentId: params.agentId,
     modelId: params.route.modelId,
     runtimeId: runtime,
   });
@@ -126,19 +129,24 @@ function resolveEffectiveSelectedModelRefs(params: { cfg: OpenClawConfig; agentI
 
 function configuredRefTargetsAgent(params: {
   cfg: OpenClawConfig;
+  sourceConfigBeforeMigrations?: OpenClawConfig;
   path: string;
   agentId: string;
 }): boolean {
   const match = /^agents\.list\.(\d+)\./.exec(params.path);
-  if (!match) {
-    return true;
+  if (match) {
+    const entry = (params.sourceConfigBeforeMigrations ?? params.cfg).agents?.list?.[
+      Number(match[1])
+    ];
+    return Boolean(entry && normalizeAgentId(entry.id) === params.agentId);
   }
-  const entry = params.cfg.agents?.list?.[Number(match[1])];
-  return Boolean(entry && normalizeAgentId(entry.id) === params.agentId);
+  const keyedMatch = /^agents\.entries\.([^.]+)\./.exec(params.path);
+  return !keyedMatch || normalizeAgentId(keyedMatch[1] ?? "") === params.agentId;
 }
 
 function configuredRefIsEffectiveForAgent(params: {
   cfg: OpenClawConfig;
+  sourceConfigBeforeMigrations?: OpenClawConfig;
   path: string;
   value: string;
   agentId: string;
@@ -178,7 +186,7 @@ function configuredProviderPoliciesNeedCodex(
     }).policy;
     if (
       genericPolicy?.id?.trim() &&
-      configuredRuntimeNeedsCodex({ cfg, env, runtimeId: genericPolicy.id })
+      configuredRuntimeNeedsCodex({ cfg, env, agentId, runtimeId: genericPolicy.id })
     ) {
       return true;
     }
@@ -214,10 +222,11 @@ function configuredProviderPoliciesNeedCodex(
 
 function configuredModelRefsNeedCodex(params: {
   cfg: OpenClawConfig;
+  sourceConfigBeforeMigrations?: OpenClawConfig;
   env: NodeJS.ProcessEnv;
   agentIds: string[];
 }): { complete: boolean; needsCodex: boolean } {
-  const refs = collectConfiguredModelRefs(params.cfg);
+  const refs = collectConfiguredModelRefs(params.sourceConfigBeforeMigrations ?? params.cfg);
   let complete = true;
   for (const agentId of params.agentIds) {
     const selected = resolveEffectiveSelectedModelRefs({ cfg: params.cfg, agentId });
@@ -236,6 +245,7 @@ function configuredModelRefsNeedCodex(params: {
       if (
         !configuredRefIsEffectiveForAgent({
           cfg: params.cfg,
+          sourceConfigBeforeMigrations: params.sourceConfigBeforeMigrations,
           path: ref.path,
           value: ref.value,
           agentId,
@@ -276,13 +286,22 @@ function defaultOpenAiRouteNeedsCodex(
       provider: OPENAI_PROVIDER_ID,
       agentId,
     }).policy?.id;
-    return configuredRuntimeNeedsCodex({ cfg, env, runtimeId });
+    return configuredRuntimeNeedsCodex({ cfg, env, agentId, runtimeId });
   });
 }
 
-function configNeedsCodexForOpenAi(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+function configNeedsCodexForOpenAi(
+  cfg: OpenClawConfig,
+  env: NodeJS.ProcessEnv,
+  sourceConfigBeforeMigrations?: OpenClawConfig,
+): boolean {
   const agentIds = listAgentIds(cfg);
-  const configuredRefs = configuredModelRefsNeedCodex({ cfg, env, agentIds });
+  const configuredRefs = configuredModelRefsNeedCodex({
+    cfg,
+    env,
+    agentIds,
+    sourceConfigBeforeMigrations,
+  });
   if (configuredRefs.needsCodex) {
     return true;
   }
@@ -296,11 +315,14 @@ function configNeedsCodexForOpenAi(cfg: OpenClawConfig, env: NodeJS.ProcessEnv):
 export function shouldSuppressMissingCodexPluginDiagnostics(
   cfg: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
+  sourceConfigBeforeMigrations?: OpenClawConfig,
 ): boolean {
   const entryEnabled = codexPluginEntryEnabled(cfg);
   if (entryEnabled === true) {
     return false;
   }
   // A disabled entry is an explicit opt-out; doctor reports selected-route conflicts.
-  return entryEnabled === false || !configNeedsCodexForOpenAi(cfg, env);
+  return (
+    entryEnabled === false || !configNeedsCodexForOpenAi(cfg, env, sourceConfigBeforeMigrations)
+  );
 }

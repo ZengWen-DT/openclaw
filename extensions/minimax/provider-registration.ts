@@ -6,16 +6,17 @@ import type {
   ProviderAuthContext,
   ProviderAuthResult,
   ProviderCatalogContext,
+  ProviderCatalogResult,
   ProviderResolveDynamicModelContext,
   ProviderRuntimeModel,
 } from "openclaw/plugin-sdk/plugin-entry";
 import {
   MINIMAX_OAUTH_MARKER,
-  ensureAuthProfileStore,
-  listProfilesForProvider,
+  buildOauthProviderAuthResult,
+  isNonSecretApiKeyMarker,
 } from "openclaw/plugin-sdk/provider-auth";
-import { buildOauthProviderAuthResult } from "openclaw/plugin-sdk/provider-auth";
-import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth-api-key";
+import { buildOpenAICompatibleLiveProviderCatalog } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
+import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-entry";
 import type { ProviderPlugin } from "openclaw/plugin-sdk/provider-model-shared";
 import {
   buildProviderReplayFamilyHooks,
@@ -34,6 +35,7 @@ import { DEFAULT_MINIMAX_MAX_TOKENS, resolveMinimaxApiCost } from "./model-defin
 import type { MiniMaxRegion } from "./oauth.js";
 import { applyMinimaxApiConfig, applyMinimaxApiConfigCn } from "./onboard.js";
 import {
+  buildMinimaxModelDiscovery,
   buildMinimaxPortalProvider,
   buildMinimaxProvider,
   resolveMinimaxCatalogBaseUrl,
@@ -134,40 +136,90 @@ function resolveMinimaxDynamicModel(params: {
   });
 }
 
-function resolveApiCatalog(ctx: ProviderCatalogContext) {
-  const apiKey = ctx.resolveProviderApiKey(API_PROVIDER_ID).apiKey;
-  if (!apiKey) {
+async function resolveApiCatalog(ctx: ProviderCatalogContext) {
+  const auth = ctx.resolveProviderApiKey(API_PROVIDER_ID);
+  if (!auth.apiKey) {
     return null;
   }
-  return {
-    provider: {
-      ...buildMinimaxProvider(ctx.env),
-      apiKey,
-    },
+  const defaults = buildMinimaxProvider(ctx.env);
+  const providerConfig = {
+    ...defaults,
+    baseUrl: getProviderBaseUrl(ctx.config, API_PROVIDER_ID) ?? defaults.baseUrl,
+    api: ctx.config.models?.providers?.[API_PROVIDER_ID]?.api ?? defaults.api,
   };
+  return await buildOpenAICompatibleLiveProviderCatalog({
+    discoveryMode: "strict",
+    providerId: API_PROVIDER_ID,
+    providerConfig,
+    apiKey: auth.apiKey,
+    discoveryApiKey: auth.discoveryApiKey,
+    profileId: auth.profileId,
+    modelDiscovery: buildMinimaxModelDiscovery(providerConfig),
+  });
 }
 
-function resolvePortalCatalog(ctx: ProviderCatalogContext) {
+async function resolvePortalCatalog(ctx: ProviderCatalogContext): Promise<ProviderCatalogResult> {
   const explicitProvider = ctx.config.models?.providers?.[PORTAL_PROVIDER_ID];
-  const envApiKey = ctx.resolveProviderApiKey(PORTAL_PROVIDER_ID).apiKey;
-  const authStore = ensureAuthProfileStore(ctx.agentDir, {
-    allowKeychainPrompt: false,
+  const apiKeyAuth = ctx.resolveProviderApiKey(PORTAL_PROVIDER_ID);
+  const profileAuth = ctx.resolveProviderAuth(PORTAL_PROVIDER_ID, {
+    oauthMarker: MINIMAX_OAUTH_MARKER,
   });
-  const hasProfiles = listProfilesForProvider(authStore, PORTAL_PROVIDER_ID).length > 0;
   const explicitApiKey = normalizeOptionalString(explicitProvider?.apiKey);
-  const apiKey = envApiKey ?? explicitApiKey ?? (hasProfiles ? MINIMAX_OAUTH_MARKER : undefined);
+  let auth: ReturnType<ProviderCatalogContext["resolveProviderApiKey" | "resolveProviderAuth"]> =
+    apiKeyAuth.apiKey !== undefined
+      ? apiKeyAuth
+      : explicitApiKey
+        ? { apiKey: explicitApiKey }
+        : profileAuth;
+  const { apiKey } = auth;
   if (!apiKey) {
     return null;
   }
+  if (!normalizeOptionalString(auth.discoveryApiKey) && isNonSecretApiKeyMarker(apiKey)) {
+    // Legacy callbacks may omit material; only matching selection facts can complete it.
+    if (
+      auth.profileId &&
+      profileAuth.source === "profile" &&
+      auth.profileId === profileAuth.profileId &&
+      apiKey === profileAuth.apiKey &&
+      (auth.mode === undefined || auth.mode === profileAuth.mode)
+    ) {
+      auth = profileAuth;
+    }
+    if (!normalizeOptionalString(auth.discoveryApiKey)) {
+      return {
+        providers: {},
+        outcomes: [
+          { provider: PORTAL_PROVIDER_ID, profileId: auth.profileId, status: "unavailable" },
+        ],
+      };
+    }
+  }
+  const usesPortalBearerAuth =
+    apiKeyAuth.apiKey === "MINIMAX_OAUTH_TOKEN" ||
+    (apiKeyAuth.apiKey && apiKeyAuth.mode
+      ? apiKeyAuth.mode === "token" || apiKeyAuth.mode === "oauth"
+      : (profileAuth.mode === "token" && profileAuth.apiKey === apiKey) ||
+        (!apiKeyAuth.apiKey && !explicitApiKey && profileAuth.mode === "oauth"));
 
   const explicitBaseUrl = normalizeOptionalString(explicitProvider?.baseUrl);
 
-  return {
-    provider: buildPortalProviderCatalog({
-      baseUrl: explicitBaseUrl || buildMinimaxPortalProvider(ctx.env).baseUrl,
-      apiKey,
-    }),
-  };
+  const providerConfig = buildPortalProviderCatalog({
+    baseUrl: explicitBaseUrl || buildMinimaxPortalProvider(ctx.env).baseUrl,
+    apiKey,
+  });
+  return await buildOpenAICompatibleLiveProviderCatalog({
+    discoveryMode: "strict",
+    providerId: PORTAL_PROVIDER_ID,
+    providerConfig,
+    apiKey,
+    discoveryApiKey: auth.discoveryApiKey,
+    profileId: auth.profileId,
+    modelDiscovery: buildMinimaxModelDiscovery(
+      providerConfig,
+      usesPortalBearerAuth ? "oauth" : "api_key",
+    ),
+  });
 }
 
 function createOAuthHandler(region: MiniMaxRegion) {
@@ -181,9 +233,11 @@ function createOAuthHandler(region: MiniMaxRegion) {
       const result = await loginMiniMaxPortalOAuth({
         openUrl: ctx.openUrl,
         note: (message, title) => ctx.prompter.note(message, title),
+        deviceCode: ctx.prompter.deviceCode,
         progress,
         region,
         ...(ctx.signal ? { signal: ctx.signal } : {}),
+        ...(ctx.assertCurrent ? { assertCurrent: ctx.assertCurrent } : {}),
       });
 
       progress.stop("MiniMax OAuth complete");
@@ -200,6 +254,7 @@ function createOAuthHandler(region: MiniMaxRegion) {
         access: result.access,
         refresh: result.refresh,
         expires: result.expires,
+        credentialExtra: { authFlow: "device-code" },
         configPatch: {
           models: {
             providers: {

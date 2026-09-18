@@ -1,14 +1,13 @@
 import {
+  asFiniteNumber,
   asSafeIntegerInRange,
   expectDefined,
+  isRecord as isObject,
   parseStrictInteger,
 } from "@openclaw/normalization-core";
 export type UsageBarTemplate = Record<string, unknown>;
 export type UsageContract = Record<string, unknown>;
 type Vocab = Record<string, unknown>;
-
-const isObject = (v: unknown): v is Record<string, unknown> =>
-  typeof v === "object" && v !== null && !Array.isArray(v);
 
 function toGlyphs(scale: unknown): string[] {
   if (Array.isArray(scale)) {
@@ -20,12 +19,16 @@ function toGlyphs(scale: unknown): string[] {
   return [];
 }
 
-function num(value: unknown): string {
+function coerceFiniteValue(value: unknown): number | undefined {
   if (value === null || value === undefined || value === "") {
-    return "";
+    return undefined;
   }
-  const n = Number(value);
-  if (!Number.isFinite(n)) {
+  return asFiniteNumber(Number(value));
+}
+
+function num(value: unknown): string {
+  const n = coerceFiniteValue(value);
+  if (n === undefined) {
     return "";
   }
   if (Math.abs(n) >= 1000) {
@@ -36,22 +39,13 @@ function num(value: unknown): string {
 }
 
 function fixed(value: unknown, digits: number): string {
-  if (value === null || value === undefined || value === "") {
-    return "";
-  }
-  const n = Number(value);
-  if (!Number.isFinite(n)) {
-    return "";
-  }
-  return n.toFixed(digits);
+  const n = coerceFiniteValue(value);
+  return n === undefined ? "" : n.toFixed(digits);
 }
 
 function dur(value: unknown): string {
-  if (value === null || value === undefined || value === "") {
-    return "";
-  }
-  const raw = Number(value);
-  if (!Number.isFinite(raw)) {
+  const raw = coerceFiniteValue(value);
+  if (raw === undefined) {
     return "";
   }
   const s = Math.max(0, Math.trunc(raw));
@@ -66,22 +60,13 @@ function dur(value: unknown): string {
 }
 
 function pct(value: unknown): string {
-  if (value === null || value === undefined || value === "") {
-    return "";
-  }
-  const n = Number(value);
-  return Number.isFinite(n) ? `${Math.round(n)}%` : "";
+  const n = coerceFiniteValue(value);
+  return n === undefined ? "" : `${Math.round(n)}%`;
 }
 
 function inv(value: unknown): unknown {
-  if (value === null || value === undefined || value === "") {
-    return value;
-  }
-  const n = Number(value);
-  if (!Number.isFinite(n)) {
-    return value;
-  }
-  return 100 - Math.max(0, Math.min(100, n));
+  const n = coerceFiniteValue(value);
+  return n === undefined ? value : 100 - Math.max(0, Math.min(100, n));
 }
 
 function norm(value: unknown): number {

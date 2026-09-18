@@ -1,16 +1,16 @@
 import type { ThinkLevel, VerboseLevel } from "../../auto-reply/thinking.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import {
-  assertAgentRunLifecycleGenerationCurrent,
-  registerAgentRunContext,
-} from "../../infra/agent-events.js";
+import { assertAgentRunLifecycleGenerationCurrent } from "../../infra/agent-events.js";
+import { registerAgentRunContext } from "../../infra/agent-run-registry.js";
+import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
+import { isSubagentCoordinationInputProvenance } from "../../sessions/input-provenance.js";
 import { applyVerboseOverride } from "../../sessions/level-overrides.js";
 import { recordSessionHumanDirectMessage } from "../../sessions/session-state-events.js";
 import { resolveEffectiveAgentSkillFilter } from "../../skills/discovery/agent-filter.js";
+import { persistAgentSession } from "./attempt-execution.shared.js";
 import { resolveAgentRunContext } from "./run-context.js";
 import { loadExecDefaultsRuntime, loadSkillsRuntime } from "./runtime-loaders.js";
-import { persistSessionEntry } from "./session-helpers.js";
 import type { AgentCommandOpts } from "./types.js";
 
 export async function prepareEmbeddedSessionState(params: {
@@ -25,6 +25,8 @@ export async function prepareEmbeddedSessionState(params: {
   lifecycleGeneration: string;
   runId: string;
   workspaceDir: string;
+  executionWorkspaceDir: string;
+  watchSkills: boolean;
   isNewSession: boolean;
   isSubagentLaneTurn: boolean;
   suppressVisibleSessionEffects: boolean;
@@ -35,10 +37,12 @@ export async function prepareEmbeddedSessionState(params: {
   persistedVerbose?: VerboseLevel;
   verboseDefault?: VerboseLevel;
   sessionStateActor: Parameters<typeof recordSessionHumanDirectMessage>[0]["actor"];
+  pluginMetadataSnapshot?: PluginMetadataSnapshot;
 }) {
   const requestedThinkLevel = params.thinkOnce ?? params.thinkOverride ?? params.persistedThinking;
   const resolvedVerboseLevel =
     params.verboseOverride ?? params.persistedVerbose ?? params.verboseDefault;
+  const coordination = isSubagentCoordinationInputProvenance(params.opts.inputProvenance);
 
   assertAgentRunLifecycleGenerationCurrent(params.lifecycleGeneration);
   if (params.sessionKey || params.suppressVisibleSessionEffects) {
@@ -47,7 +51,10 @@ export async function prepareEmbeddedSessionState(params: {
       agentId: params.sessionAgentId,
       lifecycleGeneration: params.lifecycleGeneration,
       verboseLevel: resolvedVerboseLevel,
-      isControlUiVisible: !params.suppressVisibleSessionEffects,
+      isControlUiVisible: !params.suppressVisibleSessionEffects && !coordination,
+      ...(coordination ? { projectSessionMessages: false } : {}),
+      // Node and local command ingress may not have a separate chat activity owner.
+      projectSessionActive: !params.suppressVisibleSessionEffects && !coordination,
     });
   }
 
@@ -64,19 +71,27 @@ export async function prepareEmbeddedSessionState(params: {
     sessionKey: params.sessionKey,
     agentId: params.sessionAgentId,
   });
-  const skillSnapshotState = resolveReusableWorkspaceSkillSnapshot({
+  const skillSnapshotState = await resolveReusableWorkspaceSkillSnapshot({
     workspaceDir: params.workspaceDir,
+    executionWorkspaceDir: params.executionWorkspaceDir,
     config: params.cfg,
     agentId: params.sessionAgentId,
     existingSnapshot: params.isNewSession ? undefined : currentSkillsSnapshot,
+    librarySelections: sessionEntry?.skillLibrarySelections,
     skillFilter,
-    eligibility: {
+    assertCurrent: () => assertAgentRunLifecycleGenerationCurrent(params.lifecycleGeneration),
+    resolveEligibility: () => ({
       nodeSkills: nodeSkillsEligibility,
       remote: getRemoteSkillEligibility({
         advertiseExecNode: nodeSkillsEligibility.canExec,
       }),
-    },
-    watch: false,
+    }),
+    // A one-shot caller has no later turn to consume invalidations; persistent
+    // watchers would keep its process alive after the reply has completed.
+    watch: params.watchSkills && params.opts.oneShotCliRun !== true,
+    ...(params.pluginMetadataSnapshot
+      ? { pluginMetadataSnapshot: params.pluginMetadataSnapshot }
+      : {}),
   });
   const needsSkillsSnapshot =
     params.isNewSession || !currentSkillsSnapshot || skillSnapshotState.shouldRefresh;
@@ -102,7 +117,7 @@ export async function prepareEmbeddedSessionState(params: {
       sessionStartedAt: current.sessionStartedAt ?? now,
       skillsSnapshot,
     };
-    sessionEntry = await persistSessionEntry({
+    sessionEntry = await persistAgentSession({
       sessionStore: params.sessionStore,
       sessionKey: params.sessionKey,
       storePath: params.storePath,
@@ -133,7 +148,7 @@ export async function prepareEmbeddedSessionState(params: {
       agentStatus: undefined,
     };
     applyVerboseOverride(next, params.verboseOverride);
-    sessionEntry = await persistSessionEntry({
+    sessionEntry = await persistAgentSession({
       sessionStore: params.sessionStore,
       sessionKey: params.sessionKey,
       storePath: params.storePath,

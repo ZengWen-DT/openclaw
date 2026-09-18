@@ -1,13 +1,23 @@
 // Chat UI chips for pull requests detected on the session's working branch.
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { html, nothing } from "lit";
+import { repeat } from "lit/directives/repeat.js";
 import type {
   ControlUiSessionBranch,
   ControlUiSessionPullRequest,
+  ControlUiSessionPullRequestSnapshot,
 } from "../../../../../src/gateway/control-ui-contract.js";
+import "./chat-ci-details.ts";
+import type { ApplicationGateway } from "../../../app/gateway.ts";
 import { icons } from "../../../components/icons.ts";
-import "../../../components/tooltip.ts";
 import { t } from "../../../i18n/index.ts";
+import type { GitHubPublicationView } from "../../../lib/sessions/github-publication-controller.ts";
+import "../../../components/tooltip.ts";
 import { getSafeLocalStorage } from "../../../local-storage.ts";
+import {
+  renderGitHubPublicationAction,
+  renderGitHubPublicationDetails,
+} from "./chat-github-publication.ts";
 
 const DISMISSED_STORAGE_KEY = "openclaw.chat.dismissedPullRequests";
 // Bounds localStorage growth: dismissals for the oldest sessions fall off
@@ -21,7 +31,7 @@ export function chatPullRequestId(pullRequest: ControlUiSessionPullRequest): str
 function readDismissedStore(storage: Storage): Record<string, string[]> {
   try {
     const parsed: unknown = JSON.parse(storage.getItem(DISMISSED_STORAGE_KEY) ?? "{}");
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (!isRecord(parsed)) {
       return {};
     }
     const store: Record<string, string[]> = {};
@@ -106,7 +116,10 @@ function renderChecksRow(label: string, count: number, modifier: string) {
   `;
 }
 
-function renderChecks(pullRequest: ControlUiSessionPullRequest) {
+function renderChecks(
+  pullRequest: ControlUiSessionPullRequest,
+  props: { gateway?: ApplicationGateway; sessionKey?: string; presented?: boolean },
+) {
   const checks = pullRequest.checks;
   if (!checks) {
     return nothing;
@@ -117,6 +130,7 @@ function renderChecks(pullRequest: ControlUiSessionPullRequest) {
       <summary class="chat-pr__checks-pill" aria-label=${label} title=${label}>
         <span class="chat-pr__checks-dot" aria-hidden="true"></span>
         ${t("chat.pullRequests.checks")}
+        <span class="chat-pr__checks-chevron" aria-hidden="true">${icons.chevronDown}</span>
       </summary>
       <div
         class="chat-pr__checks-menu"
@@ -134,39 +148,29 @@ function renderChecks(pullRequest: ControlUiSessionPullRequest) {
             ${icons.externalLink}
           </a>
         </div>
-        ${renderChecksRow(t("chat.pullRequests.checksPassed"), checks.passed, "passed")}
-        ${renderChecksRow(t("chat.pullRequests.checksFailed"), checks.failed, "failed")}
-        ${renderChecksRow(t("chat.pullRequests.checksRunning"), checks.running, "running")}
-        ${renderChecksRow(t("chat.pullRequests.checksSkipped"), checks.skipped, "skipped")}
+        <div class="chat-pr__checks-counts">
+          ${renderChecksRow(t("chat.pullRequests.checksPassed"), checks.passed, "passed")}
+          ${renderChecksRow(t("chat.pullRequests.checksFailed"), checks.failed, "failed")}
+          ${renderChecksRow(t("chat.pullRequests.checksRunning"), checks.running, "running")}
+          ${renderChecksRow(t("chat.pullRequests.checksSkipped"), checks.skipped, "skipped")}
+        </div>
+        <openclaw-chat-ci-details
+          .pullRequest=${pullRequest}
+          .gateway=${props.gateway}
+          .sessionKey=${props.sessionKey ?? ""}
+          .presented=${props.presented ?? true}
+        ></openclaw-chat-ci-details>
       </div>
     </details>
   `;
 }
 
 const MAX_COLLAPSED_PULL_REQUESTS = 2;
+const MIN_HIDDEN_PULL_REQUESTS = 2;
 
 // Matches GitHub's own diff-stat rendering ("+2,819") in the viewer's locale.
 function formatDiffCount(value: number): string {
   return value.toLocaleString();
-}
-
-/**
- * The pre-PR "Create PR" row must not invite a duplicate PR, so live PRs
- * (even dismissed ones) hide it — decided on the undismissed PR list. The
- * gateway already omits branches with neither a creatable PR nor local
- * changed files.
- */
-export function createPullRequestBranch(
-  pullRequests: readonly ControlUiSessionPullRequest[],
-  branch: ControlUiSessionBranch | undefined,
-): ControlUiSessionBranch | undefined {
-  if (!branch) {
-    return undefined;
-  }
-  if (pullRequests.some((item) => item.state === "open" || item.state === "draft")) {
-    return undefined;
-  }
-  return branch;
 }
 
 // Collapsed rows lead with live work; merged/closed history sits behind the
@@ -174,91 +178,156 @@ export function createPullRequestBranch(
 function visibleChatPullRequests(
   pullRequests: ControlUiSessionPullRequest[],
   expanded: boolean,
-): { visible: ControlUiSessionPullRequest[]; hiddenCount: number } {
+): { visible: ControlUiSessionPullRequest[]; collapsedCount: number } {
   const active = pullRequests.filter((item) => item.state === "open" || item.state === "draft");
   const settled = pullRequests.filter((item) => item.state !== "open" && item.state !== "draft");
   const ordered = [...active, ...settled];
-  if (expanded || ordered.length <= MAX_COLLAPSED_PULL_REQUESTS) {
-    return { visible: ordered, hiddenCount: 0 };
+  if (ordered.length < MAX_COLLAPSED_PULL_REQUESTS + MIN_HIDDEN_PULL_REQUESTS) {
+    return { visible: ordered, collapsedCount: 0 };
   }
   return {
-    visible: ordered.slice(0, MAX_COLLAPSED_PULL_REQUESTS),
-    hiddenCount: ordered.length - MAX_COLLAPSED_PULL_REQUESTS,
+    visible: expanded ? ordered : ordered.slice(0, MAX_COLLAPSED_PULL_REQUESTS),
+    collapsedCount: ordered.length - MAX_COLLAPSED_PULL_REQUESTS,
   };
 }
 
-function renderDiffStats(item: { additions?: number; deletions?: number }) {
+function renderDiffStats(
+  item: { additions?: number; deletions?: number },
+  onOpenSessionDiff?: () => void,
+) {
   if (typeof item.additions !== "number" && typeof item.deletions !== "number") {
     return nothing;
   }
-  return html`
-    <span class="chat-pr__diff">
-      <span class="chat-pr__additions">+${formatDiffCount(item.additions ?? 0)}</span>
-      <span class="chat-pr__deletions">−${formatDiffCount(item.deletions ?? 0)}</span>
-    </span>
-  `;
+  const additions = html`<span class="chat-pr__additions"
+    >+${formatDiffCount(item.additions ?? 0)}</span
+  >`;
+  const deletions = html`<span class="chat-pr__deletions"
+    >−${formatDiffCount(item.deletions ?? 0)}</span
+  >`;
+  if (onOpenSessionDiff) {
+    return html`
+      <button
+        class="chat-pr__diff"
+        type="button"
+        aria-label=${t("chat.sessionDiff.show")}
+        @click=${onOpenSessionDiff}
+      >
+        ${additions} ${deletions}
+      </button>
+    `;
+  }
+  return html` <span class="chat-pr__diff">${additions} ${deletions}</span> `;
 }
 
-function renderRateLimitWarning() {
+function renderStatusWarning(status: ControlUiSessionPullRequestSnapshot["status"]) {
+  if (status === "ready") {
+    return nothing;
+  }
+  const message = t(
+    status === "rate-limited" ? "chat.pullRequests.rateLimited" : "chat.pullRequests.unavailable",
+  );
   return html`
-    <openclaw-tooltip content=${t("chat.pullRequests.rateLimited")}>
-      <span class="chat-pr__warning" role="img" aria-label=${t("chat.pullRequests.rateLimited")}>
+    <openclaw-tooltip content=${message}>
+      <span class="chat-pr__warning" role="img" aria-label=${message}>
         ${icons.alertTriangle}
       </span>
     </openclaw-tooltip>
   `;
 }
 
-// Pre-PR state: the branch row mirrors the PR chips (repo, branch, diff
-// stats, staleness warning) and offers GitHub's create-PR page. While the
-// branch is unpushed the gateway omits createUrl — the row then just reports
-// the session's local changed files. While rate limited, "no PR found" is
-// unreliable, so the warning stays visible here.
-function renderBranchRow(branch: ControlUiSessionBranch, rateLimited: boolean) {
+function renderCreatePullRequestLink(branch: ControlUiSessionBranch) {
+  return branch.createUrl
+    ? html`
+        <a
+          class="chat-pr__create"
+          href=${branch.createUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label=${t("chat.pullRequests.createPrLabel", { branch: branch.branch })}
+        >
+          ${t("chat.pullRequests.createPr")}
+        </a>
+      `
+    : nothing;
+}
+
+// Pre-PR state: the branch row mirrors PR chips and offers Gateway-owned
+// publication when available. When status is stale, "no PR found" is unreliable,
+// so the warning stays visible here.
+function renderWorkRow(
+  branch: ControlUiSessionBranch | undefined,
+  status: ControlUiSessionPullRequestSnapshot["status"],
+  onOpenSessionDiff?: () => void,
+  publication?: GitHubPublicationView,
+) {
+  const published =
+    !branch && publication?.result?.status === "published" ? publication.result : undefined;
   return html`
-    <article class="chat-pr" data-state="branch">
+    <article
+      class="chat-pr"
+      data-state=${published ? "published" : branch ? "branch" : "publication"}
+    >
       <span class="chat-pr__link chat-pr__link--static">
-        <span class="chat-pr__icon" aria-hidden="true">${icons.gitBranch}</span>
-        <span class="chat-pr__repo">${branch.repo}</span>
-        <span class="chat-pr__branch">${branch.branch}</span>
+        <span class="chat-pr__icon" aria-hidden="true"
+          >${published || !branch ? icons.gitPullRequest : icons.gitBranch}</span
+        >
+        <span class="chat-pr__identity">
+          <span class="chat-pr__repo"
+            >${published?.repository ?? branch?.repo ?? t("chat.pullRequests.publishPr")}</span
+          >
+          <span class="chat-pr__branch">${published?.branch ?? branch?.branch}</span>
+        </span>
       </span>
       <span class="chat-pr__meta">
-        ${renderDiffStats(branch)} ${rateLimited ? renderRateLimitWarning() : nothing}
-        ${branch.createUrl
-          ? html`
-              <a
-                class="chat-pr__create"
-                href=${branch.createUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                aria-label=${t("chat.pullRequests.createPrLabel", { branch: branch.branch })}
-              >
-                ${t("chat.pullRequests.createPr")}
-              </a>
-            `
-          : nothing}
+        ${branch && !published ? renderDiffStats(branch, onOpenSessionDiff) : nothing}
+        ${renderStatusWarning(status)}
+        ${
+          publication
+            ? renderGitHubPublicationAction(publication)
+            : branch
+              ? renderCreatePullRequestLink(branch)
+              : nothing
+        }
       </span>
+      ${publication ? renderGitHubPublicationDetails(publication) : nothing}
     </article>
   `;
 }
 
 export function renderChatPullRequests(props: {
   pullRequests: ControlUiSessionPullRequest[];
+  gateway?: ApplicationGateway;
+  sessionKey?: string;
+  presented?: boolean;
   branch?: ControlUiSessionBranch;
-  rateLimited: boolean;
+  status: ControlUiSessionPullRequestSnapshot["status"];
   expanded: boolean;
-  onExpand: () => void;
+  onToggle: () => void;
   onDismiss: (pullRequest: ControlUiSessionPullRequest) => void;
+  onOpenSessionDiff?: () => void;
+  publication?: GitHubPublicationView;
 }) {
-  if (props.pullRequests.length === 0 && !props.branch) {
+  const { publication } = props;
+  const published = publication?.result?.status === "published" ? publication.result : undefined;
+  const retainedPublication = publication?.result || publication?.locked || publication?.error;
+  // Gateway branch facts describe unpublished work, including changes after a merge.
+  // PR metadata takes precedence over retained publication history.
+  if (props.branch || (props.pullRequests.length === 0 && retainedPublication)) {
+    return html`<div class="chat-prs" aria-live="polite">
+      ${renderWorkRow(props.branch, props.status, props.onOpenSessionDiff, publication)}
+    </div>`;
+  }
+  if (props.pullRequests.length === 0) {
     return nothing;
   }
-  const { visible, hiddenCount } = visibleChatPullRequests(props.pullRequests, props.expanded);
+  const recovery =
+    retainedPublication && (!published || publication?.error) ? publication : undefined;
+  const { visible, collapsedCount } = visibleChatPullRequests(props.pullRequests, props.expanded);
   return html`
     <div class="chat-prs" aria-live="polite">
-      ${props.branch ? renderBranchRow(props.branch, props.rateLimited) : nothing}
-      ${visible.map((pullRequest) => {
+      ${repeat(visible, chatPullRequestId, (pullRequest) => {
         const merged = pullRequest.state === "merged";
+        const rowPublication = pullRequest === visible[0] ? recovery : undefined;
         return html`
           <article class="chat-pr" data-state=${pullRequest.state}>
             <a
@@ -275,36 +344,62 @@ export function renderChatPullRequests(props: {
                 ${merged ? icons.gitMerge : icons.gitPullRequest}
               </span>
               <span class="chat-pr__number">#${pullRequest.number}</span>
-              <span class="chat-pr__repo">${pullRequest.repo}</span>
-              <span class="chat-pr__branch">${pullRequest.branch}</span>
+              <span class="chat-pr__identity">
+                <span class="chat-pr__repo">${pullRequest.repo}</span>
+                <span class="chat-pr__branch">${pullRequest.branch}</span>
+              </span>
             </a>
             <span class="chat-pr__meta">
-              ${renderDiffStats(pullRequest)} ${renderChecks(pullRequest)}
-              ${pullRequest.state === "open"
-                ? nothing
-                : html`<span class="chat-pr__state">${stateLabel(pullRequest.state)}</span>`}
-              ${props.rateLimited && !merged ? renderRateLimitWarning() : nothing}
+              ${renderDiffStats(pullRequest)} ${renderChecks(pullRequest, props)}
+              ${
+                pullRequest.state === "open"
+                  ? nothing
+                  : html`<span class="chat-pr__state">${stateLabel(pullRequest.state)}</span>`
+              }
+              ${!merged || props.status === "unavailable" ? renderStatusWarning(props.status) : nothing}
+              ${rowPublication && !published ? renderGitHubPublicationAction(rowPublication) : nothing}
               <button
                 class="chat-pr__dismiss"
                 type="button"
+                ?disabled=${Boolean(published) && publication?.activity !== null}
                 aria-label=${t("chat.pullRequests.dismiss", {
                   number: String(pullRequest.number),
                 })}
-                @click=${() => props.onDismiss(pullRequest)}
+                @click=${() => {
+                  if (published) {
+                    publication?.onNewAction?.();
+                  }
+                  props.onDismiss(pullRequest);
+                }}
               >
                 ${icons.x}
               </button>
             </span>
+            ${rowPublication ? renderGitHubPublicationDetails(rowPublication) : nothing}
           </article>
         `;
       })}
-      ${hiddenCount > 0
-        ? html`
-            <button class="chat-prs__more" type="button" @click=${props.onExpand}>
-              ${t("chat.pullRequests.showMore", { count: String(hiddenCount) })}
-            </button>
-          `
-        : nothing}
+      ${
+        collapsedCount > 0
+          ? html`
+              <button
+                class="chat-prs__more"
+                type="button"
+                aria-expanded=${props.expanded}
+                @click=${props.onToggle}
+              >
+                ${
+                  props.expanded
+                    ? t("chat.pullRequests.showLess")
+                    : t("chat.pullRequests.showMore", { count: String(collapsedCount) })
+                }
+                <span aria-hidden="true"
+                  >${props.expanded ? icons.chevronUp : icons.chevronDown}</span
+                >
+              </button>
+            `
+          : nothing
+      }
     </div>
   `;
 }

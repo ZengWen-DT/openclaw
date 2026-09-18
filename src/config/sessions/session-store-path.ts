@@ -1,20 +1,22 @@
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import { getRuntimeConfig } from "../io.js";
-import { resolveStorePath } from "./paths.js";
+import type { OpenClawConfig } from "../types.openclaw.js";
+import {
+  resolveExplicitSessionStorePathForScope,
+  resolveSessionStorePathCore,
+  type SessionStorePathScope,
+} from "./paths.js";
 
-type SessionStorePathScope = {
-  agentId?: string;
-  env?: NodeJS.ProcessEnv;
-  sessionKey?: string;
-  storePath?: string;
-};
-
-export function resolveSessionStorePathForScope(scope: SessionStorePathScope): string {
-  if (scope.storePath) {
-    return scope.storePath;
+export function resolveSessionStorePathForScope(
+  scope: SessionStorePathScope,
+  config?: OpenClawConfig,
+): string {
+  const explicitStorePath = resolveExplicitSessionStorePathForScope(scope);
+  if (explicitStorePath) {
+    return explicitStorePath;
   }
   const agentId = scope.agentId ?? resolveAgentIdFromSessionKey(scope.sessionKey);
-  return resolveStorePath(getRuntimeConfig().session?.store, {
+  return resolveSessionStorePathCore((config ?? getRuntimeConfig()).session?.store, {
     agentId,
     env: scope.env,
   });

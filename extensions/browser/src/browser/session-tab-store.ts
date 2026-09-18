@@ -1,5 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
+import { z } from "zod";
+import type { BrowserDashboardIdentity } from "../browser-dashboard.types.js";
 import {
   getBrowserStateRuntime,
   getOptionalBrowserStateRuntime,
@@ -13,24 +15,135 @@ import {
 const BROWSER_SESSION_TABS_NAMESPACE = "browser.session-tabs";
 const BROWSER_SESSION_TABS_MAX_ENTRIES = 5_000;
 
-export type BrowserSessionTabRecord = {
-  version: 1;
-  sessionKey: string;
-  nativeTargetId: string;
-  profile: string;
-  profileAliases?: string[];
-  profileFingerprint: string;
-  browserInstanceFingerprint: string;
-  interactionTargetKind: "native" | "opaque";
-  trackedAt: number;
-  lastUsedAt: number;
-  cleanupRequestedAt?: number;
-  cleanupAttemptToken?: string;
-  cleanupKind?: "lifecycle" | "sweep";
-};
+const browserSessionTimestampSchema = z.number().finite().nonnegative();
+const browserDashboardStopIntentSchema = z.strictObject({
+  kind: z.literal("dashboard-stop"),
+  version: z.literal(1),
+  stopId: z.uuid(),
+  sessionKey: z.string().min(1),
+  agentId: z.string().min(1),
+  name: z.string().min(1).max(64),
+  instanceId: z.string().min(1),
+  url: z.string().min(1).max(4096),
+  profile: z.string().min(1),
+});
+const browserProfileAliasSchema = z
+  .string()
+  .min(1)
+  .refine((value) => value === value.trim().toLowerCase());
+const browserSessionTabRecordSchema = z
+  .looseObject({
+    version: z.literal(1),
+    sessionKey: z.string().min(1),
+    nativeTargetId: z.string().min(1),
+    profile: z.string().min(1),
+    profileAliases: z.array(browserProfileAliasSchema).min(1).optional(),
+    profileFingerprint: z.string().min(1),
+    browserInstanceFingerprint: z.string().min(1),
+    interactionTargetKind: z.enum(["native", "opaque"]),
+    trackedAt: browserSessionTimestampSchema,
+    lastUsedAt: browserSessionTimestampSchema,
+    dashboard: z
+      .object({
+        name: z.string().min(1).max(64),
+        sessionKey: z.string().min(1),
+        instanceId: z.string().min(1),
+        agentId: z.string().min(1).optional(),
+        url: z.string().min(1).max(4096),
+        state: z.enum(["active", "stopping", "stopped", "released"]),
+      })
+      .optional(),
+    cleanupRequestedAt: browserSessionTimestampSchema.optional(),
+    cleanupAttemptToken: z.string().min(1).optional(),
+    cleanupKind: z.enum(["lifecycle", "sweep"]).optional(),
+  })
+  .superRefine((record, context) => {
+    if (record.profileAliases) {
+      const canonical = [...new Set(record.profileAliases)].toSorted(
+        compareBrowserSessionTabProfileAliases,
+      );
+      if (
+        canonical.includes(record.profile) ||
+        !canonical.every((entry, index) => entry === record.profileAliases?.[index])
+      ) {
+        context.addIssue({ code: "custom", message: "profile aliases must be canonical" });
+      }
+    }
+    const cleanupFieldCount = [
+      record.cleanupRequestedAt,
+      record.cleanupAttemptToken,
+      record.cleanupKind,
+    ].filter((value) => value !== undefined).length;
+    if (cleanupFieldCount !== 0 && cleanupFieldCount !== 3) {
+      context.addIssue({ code: "custom", message: "cleanup fields must be all present or absent" });
+    }
+    if (Object.hasOwn(record, "baseUrl") || Object.hasOwn(record, "interactionTargetId")) {
+      context.addIssue({ code: "custom", message: "retired browser tab fields are not allowed" });
+    }
+  });
+
+export type BrowserSessionTabRecord = z.infer<typeof browserSessionTabRecordSchema>;
+export type BrowserDashboardStopIntent = z.infer<typeof browserDashboardStopIntentSchema>;
+
+function browserDashboardStopIntentKey(
+  identity: Pick<BrowserDashboardIdentity, "sessionKey" | "agentId" | "instanceId" | "name">,
+): string {
+  return `dashboard-stop:${createHash("sha256")
+    .update(
+      JSON.stringify([identity.sessionKey, identity.agentId, identity.instanceId, identity.name]),
+    )
+    .digest("hex")}`;
+}
+
+export function parseBrowserDashboardStopIntent(
+  key: string,
+  value: unknown,
+): BrowserDashboardStopIntent | undefined {
+  const parsed = browserDashboardStopIntentSchema.safeParse(value);
+  return parsed.success && browserDashboardStopIntentKey(parsed.data) === key
+    ? parsed.data
+    : undefined;
+}
+
+export function readBrowserDashboardStopIntent(identity: BrowserDashboardIdentity) {
+  const key = browserDashboardStopIntentKey(identity);
+  return parseBrowserDashboardStopIntent(key, getOptionalBrowserSessionTabStore()?.lookup(key));
+}
+
+export function readBrowserDashboardStopIntents(): BrowserDashboardStopIntent[] {
+  return (getOptionalBrowserSessionTabStore()?.entries() ?? []).flatMap(({ key, value }) => {
+    const intent = parseBrowserDashboardStopIntent(key, value);
+    return intent ? [intent] : [];
+  });
+}
+
+export function persistBrowserDashboardStopIntent(identity: BrowserDashboardIdentity): void {
+  const { sessionKey, agentId, name, instanceId, url, profile } = identity;
+  const intent: BrowserDashboardStopIntent = {
+    kind: "dashboard-stop",
+    version: 1,
+    stopId: randomUUID(),
+    sessionKey,
+    agentId,
+    name,
+    instanceId,
+    url,
+    profile,
+  };
+  getBrowserSessionTabStore().register(browserDashboardStopIntentKey(intent), intent);
+}
+
+export function deleteBrowserDashboardStopIntent(intent: BrowserDashboardStopIntent): boolean {
+  const key = browserDashboardStopIntentKey(intent);
+  return deleteBrowserSessionTabIf(
+    key,
+    (current) => parseBrowserDashboardStopIntent(key, current)?.stopId === intent.stopId,
+  );
+}
 
 type BrowserSessionTabStoreRuntime = {
   state: Pick<PluginRuntime["state"], "openSyncKeyedStore">;
+  gateway?: PluginRuntime["gateway"];
 };
 
 /** Opens and publishes Browser's canonical durable tab store during plugin registration. */
@@ -40,7 +153,14 @@ export function initializeBrowserSessionTabStore(runtime: BrowserSessionTabStore
     maxEntries: BROWSER_SESSION_TABS_MAX_ENTRIES,
     overflowPolicy: "reject-new",
   });
-  setBrowserStateRuntime({ sessionTabs });
+  setBrowserStateRuntime({
+    sessionTabs,
+    // Metadata registration must not materialize the broad host runtime.
+    get gateway() {
+      return runtime.gateway;
+    },
+    dashboardOperations: new Map(),
+  });
   resetDurableTabAliases();
   for (const entry of sessionTabs.entries()) {
     const record = parseBrowserSessionTabRecord(entry.value);
@@ -68,6 +188,67 @@ export function getOptionalBrowserSessionTabStore() {
   return getOptionalBrowserStateRuntime()?.sessionTabs;
 }
 
+export function readBrowserDashboardTabs(
+  storageKey?: string,
+): Array<BrowserSessionTabRecord & { storageKey: string }> {
+  const store = getOptionalBrowserSessionTabStore();
+  const entries =
+    storageKey === undefined
+      ? (store?.entries() ?? [])
+      : [{ key: storageKey, value: store?.lookup(storageKey) }];
+  return entries.flatMap(({ key, value }) => {
+    const tab = parseBrowserDashboardTab(key, value);
+    return tab ? [tab] : [];
+  });
+}
+
+function parseBrowserDashboardTab(key: string, value: unknown) {
+  const record = parseBrowserSessionTabRecord(value);
+  return record?.dashboard && browserSessionTabStorageKey(record) === key
+    ? { ...record, storageKey: key }
+    : undefined;
+}
+
+/** Discovery only; reconciliation rereads current authority after awaited work. */
+export function readBrowserDashboardSessionOwners(): Array<{
+  sessionKey: string;
+  agentId?: string;
+}> {
+  const entries = getOptionalBrowserSessionTabStore()?.entries() ?? [];
+  const dashboards = entries.flatMap(({ key, value }) => {
+    const tab = parseBrowserDashboardTab(key, value);
+    return tab?.dashboard ? [tab.dashboard] : [];
+  });
+  const stopIntents = entries.flatMap(({ key, value }) => {
+    const intent = parseBrowserDashboardStopIntent(key, value);
+    return intent ? [intent] : [];
+  });
+  return [...dashboards, ...stopIntents];
+}
+
+/** Ordinary close commands cannot discard a dashboard's retained page. */
+export function findRetainedBrowserDashboardTab(
+  targetId: string,
+  profile?: string,
+  tabs = readBrowserDashboardTabs(),
+) {
+  return tabs.find(
+    (tab) =>
+      tab.nativeTargetId === targetId &&
+      (!profile || tab.profile === profile) &&
+      (tab.dashboard?.state === "active" || tab.dashboard?.state === "stopping"),
+  );
+}
+
+export function assertBrowserDashboardTabCanClose(targetId: string, profile?: string): void {
+  const retained = findRetainedBrowserDashboardTab(targetId, profile);
+  if (retained) {
+    throw new Error(
+      `This tab belongs to dashboard ${retained.dashboard!.name}. Stop it from the dashboard or use browser action=close dashboard=${retained.dashboard!.name}.`,
+    );
+  }
+}
+
 export function browserSessionTabStorageKey(record: {
   sessionKey: string;
   nativeTargetId: string;
@@ -92,73 +273,13 @@ export function browserSessionTabNativeIdentity(
   return `${record.sessionKey}\u0000${record.profile}\u0000${record.nativeTargetId}`;
 }
 
-function isTimestamp(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
-}
-
 export function compareBrowserSessionTabProfileAliases(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function isCanonicalProfileAliases(
-  value: unknown,
-  profile: unknown,
-): value is string[] | undefined {
-  if (value === undefined) {
-    return true;
-  }
-  if (
-    !Array.isArray(value) ||
-    value.length === 0 ||
-    value.some(
-      (entry) => typeof entry !== "string" || !entry || entry !== entry.trim().toLowerCase(),
-    )
-  ) {
-    return false;
-  }
-  const canonical = [...new Set(value)].toSorted(compareBrowserSessionTabProfileAliases);
-  return (
-    !canonical.includes(String(profile)) &&
-    canonical.every((entry, index) => entry === value[index])
-  );
-}
-
 export function parseBrowserSessionTabRecord(value: unknown): BrowserSessionTabRecord | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-  const record = value as Record<string, unknown>;
-  const cleanupFieldsValid =
-    (record.cleanupRequestedAt === undefined &&
-      record.cleanupAttemptToken === undefined &&
-      record.cleanupKind === undefined) ||
-    (isTimestamp(record.cleanupRequestedAt) &&
-      typeof record.cleanupAttemptToken === "string" &&
-      record.cleanupAttemptToken.length > 0 &&
-      (record.cleanupKind === "lifecycle" || record.cleanupKind === "sweep"));
-  if (
-    record.version !== 1 ||
-    typeof record.sessionKey !== "string" ||
-    !record.sessionKey ||
-    typeof record.nativeTargetId !== "string" ||
-    !record.nativeTargetId ||
-    typeof record.profile !== "string" ||
-    !record.profile ||
-    !isCanonicalProfileAliases(record.profileAliases, record.profile) ||
-    typeof record.profileFingerprint !== "string" ||
-    !record.profileFingerprint ||
-    typeof record.browserInstanceFingerprint !== "string" ||
-    !record.browserInstanceFingerprint ||
-    (record.interactionTargetKind !== "native" && record.interactionTargetKind !== "opaque") ||
-    !isTimestamp(record.trackedAt) ||
-    !isTimestamp(record.lastUsedAt) ||
-    !cleanupFieldsValid ||
-    Object.hasOwn(record, "baseUrl") ||
-    Object.hasOwn(record, "interactionTargetId")
-  ) {
-    return undefined;
-  }
-  return record as BrowserSessionTabRecord;
+  const parsed = browserSessionTabRecordSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
 export function sameBrowserSessionTabRecord(
@@ -177,6 +298,12 @@ export function sameBrowserSessionTabRecord(
     left.interactionTargetKind === right.interactionTargetKind &&
     left.trackedAt === right.trackedAt &&
     left.lastUsedAt === right.lastUsedAt &&
+    left.dashboard?.name === right.dashboard?.name &&
+    left.dashboard?.sessionKey === right.dashboard?.sessionKey &&
+    left.dashboard?.instanceId === right.dashboard?.instanceId &&
+    left.dashboard?.agentId === right.dashboard?.agentId &&
+    left.dashboard?.url === right.dashboard?.url &&
+    left.dashboard?.state === right.dashboard?.state &&
     left.cleanupRequestedAt === right.cleanupRequestedAt &&
     left.cleanupAttemptToken === right.cleanupAttemptToken &&
     left.cleanupKind === right.cleanupKind

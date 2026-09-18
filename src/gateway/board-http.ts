@@ -1,28 +1,21 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { BoardStore } from "../boards/board-store.js";
+import { buildBoardWidgetContentSecurityPolicy } from "./board-sandbox.js";
 import { boardStore } from "./board-store.js";
-import { BOARD_HTTP_PATH_PREFIX, verifyBoardViewTicket } from "./board-view-ticket.js";
+import { BoardGatewayUnavailableError, BOARD_HTTP_PATH_PREFIX } from "./board-view-ticket.js";
+import { withAuthorizedBoardWidgetView } from "./board-widget-view.js";
+import { isReadHttpMethod, respondNotFound, respondPlainText } from "./control-ui-http-utils.js";
 import { sendMethodNotAllowed } from "./http-common.js";
+import type { GatewayContextResolver } from "./server-methods/types.js";
+import { sessionObserverScopeKey } from "./session-observer-model.js";
 
 const BOARD_WIDGET_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-const BOARD_WIDGET_CSP = "sandbox allow-scripts";
 
 type BoardHttpOptions = {
+  resolveGatewayContext?: GatewayContextResolver;
   store?: BoardStore;
   nowMs?: number;
 };
-
-function sendNotFound(res: ServerResponse): void {
-  res.statusCode = 404;
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.end("Not Found");
-}
-
-function sendUnauthorized(res: ServerResponse): void {
-  res.statusCode = 401;
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.end("Unauthorized");
-}
 
 function parseBoardWidgetPath(pathname: string): { sessionKey: string; name: string } | undefined {
   const match = /^\/__openclaw__\/board\/([^/]+)\/([^/]+)\/index\.html$/.exec(pathname);
@@ -41,45 +34,69 @@ function parseBoardWidgetPath(pathname: string): { sessionKey: string; name: str
   }
 }
 
-export function handleBoardHttpRequest(
+export async function handleBoardHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
   opts: BoardHttpOptions = {},
-): boolean {
+): Promise<boolean> {
   const url = new URL(req.url ?? "/", "http://localhost");
   const pathname = url.pathname;
   if (!pathname.startsWith(BOARD_HTTP_PATH_PREFIX)) {
     return false;
   }
-  if (req.method !== "GET") {
-    sendMethodNotAllowed(res, "GET");
+  // The ticket is the authorization boundary. CORS lets a Control UI hosted
+  // away from the Gateway fetch the bytes and observe authorization failures.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  if (!isReadHttpMethod(req.method)) {
+    sendMethodNotAllowed(res, "GET, HEAD");
     return true;
   }
   const path = parseBoardWidgetPath(pathname);
   if (!path) {
-    sendNotFound(res);
+    respondNotFound(res);
     return true;
   }
   const ticket = url.searchParams.get("bt");
-  const claims = ticket ? verifyBoardViewTicket(ticket, { nowMs: opts.nowMs }) : undefined;
-  if (!claims || claims.sessionKey !== path.sessionKey || claims.name !== path.name) {
-    sendUnauthorized(res);
+  if (!ticket) {
+    respondPlainText(res, 401, "Unauthorized");
     return true;
   }
-  const document = (opts.store ?? boardStore).readWidgetHtml(path.sessionKey, path.name);
-  if (
-    !document ||
-    (document.grantState !== "none" && document.grantState !== "granted") ||
-    document.revision !== claims.revision ||
-    document.viewGeneration !== claims.viewGeneration
-  ) {
-    sendUnauthorized(res);
+  try {
+    return await withAuthorizedBoardWidgetView(
+      opts.store ?? boardStore,
+      ticket,
+      (authorized) => {
+        // Ticket claims address stored rows; owned frame routes carry observer identity.
+        const routeSessionKey = authorized.agentId
+          ? sessionObserverScopeKey(authorized.sessionKey, authorized.agentId)
+          : authorized.sessionKey;
+        if (routeSessionKey !== path.sessionKey || authorized.name !== path.name) {
+          respondPlainText(res, 401, "Unauthorized");
+          return true;
+        }
+        const html = authorized.document.html;
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Content-Length", String(Buffer.byteLength(html)));
+        res.setHeader(
+          "Content-Security-Policy",
+          buildBoardWidgetContentSecurityPolicy(authorized.document),
+        );
+        res.setHeader("Cache-Control", "no-cache");
+        res.end(req.method === "HEAD" ? undefined : html);
+        return true;
+      },
+      {
+        gatewayContext: opts.resolveGatewayContext?.(),
+        nowMs: opts.nowMs,
+      },
+    );
+  } catch (error) {
+    if (error instanceof BoardGatewayUnavailableError) {
+      respondPlainText(res, 503, "Service Unavailable");
+      return true;
+    }
+    respondPlainText(res, 401, "Unauthorized");
     return true;
   }
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.setHeader("Content-Security-Policy", BOARD_WIDGET_CSP);
-  res.setHeader("Cache-Control", "no-cache");
-  res.end(document.html);
-  return true;
 }

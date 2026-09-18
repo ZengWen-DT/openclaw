@@ -21,6 +21,10 @@ export type PluginHookBeforeModelResolveResult = {
 // before_prompt_build hook
 export type PluginHookBeforePromptBuildEvent = {
   prompt: string;
+  /** Current request before projection. Empty means no textual request; omission is legacy. */
+  currentUserMessage?: string;
+  /** Stable native admission identity across rebuilds; differs between admitted requests. */
+  currentUserMessageId?: string;
   /** Session messages prepared for this run. */
   messages: unknown[];
 };
@@ -29,6 +33,11 @@ export type PluginHookBeforePromptBuildResult = {
   systemPrompt?: string;
   prependContext?: string;
   appendContext?: string;
+  /**
+   * Narrows the tools submitted to the model for this turn.
+   * An empty array disables optional tools; omitted leaves the existing tool policy unchanged.
+   */
+  toolsAllow?: string[];
   /**
    * Prepended to the agent system prompt so providers can cache it (e.g. prompt caching).
    * Use for static plugin guidance instead of prependContext to avoid per-turn token cost.

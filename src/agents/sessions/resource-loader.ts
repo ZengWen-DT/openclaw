@@ -5,12 +5,13 @@
  */
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import chalk from "chalk";
+import { isPathInside } from "../../infra/path-guards.js";
 import type { Skill } from "../../skills/loading/session.js";
 import { loadSkills } from "../../skills/loading/session.js";
-import { CONFIG_DIR_NAME } from "../config.js";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.js";
+import { CONFIG_DIR_NAME } from "../package-metadata.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
@@ -26,11 +27,11 @@ import type {
   ExtensionRuntime,
   LoadExtensionsResult,
 } from "./extensions/types.js";
-import { DefaultPackageManager, type PathMetadata } from "./package-manager.js";
+import { DefaultPackageManager, type ResolvedPaths } from "./package-manager.js";
 import type { PromptTemplate } from "./prompt-templates.js";
 import { loadPromptTemplates } from "./prompt-templates.js";
 import { SettingsManager } from "./settings-manager.js";
-import { createSourceInfo, type SourceInfo } from "./source-info.js";
+import { createSourceInfo, type PathMetadata, type SourceInfo } from "./source-info.js";
 
 export interface ResourceExtensionPaths {
   skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -49,6 +50,13 @@ export interface ResourceLoader {
   extendResources(paths: ResourceExtensionPaths): void;
   reload(): Promise<void>;
 }
+
+const EMPTY_RESOLVED_PATHS: ResolvedPaths = {
+  extensions: [],
+  skills: [],
+  prompts: [],
+  themes: [],
+};
 
 function resolvePromptInput(input: string | undefined, description: string): string | undefined {
   if (!input) {
@@ -349,7 +357,10 @@ export class DefaultResourceLoader implements ResourceLoader {
       clearExtensionCache();
     }
     await this.settingsManager.reload();
-    const resolvedPaths = await this.packageManager.resolve();
+    const resolvedPaths =
+      this.noExtensions && this.noSkills && this.noPromptTemplates && this.noThemes
+        ? EMPTY_RESOLVED_PATHS
+        : await this.packageManager.resolve();
     const cliExtensionPaths = await this.packageManager.resolveExtensionSources(
       this.additionalExtensionPaths,
       {
@@ -664,10 +675,7 @@ export class DefaultResourceLoader implements ResourceLoader {
     if (extraSourceInfos) {
       for (const [sourcePath, sourceInfo] of extraSourceInfos.entries()) {
         const normalizedSourcePath = resolve(sourcePath);
-        if (
-          normalizedResourcePath === normalizedSourcePath ||
-          normalizedResourcePath.startsWith(`${normalizedSourcePath}${sep}`)
-        ) {
+        if (isPathInside(normalizedSourcePath, normalizedResourcePath)) {
           return { ...sourceInfo, path: resourcePath };
         }
       }
@@ -681,10 +689,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
       for (const [sourcePath, metadata] of metadataByPath.entries()) {
         const normalizedSourcePath = resolve(sourcePath);
-        if (
-          normalizedResourcePath === normalizedSourcePath ||
-          normalizedResourcePath.startsWith(`${normalizedSourcePath}${sep}`)
-        ) {
+        if (isPathInside(normalizedSourcePath, normalizedResourcePath)) {
           return createSourceInfo(resourcePath, metadata);
         }
       }
@@ -718,7 +723,7 @@ export class DefaultResourceLoader implements ResourceLoader {
     ];
 
     for (const root of agentRoots) {
-      if (this.isUnderPath(normalizedPath, root)) {
+      if (isPathInside(root, normalizedPath)) {
         return {
           path: filePath,
           source: "local",
@@ -730,7 +735,7 @@ export class DefaultResourceLoader implements ResourceLoader {
     }
 
     for (const root of projectRoots) {
-      if (this.isUnderPath(normalizedPath, root)) {
+      if (isPathInside(root, normalizedPath)) {
         return {
           path: filePath,
           source: "local",
@@ -983,15 +988,6 @@ export class DefaultResourceLoader implements ResourceLoader {
     }
 
     return undefined;
-  }
-
-  private isUnderPath(target: string, root: string): boolean {
-    const normalizedRoot = resolve(root);
-    if (target === normalizedRoot) {
-      return true;
-    }
-    const prefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
-    return target.startsWith(prefix);
   }
 
   private detectExtensionConflicts(

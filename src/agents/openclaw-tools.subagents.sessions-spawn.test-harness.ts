@@ -1,19 +1,26 @@
 // Shared sessions_spawn test harness for gateway, registry, and lifecycle mocks.
+import os from "node:os";
+import path from "node:path";
 import { vi, type Mock } from "vitest";
+import type { SessionRunStatus } from "../../packages/gateway-protocol/src/schema/sessions-row.js";
 import type { SubagentLifecycleHookRunner } from "../plugins/hooks.js";
-import { resolveRequesterStoreKey } from "./subagent-requester-store-key.js";
+import { resolveRequesterStoreKey } from "./subagents/announce/subagent-requester-store-key.js";
+import { supportedSpawnModelChoice } from "./subagents/spawn/subagent-spawn.test-helpers.js";
 
 type SessionsSpawnTestConfig = ReturnType<
   (typeof import("../config/config.js"))["getRuntimeConfig"]
 >;
 type SessionsSpawnHookRunner = SubagentLifecycleHookRunner | null;
 type CaptureSubagentCompletionReply =
-  (typeof import("./subagent-announce.js"))["captureSubagentCompletionReply"];
-type RunSubagentAnnounceFlow = (typeof import("./subagent-announce.js"))["runSubagentAnnounceFlow"];
+  (typeof import("./subagents/announce/subagent-announce.js"))["captureSubagentCompletionReply"];
+type RunSubagentAnnounceFlow =
+  (typeof import("./subagents/announce/subagent-announce.js"))["runSubagentAnnounceFlow"];
 type CreateSessionsSpawnTool =
   (typeof import("./tools/sessions-spawn-tool.js"))["createSessionsSpawnTool"];
-type SubagentRegistryTesting = (typeof import("./subagent-registry.test-helpers.js"))["testing"];
-type SubagentSpawnTesting = (typeof import("./subagent-spawn.test-support.js"))["testing"];
+type SubagentRegistryTesting =
+  (typeof import("./subagents/registry/subagent-registry.test-helpers.js"))["testing"];
+type SubagentSpawnTesting =
+  (typeof import("./subagents/spawn/subagent-spawn.test-support.js"))["testing"];
 type CreateOpenClawToolsOpts = Parameters<CreateSessionsSpawnTool>[0];
 type GatewayRequest = { method?: string; params?: unknown; timeoutMs?: number };
 type AgentWaitCall = { runId?: string; timeoutMs?: number };
@@ -22,7 +29,7 @@ type TestSessionEntry = {
   updatedAt: number;
   startedAt?: number;
   endedAt?: number;
-  status?: "running" | "done" | "failed" | "killed" | "timeout";
+  status?: SessionRunStatus;
 };
 type SessionsSpawnGatewayMockOptions = {
   includeSessionsList?: boolean;
@@ -92,7 +99,7 @@ const hoisted = vi.hoisted(() => {
       });
     }
 
-    return true;
+    return "delivered";
   };
   const defaultCaptureSubagentCompletionReply: CaptureSubagentCompletionReply = async () =>
     undefined;
@@ -138,6 +145,10 @@ const hoisted = vi.hoisted(() => {
 let cachedCreateSessionsSpawnTool: CreateSessionsSpawnTool | null = null;
 let cachedSubagentRegistryTesting: SubagentRegistryTesting | null = null;
 let cachedSubagentSpawnTesting: SubagentSpawnTesting | null = null;
+const sessionStorePath = path.join(
+  os.tmpdir(),
+  `openclaw-sessions-spawn-test-store-${process.pid}-${process.env.VITEST_POOL_ID ?? "0"}.json`,
+);
 
 export function getCallGatewayMock(): Mock {
   return hoisted.callGatewayMock;
@@ -193,13 +204,14 @@ export async function getSessionsSpawnTool(opts: CreateOpenClawToolsOpts) {
   if (!cachedSubagentSpawnTesting || !cachedSubagentRegistryTesting) {
     const [{ testing: subagentSpawnTesting }, { testing: subagentRegistryTesting }] =
       await Promise.all([
-        import("./subagent-spawn.test-support.js"),
-        import("./subagent-registry.test-helpers.js"),
+        import("./subagents/spawn/subagent-spawn.test-support.js"),
+        import("./subagents/registry/subagent-registry.test-helpers.js"),
       ]);
     cachedSubagentSpawnTesting = subagentSpawnTesting;
     cachedSubagentRegistryTesting = subagentRegistryTesting;
   }
   cachedSubagentSpawnTesting.setDepsForTest({
+    prepareModelChoice: supportedSpawnModelChoice,
     callGateway: (optsUnknown) => hoisted.callGatewayMock(optsUnknown),
     getGlobalHookRunner: () => hoisted.state.hookRunnerOverride,
     getRuntimeConfig: () => hoisted.state.configOverride,
@@ -236,7 +248,7 @@ export async function getSessionsSpawnTool(opts: CreateOpenClawToolsOpts) {
     getRuntimeConfig: () => hoisted.state.configOverride,
     cleanupBrowserSessionsForLifecycleEnd: async () => {},
     ensureContextEnginesInitialized: () => {},
-    ensureRuntimePluginsLoaded: () => {},
+    loadAgentRuntimePluginRegistryHandle: () => undefined,
     persistSubagentRunsToDisk: () => {
       hoisted.notifyEventWaiters();
     },
@@ -372,12 +384,13 @@ vi.mock("../config/config.js", () => ({
   resolveGatewayPort: () => 18789,
 }));
 
-vi.mock("../config/sessions.js", () => ({
+vi.mock("../config/sessions.js", async () => ({
+  isPerAgentSessionStoreConfig: (await import("../config/sessions/session-store-config.js"))
+    .isPerAgentSessionStoreConfig,
   isConfiguredSessionStoreAgentId: (
     cfg: { agents?: { list?: Array<{ id?: string }> } },
     agentId: string,
   ) => agentId === "main" || cfg.agents?.list?.some((agent) => agent.id === agentId) === true,
-  isLegacyOnlySessionStoreTarget: () => false,
   loadSessionStore: () => hoisted.sessionStore,
   mergeSessionEntry: (existing: object | undefined, patch: object) => ({
     ...existing,
@@ -389,9 +402,8 @@ vi.mock("../config/sessions.js", () => ({
     cfg?: { session?: { mainKey?: string } };
     agentId: string;
   }) => `agent:${params.agentId}:${params.cfg?.session?.mainKey ?? "main"}`,
-  readLegacySessionStoreTarget: () => undefined,
   resolveExistingAgentSessionStoreTargetsSync: () => [],
-  resolveStorePath: () => "/tmp/openclaw-sessions-spawn-test-store.json",
+  resolveSessionStorePathCore: () => sessionStorePath,
   updateSessionStore: async (
     _storePath: string,
     mutator: (store: typeof hoisted.sessionStore) => void | Promise<void>,
@@ -402,7 +414,8 @@ vi.mock("../config/sessions.js", () => ({
 
 vi.mock("../tasks/detached-task-runtime.js", () => ({
   completeTaskRunByRunId: vi.fn(),
-  createRunningTaskRun: vi.fn(),
+  createQueuedTaskRun: vi.fn(() => ({})),
+  createRunningTaskRun: vi.fn(() => ({})),
   failTaskRunByRunId: vi.fn(),
   findDetachedTaskRun: vi.fn(() => ({ lookup: "available" as const })),
   setDetachedTaskDeliveryStatusByRunId: vi.fn(),

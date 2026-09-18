@@ -1,30 +1,55 @@
 import type { DatabaseSync } from "node:sqlite";
+import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
 import { normalizeAgentId } from "../routing/session-key.js";
+import { isPidAlive } from "../shared/pid-alive.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
-import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
-import { runOpenClawAgentWriteTransaction } from "../state/openclaw-agent-db.js";
-// Per-agent SQLite storage for rebuildable per-session usage rollups.
-import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
+import { withOpenClawAgentDatabaseWrite } from "../state/openclaw-agent-db-write.js";
+import {
+  runOpenClawAgentWriteTransaction,
+  resolveOpenClawAgentSqlitePath,
+} from "../state/openclaw-agent-db.js";
+import {
+  acquireSessionCostUsageRefreshLockInDatabase,
+  deleteSessionCostUsageRefreshLockInDatabase,
+  pruneSessionCostUsageRollupsInDatabase,
+  readSessionCostUsageRefreshLockInDatabase,
+  readSessionCostUsageRollupRowsInDatabase,
+  writeSessionCostUsageRollupInDatabase,
+  type SessionCostUsageRollupRow,
+} from "./session-cost-usage-cache.kernel.js";
 import { isTransientSqliteError } from "./unhandled-rejections.js";
 
-const LEGACY_CACHE_SCOPE = "session-cost-usage";
-const LEGACY_CACHE_KEY = "cache";
-const REFRESH_LOCK_KEY = "refresh-lock";
-const ROLLUP_SCOPE = "session-cost-usage-rollup-v1";
-
-type AgentCacheDatabase = Pick<OpenClawAgentKyselyDatabase, "cache_entries">;
-
+// Per-agent SQLite storage for rebuildable per-session usage rollups.
 type SessionCostUsageRefreshLock = {
   pid: number;
   startedAt: number;
   ownerNonce: string;
 };
 
-type SessionCostUsageRollupRow = {
-  key: string;
-  updatedAt: number;
-  valueJson: string;
-};
+function captureCacheDatabaseOptions(
+  inputOptions: Parameters<typeof runOpenClawAgentWriteTransaction>[1],
+) {
+  const options = {
+    ...inputOptions,
+    env: cloneEnvWithPlatformSemantics(inputOptions.env ?? process.env),
+  };
+  return { ...options, path: resolveOpenClawAgentSqlitePath(options) };
+}
+
+function runCacheWriteTransaction<T>(
+  operation: Parameters<typeof runOpenClawAgentWriteTransaction<T>>[0],
+  inputOptions: Parameters<typeof runOpenClawAgentWriteTransaction>[1],
+  transactionOptions: Parameters<typeof runOpenClawAgentWriteTransaction>[2],
+): Promise<T> {
+  const options = captureCacheDatabaseOptions(inputOptions);
+  return withOpenClawAgentDatabaseWrite(options, (database) =>
+    runOpenClawAgentWriteTransaction(
+      operation,
+      { ...options, path: database.path },
+      transactionOptions,
+    ),
+  );
+}
 
 function readCacheDatabase<T>(
   agentId: string | undefined,
@@ -46,125 +71,53 @@ function readCacheDatabase<T>(
   }
 }
 
-function readCacheValue(
-  agentId: string | undefined,
-  scope: string,
-  key: string,
-  databasePath?: string,
-): string | null {
+function readRefreshLock(agentId: string | undefined, databasePath?: string): string | null {
   return (
-    readCacheDatabase(agentId, databasePath, (database) => {
-      const kysely = getNodeSqliteKysely<AgentCacheDatabase>(database.db);
-      const row = executeSqliteQuerySync(
-        database.db,
-        kysely
-          .selectFrom("cache_entries")
-          .select("value_json")
-          .where("scope", "=", scope)
-          .where("key", "=", key)
-          .limit(1),
-      ).rows[0];
-      return row?.value_json ?? null;
-    }) ?? null
+    readCacheDatabase(agentId, databasePath, (database) =>
+      readSessionCostUsageRefreshLockInDatabase(database.db),
+    ) ?? null
   );
 }
 
-function deleteCacheValueIfUnchanged(params: {
+async function deleteRefreshLockIfUnchanged(params: {
   agentId?: string;
+  env?: NodeJS.ProcessEnv;
   databasePath?: string;
-  scope: string;
-  key: string;
   valueJson: string;
-}): void {
-  runOpenClawAgentWriteTransaction(
-    (database) => {
-      const kysely = getNodeSqliteKysely<AgentCacheDatabase>(database.db);
-      executeSqliteQuerySync(
-        database.db,
-        kysely
-          .deleteFrom("cache_entries")
-          .where("scope", "=", params.scope)
-          .where("key", "=", params.key)
-          .where("value_json", "=", params.valueJson),
-      );
-    },
+}): Promise<void> {
+  await runCacheWriteTransaction(
+    (database) => deleteSessionCostUsageRefreshLockInDatabase(database.db, params.valueJson),
     {
       agentId: normalizeAgentId(params.agentId),
+      env: params.env,
       ...(params.databasePath ? { path: params.databasePath } : {}),
     },
-    { operationLabel: `session-cost-usage.${params.key}.delete` },
+    { operationLabel: "session-cost-usage.refresh-lock.delete" },
   );
 }
 
 export function readSessionCostUsageRollupRows(
   agentId?: string,
   databasePath?: string,
+  filePaths?: readonly string[],
 ): SessionCostUsageRollupRow[] {
   return (
-    readCacheDatabase(agentId, databasePath, (database) => {
-      const kysely = getNodeSqliteKysely<AgentCacheDatabase>(database.db);
-      return executeSqliteQuerySync(
-        database.db,
-        kysely
-          .selectFrom("cache_entries")
-          .select(["key", "value_json", "updated_at"])
-          .where("scope", "=", ROLLUP_SCOPE),
-      ).rows.flatMap((row) =>
-        row.value_json === null
-          ? []
-          : [{ key: row.key, valueJson: row.value_json, updatedAt: row.updated_at }],
-      );
-    }) ?? []
+    readCacheDatabase(agentId, databasePath, (database) =>
+      readSessionCostUsageRollupRowsInDatabase(database.db, filePaths),
+    ) ?? []
   );
 }
 
-export function writeSessionCostUsageRollup(params: {
+export async function writeSessionCostUsageRollup(params: {
   agentId?: string;
   databasePath?: string;
   rollupId: string;
   previousValueJson: string | null;
   valueJson: string;
   updatedAt: number;
-}): boolean {
-  return runOpenClawAgentWriteTransaction(
-    (database) => {
-      const kysely = getNodeSqliteKysely<AgentCacheDatabase>(database.db);
-      const currentValueJson =
-        executeSqliteQuerySync(
-          database.db,
-          kysely
-            .selectFrom("cache_entries")
-            .select("value_json")
-            .where("scope", "=", ROLLUP_SCOPE)
-            .where("key", "=", params.rollupId)
-            .limit(1),
-        ).rows[0]?.value_json ?? null;
-      if (currentValueJson !== params.previousValueJson) {
-        return false;
-      }
-      executeSqliteQuerySync(
-        database.db,
-        kysely
-          .insertInto("cache_entries")
-          .values({
-            scope: ROLLUP_SCOPE,
-            key: params.rollupId,
-            value_json: params.valueJson,
-            blob: null,
-            expires_at: null,
-            updated_at: params.updatedAt,
-          })
-          .onConflict((conflict) =>
-            conflict.columns(["scope", "key"]).doUpdateSet({
-              value_json: params.valueJson,
-              blob: null,
-              expires_at: null,
-              updated_at: params.updatedAt,
-            }),
-          ),
-      );
-      return true;
-    },
+}): Promise<boolean> {
+  return runCacheWriteTransaction(
+    (database) => writeSessionCostUsageRollupInDatabase(database.db, params),
     {
       agentId: normalizeAgentId(params.agentId),
       ...(params.databasePath ? { path: params.databasePath } : {}),
@@ -173,36 +126,19 @@ export function writeSessionCostUsageRollup(params: {
   );
 }
 
-export function deleteSessionCostUsageRollupsExcept(params: {
+export async function deleteSessionCostUsageRollupsExcept(params: {
   agentId?: string;
+  env?: NodeJS.ProcessEnv;
   databasePath?: string;
   liveKeys: ReadonlySet<string>;
-}): void {
-  const existing = readSessionCostUsageRollupRows(params.agentId, params.databasePath)
-    .map((row) => row.key)
-    .filter((key) => !params.liveKeys.has(key));
-  runOpenClawAgentWriteTransaction(
-    (database) => {
-      const kysely = getNodeSqliteKysely<AgentCacheDatabase>(database.db);
-      for (const key of existing) {
-        executeSqliteQuerySync(
-          database.db,
-          kysely
-            .deleteFrom("cache_entries")
-            .where("scope", "=", ROLLUP_SCOPE)
-            .where("key", "=", key),
-        );
-      }
-      executeSqliteQuerySync(
-        database.db,
-        kysely
-          .deleteFrom("cache_entries")
-          .where("scope", "=", LEGACY_CACHE_SCOPE)
-          .where("key", "=", LEGACY_CACHE_KEY),
-      );
-    },
+  rows: readonly SessionCostUsageRollupRow[];
+}): Promise<void> {
+  const existing = params.rows.filter((row) => !params.liveKeys.has(row.key));
+  await runCacheWriteTransaction(
+    (database) => pruneSessionCostUsageRollupsInDatabase(database.db, existing),
     {
       agentId: normalizeAgentId(params.agentId),
+      env: params.env,
       ...(params.databasePath ? { path: params.databasePath } : {}),
     },
     { operationLabel: "session-cost-usage.rollup.prune" },
@@ -233,102 +169,57 @@ function parseRefreshLock(raw: string | null): SessionCostUsageRefreshLock | nul
   }
 }
 
-function isProcessRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-export function isSessionCostUsageRefreshRunning(agentId?: string, databasePath?: string): boolean {
-  const raw = readCacheValue(agentId, LEGACY_CACHE_SCOPE, REFRESH_LOCK_KEY, databasePath);
-  const lock = parseRefreshLock(raw);
-  if (lock && isProcessRunning(lock.pid)) {
-    return true;
-  }
-  if (raw !== null) {
-    deleteCacheValueIfUnchanged({
-      agentId,
-      databasePath,
-      scope: LEGACY_CACHE_SCOPE,
-      key: REFRESH_LOCK_KEY,
-      valueJson: raw,
-    });
-  }
-  return false;
-}
-
-export function acquireSessionCostUsageRefreshLock(
+export async function isSessionCostUsageRefreshRunning(
   agentId?: string,
   databasePath?: string,
-): { acquired: boolean; release: () => void } {
-  const previousRaw = readCacheValue(agentId, LEGACY_CACHE_SCOPE, REFRESH_LOCK_KEY, databasePath);
+): Promise<boolean> {
+  const options = captureCacheDatabaseOptions({
+    agentId: normalizeAgentId(agentId),
+    path: databasePath,
+  });
+  const lock = parseRefreshLock(readRefreshLock(options.agentId, options.path));
+  // Status never waits for a writer; acquisition replaces stale locks with its existing CAS.
+  return lock !== null && isPidAlive(lock.pid);
+}
+
+export async function acquireSessionCostUsageRefreshLock(
+  agentId?: string,
+  databasePath?: string,
+): Promise<{ acquired: boolean; release: () => Promise<void> }> {
+  const options = captureCacheDatabaseOptions({
+    agentId: normalizeAgentId(agentId),
+    path: databasePath,
+  });
+  const previousRaw = readRefreshLock(options.agentId, options.path);
   const previousLock = parseRefreshLock(previousRaw);
   // Process liveness is resolved before BEGIN. The transaction only compares
   // the authoritative row and commits the prepared replacement synchronously.
-  const previousOwnerIsRunning = previousLock ? isProcessRunning(previousLock.pid) : false;
+  const previousOwnerIsRunning = previousLock ? isPidAlive(previousLock.pid) : false;
   const lock: SessionCostUsageRefreshLock = {
     pid: process.pid,
     startedAt: Date.now(),
     ownerNonce: `${process.pid}:${Date.now()}:${process.hrtime.bigint()}`,
   };
   const lockJson = JSON.stringify(lock);
-  const acquired = runOpenClawAgentWriteTransaction(
-    (database) => {
-      const kysely = getNodeSqliteKysely<AgentCacheDatabase>(database.db);
-      const currentRaw =
-        executeSqliteQuerySync(
-          database.db,
-          kysely
-            .selectFrom("cache_entries")
-            .select("value_json")
-            .where("scope", "=", LEGACY_CACHE_SCOPE)
-            .where("key", "=", REFRESH_LOCK_KEY)
-            .limit(1),
-        ).rows[0]?.value_json ?? null;
-      if (currentRaw !== previousRaw || previousOwnerIsRunning) {
-        return false;
-      }
-      executeSqliteQuerySync(
-        database.db,
-        kysely
-          .insertInto("cache_entries")
-          .values({
-            scope: LEGACY_CACHE_SCOPE,
-            key: REFRESH_LOCK_KEY,
-            value_json: lockJson,
-            blob: null,
-            expires_at: null,
-            updated_at: lock.startedAt,
-          })
-          .onConflict((conflict) =>
-            conflict.columns(["scope", "key"]).doUpdateSet({
-              value_json: lockJson,
-              blob: null,
-              expires_at: null,
-              updated_at: lock.startedAt,
-            }),
-          ),
-      );
-      return true;
-    },
-    {
-      agentId: normalizeAgentId(agentId),
-      ...(databasePath ? { path: databasePath } : {}),
-    },
+  const acquired = await runCacheWriteTransaction(
+    (database) =>
+      acquireSessionCostUsageRefreshLockInDatabase(database.db, {
+        previousRaw,
+        previousOwnerIsRunning,
+        lockJson,
+        startedAt: lock.startedAt,
+      }),
+    options,
     { operationLabel: "session-cost-usage.refresh-lock.acquire" },
   );
   return {
     acquired,
-    release: () => {
+    release: async () => {
       if (acquired) {
-        deleteCacheValueIfUnchanged({
-          agentId,
-          databasePath,
-          scope: LEGACY_CACHE_SCOPE,
-          key: REFRESH_LOCK_KEY,
+        await deleteRefreshLockIfUnchanged({
+          agentId: options.agentId,
+          databasePath: options.path,
+          env: options.env,
           valueJson: lockJson,
         });
       }

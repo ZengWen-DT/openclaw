@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/twitch",
-  "version": "2026.7.2",
+  "version": "2026.9.4",
   "description": "OpenClaw Twitch channel plugin for chat and moderation workflows.",
   "repository": {
     "type": "git",
@@ -11,7 +11,7 @@
     "@twurple/api-call": "8.1.4",
     "@twurple/auth": "8.1.4",
     "@twurple/chat": "8.1.4",
-    "zod": "4.4.3"
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@openclaw/plugin-sdk": "workspace:*"
@@ -21,16 +21,20 @@
       "./index.ts"
     ],
     "setupEntry": "./setup-entry.ts",
+    "setupFeatures": {
+      "configPromotion": true
+    },
     "install": {
+      "clawhubSpec": "clawhub:@openclaw/twitch",
       "npmSpec": "@openclaw/twitch",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.4.10"
     },
     "compat": {
-      "pluginApi": ">=2026.7.2"
+      "pluginApi": ">=2026.9.4"
     },
     "build": {
-      "openclawVersion": "2026.7.2"
+      "openclawVersion": "2026.9.4"
     },
     "channel": {
       "id": "twitch",
@@ -47,9 +51,13 @@
       "blurb": "Twitch chat integration",
       "aliases": [
         "twitch-chat"
-      ]
+      ],
+      "setup": {
+        "fields": []
+      }
     },
     "release": {
+      "bundleRuntimeDependencies": false,
       "publishToClawHub": true,
       "publishToNpm": true
     }

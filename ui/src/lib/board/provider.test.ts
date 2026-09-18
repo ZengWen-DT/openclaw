@@ -1,28 +1,16 @@
 // @vitest-environment node
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BoardMcpAppViewCache } from "./mcp-app-view-cache.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { waitForFast } from "../../test-helpers/wait-for.ts";
+import { GatewayBoardProvider } from "./gateway-provider.ts";
+import { registerBoardProviderLeaseCases } from "./provider.lease-cases.test-support.ts";
 import {
+  acquireBoardProviderForSession,
   boardExists,
   boardProviderForSession,
   canvasWidgetNameForDocument,
-  GatewayBoardProvider,
   mcpAppWidgetNameForViewId,
-  type BoardCommandEvent,
   type BoardProvider,
 } from "./provider.ts";
-
-type MockProvider = BoardProvider & { emitCommand(command: BoardCommandEvent["command"]): void };
-
-let mockLocation: { search: string };
-
-function mockBoardProvider(sessionKey: string): MockProvider {
-  return boardProviderForSession(sessionKey) as MockProvider;
-}
-
-beforeEach(() => {
-  mockLocation = { search: "?mockBoard=1" };
-  vi.stubGlobal("location", mockLocation);
-});
 
 afterEach(() => {
   vi.useRealTimers();
@@ -54,8 +42,7 @@ describe("board providers", () => {
   });
 
   it("keeps the null provider chat-only", () => {
-    mockLocation.search = "";
-    const provider = boardProviderForSession("agent:main:plain");
+    const provider = boardProviderForSession({ sessionKey: "agent:main:plain" });
 
     expect(boardExists(provider.snapshot$.value)).toBe(false);
     expect(provider.snapshot$.value).toEqual({
@@ -66,157 +53,319 @@ describe("board providers", () => {
     });
   });
 
-  it("keeps older gateways without board methods on the null provider", () => {
-    mockLocation.search = "";
-    const provider = boardProviderForSession("agent:main:legacy", {} as never, false);
+  registerBoardProviderLeaseCases();
 
-    expect(provider.canPinWidgets).toBe(false);
-    expect(boardExists(provider.snapshot$.value)).toBe(false);
-  });
-
-  it("updates pin capability independently from board availability", () => {
-    mockLocation.search = "";
+  it("updates only the capabilities of the owning gateway board lease", async () => {
+    const sessionKey = "agent:main:lease-capability-update";
+    const snapshot = { sessionKey, revision: 1, tabs: [], widgets: [] };
     const client = {
-      request: vi.fn(),
+      request: vi.fn(async () => snapshot) as never,
       addEventListener: vi.fn(() => () => {}),
     };
-    const provider = boardProviderForSession(
-      "agent:main:pin-capability",
-      client as never,
+    const writable = acquireBoardProviderForSession(
+      { sessionKey },
+      client,
+      true,
+      true,
+      true,
+      true,
+      false,
+    );
+    const approver = acquireBoardProviderForSession(
+      { sessionKey },
+      client,
       true,
       false,
       false,
+      false,
+      true,
     );
 
-    expect(provider.canPinWidgets).toBe(false);
-    expect(provider.canPinMcpApps).toBe(false);
-    expect(
-      boardProviderForSession(
-        "agent:main:pin-capability",
-        client as never,
-        true,
-        false,
-        true,
-        false,
-      ),
-    ).toBe(provider);
-    expect(provider.canPinWidgets).toBe(true);
-    expect(provider.canPinMcpApps).toBe(false);
-    boardProviderForSession("agent:main:pin-capability", client as never, true, false, true, true);
-    expect(provider.canPinMcpApps).toBe(true);
+    try {
+      await waitForFast(() => expect(writable.provider.snapshot$.value).toEqual(snapshot));
+
+      writable.update(client, true, {
+        canPinWidgets: false,
+        canPinMcpApps: false,
+        canMutate: false,
+        canGrant: false,
+      });
+
+      expect(writable.provider).toMatchObject({
+        canPinWidgets: false,
+        canPinMcpApps: false,
+        canMutate: false,
+        canGrant: false,
+      });
+      expect(approver.provider).toMatchObject({
+        canPinWidgets: false,
+        canPinMcpApps: false,
+        canMutate: false,
+        canGrant: true,
+      });
+      expect(client.request).toHaveBeenCalledOnce();
+      expect(client.addEventListener).toHaveBeenCalledOnce();
+
+      writable.update(client, true, {
+        canPinWidgets: true,
+        canPinMcpApps: true,
+        canMutate: true,
+        canGrant: false,
+      });
+
+      expect(writable.provider.canMutate).toBe(true);
+      expect(writable.provider.canPinWidgets).toBe(true);
+      expect(writable.provider.canPinMcpApps).toBe(true);
+      expect(writable.provider.canGrant).toBe(false);
+      expect(approver.provider.canGrant).toBe(true);
+      expect(approver.provider.canMutate).toBe(false);
+      expect(client.request).toHaveBeenCalledOnce();
+    } finally {
+      writable.release();
+      approver.release();
+    }
   });
 
-  it("provides two mock tabs with mixed widget sizes", () => {
-    const snapshot = mockBoardProvider("agent:main:main").snapshot$.value;
-
-    expect(snapshot.tabs).toHaveLength(2);
-    expect(snapshot.tabs.map((tab) => tab.chatDock)).toEqual(["right", "bottom"]);
-    expect(new Set(snapshot.widgets.map((widget) => `${widget.sizeW}x${widget.sizeH}`)).size).toBe(
-      3,
+  it("dispatches newly authorized board actions after upgrading a read-only lease", async () => {
+    const sessionKey = "agent:main:lease-scope-upgrade";
+    const snapshot = {
+      sessionKey,
+      revision: 1,
+      tabs: [{ tabId: "main", title: "Main", position: 0, chatDock: "right" as const }],
+      widgets: [
+        {
+          name: "pending-widget",
+          tabId: "main",
+          contentKind: "html" as const,
+          sizeW: 6,
+          sizeH: 4,
+          position: 0,
+          grantState: "pending" as const,
+          revision: 1,
+        },
+      ],
+    };
+    const client = {
+      request: vi.fn(async () => snapshot) as never,
+      addEventListener: vi.fn(() => () => {}),
+    };
+    const lease = acquireBoardProviderForSession(
+      { sessionKey },
+      client,
+      true,
+      false,
+      false,
+      false,
+      false,
     );
+
+    try {
+      await waitForFast(() => expect(lease.provider.snapshot$.value).toEqual(snapshot));
+      await expect(lease.provider.applyOps([])).rejects.toThrow();
+      await expect(lease.provider.pinWidget({ docId: "cv-upgraded" })).rejects.toThrow();
+      await expect(lease.provider.pinMcpApp({ viewId: "app-upgraded" })).rejects.toThrow();
+      await expect(lease.provider.grant("pending-widget", "granted")).rejects.toThrow();
+      expect(client.request).toHaveBeenCalledOnce();
+
+      lease.update(client, true, {
+        canPinWidgets: true,
+        canPinMcpApps: true,
+        canMutate: true,
+        canGrant: true,
+      });
+
+      await expect(lease.provider.applyOps([])).resolves.toBeUndefined();
+      await expect(lease.provider.pinWidget({ docId: "cv-upgraded" })).resolves.toBeUndefined();
+      await expect(lease.provider.pinMcpApp({ viewId: "app-upgraded" })).resolves.toBeUndefined();
+      await expect(lease.provider.grant("pending-widget", "granted")).resolves.toBeUndefined();
+      expect(client.request).toHaveBeenCalledTimes(5);
+      expect(client.request).toHaveBeenCalledWith("board.update", { sessionKey, ops: [] });
+      expect(client.request).toHaveBeenCalledWith("board.widget.put", {
+        sessionKey,
+        name: "canvas-cv-upgraded",
+        content: { kind: "canvas-doc", docId: "cv-upgraded" },
+      });
+      expect(client.request).toHaveBeenCalledWith("board.widget.put", {
+        sessionKey,
+        name: mcpAppWidgetNameForViewId("app-upgraded"),
+        content: { kind: "mcp-app", viewId: "app-upgraded" },
+      });
+      expect(client.request).toHaveBeenCalledWith("board.widget.grant", {
+        sessionKey,
+        name: "pending-widget",
+        decision: "granted",
+        revision: 1,
+      });
+      expect(client.addEventListener).toHaveBeenCalledOnce();
+
+      lease.update(client, true, {
+        canPinWidgets: false,
+        canPinMcpApps: false,
+        canMutate: false,
+        canGrant: false,
+      });
+
+      await expect(lease.provider.applyOps([])).rejects.toThrow();
+      await expect(lease.provider.pinWidget({ docId: "cv-upgraded" })).rejects.toThrow();
+      await expect(lease.provider.pinMcpApp({ viewId: "app-upgraded" })).rejects.toThrow();
+      await expect(lease.provider.grant("pending-widget", "granted")).rejects.toThrow();
+      expect(client.request).toHaveBeenCalledTimes(5);
+    } finally {
+      lease.release();
+    }
   });
 
-  it("applies dock operations and publishes snapshots", async () => {
-    const provider = mockBoardProvider("agent:main:main");
-    const changed = vi.fn();
-    provider.snapshot$.subscribe(changed);
+  it("reconnects concurrent board leases through the same cached gateway transport", async () => {
+    const sessionKey = "agent:main:shared-lease-reconnect";
+    const previousSnapshot = { sessionKey, revision: 1, tabs: [], widgets: [] };
+    const nextSnapshot = { ...previousSnapshot, revision: 2 };
+    const removePreviousListener = vi.fn();
+    const removeNextListener = vi.fn();
+    const previousClient = {
+      request: vi.fn(async () => previousSnapshot) as never,
+      addEventListener: vi.fn(() => removePreviousListener),
+    };
+    const nextClient = {
+      request: vi.fn(async () => nextSnapshot) as never,
+      addEventListener: vi.fn(() => removeNextListener),
+    };
+    const writer = acquireBoardProviderForSession(
+      { sessionKey },
+      previousClient,
+      true,
+      true,
+      true,
+      true,
+      false,
+    );
+    const approver = acquireBoardProviderForSession(
+      { sessionKey },
+      previousClient,
+      true,
+      false,
+      false,
+      false,
+      true,
+    );
+    const cached = boardProviderForSession({ sessionKey });
 
-    await provider.applyOps([{ kind: "tab_update", tabId: "main", chatDock: "left" }]);
+    try {
+      await waitForFast(() => expect(writer.provider.snapshot$.value).toEqual(previousSnapshot));
 
-    expect(provider.snapshot$.value.tabs[0]?.chatDock).toBe("left");
-    expect(provider.snapshot$.value.revision).toBe(2);
-    expect(changed).toHaveBeenCalledOnce();
+      writer.update(nextClient, true, {
+        canPinWidgets: true,
+        canPinMcpApps: true,
+        canMutate: true,
+        canGrant: false,
+      });
+
+      await waitForFast(() => expect(writer.provider.snapshot$.value).toEqual(nextSnapshot));
+      expect(approver.provider.snapshot$.value).toEqual(nextSnapshot);
+      expect(boardProviderForSession({ sessionKey })).toBe(cached);
+      expect(removePreviousListener).toHaveBeenCalledOnce();
+      expect(nextClient.addEventListener).toHaveBeenCalledOnce();
+      expect(nextClient.request).toHaveBeenCalledOnce();
+      expect(approver.provider.canGrant).toBe(true);
+      expect(approver.provider.canMutate).toBe(false);
+
+      writer.release();
+      expect(removeNextListener).not.toHaveBeenCalled();
+      approver.release();
+      expect(removeNextListener).toHaveBeenCalledOnce();
+    } finally {
+      writer.release();
+      approver.release();
+    }
   });
 
-  it("preserves tabs when a reorder is not a complete permutation", async () => {
-    const provider = mockBoardProvider("agent:main:main");
+  it("disposes a released gateway provider and creates a fresh provider on reacquire", async () => {
+    type Event = { event: string; payload: unknown };
+    const listeners = new Set<(event: Event) => void>();
+    const snapshot = {
+      sessionKey: "agent:main:leased-provider",
+      revision: 1,
+      tabs: [{ tabId: "main", title: "Main", position: 0, chatDock: "right" as const }],
+      widgets: [],
+    };
+    const client = {
+      request: vi.fn(async () => snapshot) as never,
+      addEventListener: (listener: (event: Event) => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const first = acquireBoardProviderForSession(
+      { sessionKey: snapshot.sessionKey },
+      client as never,
+    );
+    await waitForFast(() => expect(first.provider.snapshot$.value).toEqual(snapshot));
+    const command = vi.fn();
+    first.provider.events.subscribe(command);
 
-    await provider.applyOps([{ kind: "tabs_reorder", tabIds: ["research"] }]);
+    for (const listener of listeners) {
+      listener({
+        event: "board.command",
+        payload: { sessionKey: snapshot.sessionKey, command: { kind: "focus_tab", tabId: "main" } },
+      });
+    }
+    expect(command).toHaveBeenCalledOnce();
 
-    expect(provider.snapshot$.value.tabs.map((tab) => tab.tabId)).toEqual(["main", "research"]);
+    first.release();
+    expect(listeners.size).toBe(0);
+    for (const listener of listeners) {
+      listener({
+        event: "board.command",
+        payload: { sessionKey: snapshot.sessionKey, command: { kind: "focus_tab", tabId: "main" } },
+      });
+    }
+    expect(command).toHaveBeenCalledOnce();
+
+    const second = acquireBoardProviderForSession(
+      { sessionKey: snapshot.sessionKey },
+      client as never,
+    );
+    expect(second.provider).not.toBe(first.provider);
+    await waitForFast(() => expect(second.provider.snapshot$.value).toEqual(snapshot));
+    expect(listeners.size).toBe(1);
+    second.release();
+    expect(listeners.size).toBe(0);
   });
 
-  it("does not create or reorder duplicate tab ids", async () => {
-    const provider = mockBoardProvider("agent:main:main");
+  it("distinguishes an unloaded board from a loaded empty snapshot", async () => {
+    const sessionKey = "agent:main:loading-board";
+    const emptySnapshot = { sessionKey, revision: 1, tabs: [], widgets: [] };
+    let resolveSnapshot: ((snapshot: typeof emptySnapshot) => void) | undefined;
+    const lease = acquireBoardProviderForSession(
+      { sessionKey },
+      {
+        request: vi.fn(
+          () =>
+            new Promise<typeof emptySnapshot>((resolve) => {
+              resolveSnapshot = resolve;
+            }),
+        ) as never,
+        addEventListener: () => () => {},
+      },
+    );
 
-    await provider.applyOps([
-      { kind: "tab_create", tabId: "main", title: "Duplicate" },
-      { kind: "tabs_reorder", tabIds: ["main", "research", "main"] },
-    ]);
+    try {
+      expect(boardProviderForSession({ sessionKey })).toBeInstanceOf(GatewayBoardProvider);
+      expect(lease.provider.hasLoadedSnapshot).toBe(false);
 
-    expect(provider.snapshot$.value.tabs.map((tab) => tab.tabId)).toEqual(["main", "research"]);
-  });
+      resolveSnapshot?.(emptySnapshot);
+      await waitForFast(() => expect(lease.provider.snapshot$.value).toEqual(emptySnapshot));
 
-  it("reorders widgets after a named anchor", async () => {
-    const provider = mockBoardProvider("agent:main:main");
-
-    await provider.applyOps([
-      { kind: "widget_move", name: "session-status", after: "recent-findings" },
-    ]);
-
-    expect(
-      provider.snapshot$.value.widgets
-        .filter((widget) => widget.tabId === "main")
-        .toSorted((left, right) => left.position - right.position)
-        .map((widget) => widget.name),
-    ).toEqual(["recent-findings", "session-status"]);
-  });
-
-  it("moves widgets across tabs and normalizes both tab orders", async () => {
-    const provider = mockBoardProvider("agent:main:main");
-
-    await provider.applyOps([
-      { kind: "widget_move", name: "source-map", tabId: "main", after: "session-status" },
-    ]);
-
-    expect(
-      provider.snapshot$.value.widgets
-        .filter((widget) => widget.tabId === "main")
-        .map((widget) => `${widget.position}:${widget.name}`),
-    ).toEqual(["0:session-status", "1:source-map", "2:recent-findings"]);
-    expect(
-      provider.snapshot$.value.widgets.filter((widget) => widget.tabId === "research"),
-    ).toEqual([]);
-  });
-
-  it("clamps widget sizes to the board grid", async () => {
-    const provider = mockBoardProvider("agent:main:main");
-
-    await provider.applyOps([
-      { kind: "widget_resize", name: "session-status", sizeW: 99, sizeH: -5 },
-    ]);
-
-    expect(provider.snapshot$.value.widgets[0]).toMatchObject({ sizeW: 12, sizeH: 1 });
-  });
-
-  it("surfaces agent board commands", () => {
-    const provider = mockBoardProvider("agent:main:main");
-    const listener = vi.fn();
-    provider.events.subscribe(listener);
-
-    provider.emitCommand({ kind: "set_chat_dock", dock: "hidden" });
-    provider.emitCommand({ kind: "focus_tab", tabId: "research" });
-
-    expect(listener).toHaveBeenNthCalledWith(1, {
-      sessionKey: "agent:main:main",
-      command: { kind: "set_chat_dock", dock: "hidden" },
-    });
-    expect(listener).toHaveBeenNthCalledWith(2, {
-      sessionKey: "agent:main:main",
-      command: { kind: "focus_tab", tabId: "research" },
-    });
+      expect(lease.provider.hasLoadedSnapshot).toBe(true);
+    } finally {
+      resolveSnapshot?.(emptySnapshot);
+      lease.release();
+    }
   });
 
   it("shares one provider across equivalent main session keys", () => {
-    vi.stubGlobal("location", { search: "?mockBoard=1" });
-
-    expect(boardProviderForSession("main")).toBe(boardProviderForSession("agent:main:main"));
-  });
-
-  it("provides mock boards for canonical configured-main session keys", () => {
-    vi.stubGlobal("location", { search: "?mockBoard=1" });
-
-    expect(boardExists(boardProviderForSession("agent:work:primary").snapshot$.value)).toBe(true);
+    expect(boardProviderForSession({ sessionKey: "main" })).toBe(
+      boardProviderForSession({ sessionKey: "agent:main:main" }),
+    );
   });
 
   it("refetches changed boards while reloading only the named widget frame", async () => {
@@ -314,14 +463,17 @@ describe("board providers", () => {
       expect(method).toBe("board.get");
       return snapshots.shift();
     });
-    const provider = new GatewayBoardProvider("agent:main:live", {
-      request: request as never,
-      addEventListener: (next) => {
-        listener = next as typeof listener;
-        return () => {};
+    const provider = new GatewayBoardProvider(
+      { sessionKey: "agent:main:live" },
+      {
+        request: request as never,
+        addEventListener: (next) => {
+          listener = next as typeof listener;
+          return () => {};
+        },
       },
-    });
-    await vi.waitFor(() => expect(provider.snapshot$.value.revision).toBe(1));
+    );
+    await waitForFast(() => expect(provider.snapshot$.value.revision).toBe(1));
 
     listener?.({
       event: "board.changed",
@@ -335,6 +487,80 @@ describe("board providers", () => {
     await provider.refreshWidgetFrame("alpha");
     expect(provider.widgetFrameUrl("alpha", 2)).toBe("/alpha-reminted");
     expect(provider.widgetFrameUrl("beta", 1)).toBe("/beta-old");
+  });
+
+  it("does not preserve a stale ticket when a widget generation is recreated", async () => {
+    let listener: ((event: { event: string; payload: unknown }) => void) | undefined;
+    const baseWidget = {
+      name: "alpha",
+      tabId: "main",
+      contentKind: "html" as const,
+      sizeW: 6,
+      sizeH: 4,
+      position: 0,
+      grantState: "none" as const,
+      revision: 1,
+    };
+    const initial = {
+      sessionKey: "agent:main:generation",
+      revision: 1,
+      tabs: [{ tabId: "main", title: "Main", position: 0, chatDock: "right" as const }],
+      widgets: [
+        {
+          ...baseWidget,
+          viewGeneration: "a".repeat(32),
+          frameUrl: "/old-ticket",
+        },
+      ],
+    };
+    const recreated = {
+      ...initial,
+      revision: 2,
+      widgets: [
+        {
+          ...baseWidget,
+          viewGeneration: "b".repeat(32),
+          frameUrl: "/replacement-ticket",
+          sandboxUrl: "/mcp-app-sandbox",
+        },
+      ],
+    };
+    const renewed = {
+      ...recreated,
+      revision: 3,
+      widgets: [{ ...recreated.widgets[0]!, frameUrl: "/renewed-ticket" }],
+    };
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(recreated)
+      .mockResolvedValueOnce(renewed);
+    const provider = new GatewayBoardProvider(
+      { sessionKey: "agent:main:generation" },
+      {
+        request: request as never,
+        addEventListener: (next) => {
+          listener = next as typeof listener;
+          return () => {};
+        },
+      },
+    );
+    await waitForFast(() => expect(provider.snapshot$.value).toEqual(initial));
+
+    listener?.({
+      event: "board.changed",
+      payload: { sessionKey: "agent:main:generation", revision: 2 },
+    });
+
+    await vi.waitFor(() => expect(provider.snapshot$.value.revision).toBe(2));
+    expect(provider.widgetFrameUrl("alpha", 1)).toBe("/replacement-ticket");
+
+    listener?.({
+      event: "board.changed",
+      payload: { sessionKey: "agent:main:generation", revision: 3 },
+    });
+    await vi.waitFor(() => expect(provider.snapshot$.value.revision).toBe(3));
+    expect(provider.widgetFrameUrl("alpha", 1)).toBe("/renewed-ticket");
   });
 
   it("does not publish an activation snapshot older than a completed mutation", async () => {
@@ -359,10 +585,13 @@ describe("board providers", () => {
       }
       return Promise.resolve(current);
     });
-    const provider = new GatewayBoardProvider("agent:main:stale", {
-      request: request as never,
-      addEventListener: () => () => {},
-    });
+    const provider = new GatewayBoardProvider(
+      { sessionKey: "agent:main:stale" },
+      {
+        request: request as never,
+        addEventListener: () => () => {},
+      },
+    );
     await vi.waitFor(() => expect(request).toHaveBeenCalledWith("board.get", expect.anything()));
 
     await provider.pinWidget({ docId: "cv-current" });
@@ -399,14 +628,17 @@ describe("board providers", () => {
           }),
       )
       .mockResolvedValueOnce(deleted);
-    const provider = new GatewayBoardProvider("agent:main:deleted-board", {
-      request: request as never,
-      addEventListener: (next) => {
-        listener = next as typeof listener;
-        return () => {};
+    const provider = new GatewayBoardProvider(
+      { sessionKey: "agent:main:deleted-board" },
+      {
+        request: request as never,
+        addEventListener: (next) => {
+          listener = next as typeof listener;
+          return () => {};
+        },
       },
-    });
-    await vi.waitFor(() => expect(provider.snapshot$.value).toEqual(populated));
+    );
+    await waitForFast(() => expect(provider.snapshot$.value).toEqual(populated));
 
     listener?.({
       event: "board.changed",
@@ -454,14 +686,17 @@ describe("board providers", () => {
           }),
       )
       .mockResolvedValueOnce(recreated);
-    const provider = new GatewayBoardProvider("agent:main:recreated-board", {
-      request: request as never,
-      addEventListener: (next) => {
-        listener = next as typeof listener;
-        return () => {};
+    const provider = new GatewayBoardProvider(
+      { sessionKey: "agent:main:recreated-board" },
+      {
+        request: request as never,
+        addEventListener: (next) => {
+          listener = next as typeof listener;
+          return () => {};
+        },
       },
-    });
-    await vi.waitFor(() => expect(provider.snapshot$.value).toEqual(populated));
+    );
+    await waitForFast(() => expect(provider.snapshot$.value).toEqual(populated));
 
     listener?.({
       event: "board.changed",
@@ -509,11 +744,14 @@ describe("board providers", () => {
             resolveNewer = resolve;
           }),
       );
-    const provider = new GatewayBoardProvider("agent:main:mutation-race", {
-      request: request as never,
-      addEventListener: () => () => {},
-    });
-    await vi.waitFor(() => expect(provider.snapshot$.value).toEqual(populated));
+    const provider = new GatewayBoardProvider(
+      { sessionKey: "agent:main:mutation-race" },
+      {
+        request: request as never,
+        addEventListener: () => () => {},
+      },
+    );
+    await waitForFast(() => expect(provider.snapshot$.value).toEqual(populated));
 
     const olderMutation = provider.applyOps([{ kind: "tab_delete", tabId: "main" }]);
     const newerMutation = provider.applyOps([
@@ -561,11 +799,14 @@ describe("board providers", () => {
         resolveDelete = resolve;
       });
     });
-    const provider = new GatewayBoardProvider("agent:main:refresh-reset-race", {
-      request: request as never,
-      addEventListener: () => () => {},
-    });
-    await vi.waitFor(() => expect(provider.snapshot$.value).toEqual(populated));
+    const provider = new GatewayBoardProvider(
+      { sessionKey: "agent:main:refresh-reset-race" },
+      {
+        request: request as never,
+        addEventListener: () => () => {},
+      },
+    );
+    await waitForFast(() => expect(provider.snapshot$.value).toEqual(populated));
 
     const refresh = provider.activate();
     await vi.waitFor(() => expect(getCount).toBe(2));
@@ -624,11 +865,14 @@ describe("board providers", () => {
       }
       return Promise.resolve(reminted);
     });
-    const provider = new GatewayBoardProvider("agent:main:ticket-race", {
-      request: request as never,
-      addEventListener: () => () => {},
-    });
-    await vi.waitFor(() => expect(provider.snapshot$.value).toEqual(initial));
+    const provider = new GatewayBoardProvider(
+      { sessionKey: "agent:main:ticket-race" },
+      {
+        request: request as never,
+        addEventListener: () => () => {},
+      },
+    );
+    await waitForFast(() => expect(provider.snapshot$.value).toEqual(initial));
 
     const refresh = provider.refreshWidgetFrame("alpha");
     await vi.waitFor(() => expect(getCount).toBe(2));
@@ -641,420 +885,5 @@ describe("board providers", () => {
 
     expect(getCount).toBe(3);
     expect(provider.widgetFrameUrl("alpha", 1)).toBe("/reminted-ticket");
-  });
-
-  it("discards mutation responses from a replaced gateway client", async () => {
-    let resolveMutation: ((snapshot: BoardProvider["snapshot$"]["value"]) => void) | undefined;
-    const oldClient = {
-      request: vi.fn(
-        () =>
-          new Promise<BoardProvider["snapshot$"]["value"]>((resolve) => {
-            resolveMutation = resolve;
-          }),
-      ) as never,
-      addEventListener: () => () => {},
-    };
-    const current = {
-      sessionKey: "agent:main:replacement",
-      revision: 3,
-      tabs: [],
-      widgets: [],
-    };
-    const newClient = {
-      request: vi.fn(async () => current) as never,
-      addEventListener: () => () => {},
-    };
-    const provider = new GatewayBoardProvider("agent:main:replacement", oldClient, false);
-    const mutation = provider.applyOps([]);
-
-    provider.attachClient(newClient, true);
-    await vi.waitFor(() => expect(provider.snapshot$.value).toEqual(current));
-    resolveMutation?.({ ...current, revision: 4 });
-    await mutation;
-
-    expect(provider.snapshot$.value).toEqual(current);
-  });
-
-  it("clears an old gateway snapshot before accepting a lower revision", async () => {
-    const oldSnapshot = {
-      sessionKey: "agent:main:gateway-swap",
-      revision: 5,
-      tabs: [{ tabId: "main", title: "Old", position: 0, chatDock: "right" as const }],
-      widgets: [],
-    };
-    const newSnapshot = {
-      sessionKey: "agent:main:gateway-swap",
-      revision: 1,
-      tabs: [{ tabId: "main", title: "New", position: 0, chatDock: "left" as const }],
-      widgets: [],
-    };
-    const oldClient = {
-      request: vi.fn(async () => oldSnapshot) as never,
-      addEventListener: () => () => {},
-    };
-    let resolveNewSnapshot: ((snapshot: BoardProvider["snapshot$"]["value"]) => void) | undefined;
-    const newClient = {
-      request: vi.fn(
-        () =>
-          new Promise<BoardProvider["snapshot$"]["value"]>((resolve) => {
-            resolveNewSnapshot = resolve;
-          }),
-      ) as never,
-      addEventListener: () => () => {},
-    };
-    const provider = new GatewayBoardProvider("agent:main:gateway-swap", oldClient);
-    await vi.waitFor(() => expect(provider.snapshot$.value).toEqual(oldSnapshot));
-
-    provider.attachClient(newClient, true);
-    expect(provider.snapshot$.value).toEqual({
-      sessionKey: "agent:main:gateway-swap",
-      revision: 0,
-      tabs: [],
-      widgets: [],
-    });
-    resolveNewSnapshot?.(newSnapshot);
-    await vi.waitFor(() => expect(provider.snapshot$.value).toEqual(newSnapshot));
-  });
-
-  it("retries a transient activation failure", async () => {
-    vi.useFakeTimers();
-    const snapshot = {
-      sessionKey: "agent:main:retry",
-      revision: 1,
-      tabs: [{ tabId: "main", title: "Main", position: 0, chatDock: "right" as const }],
-      widgets: [],
-    };
-    const request = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("temporarily unavailable"))
-      .mockResolvedValue(snapshot);
-    const provider = new GatewayBoardProvider("agent:main:retry", {
-      request: request as never,
-      addEventListener: () => () => {},
-    });
-
-    await vi.advanceTimersByTimeAsync(0);
-    expect(request).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1_000);
-
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(provider.snapshot$.value).toEqual(snapshot);
-  });
-
-  it("reactivates the same gateway client after reconnect", async () => {
-    const snapshot = {
-      sessionKey: "agent:main:reconnect",
-      revision: 1,
-      tabs: [],
-      widgets: [],
-    };
-    const request = vi.fn(async () => snapshot);
-    const client = {
-      request: request as never,
-      addEventListener: () => () => {},
-    };
-    const provider = new GatewayBoardProvider("agent:main:reconnect", client, false);
-
-    expect(request).not.toHaveBeenCalled();
-    provider.attachClient(client, true);
-    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
-    expect(provider.snapshot$.value).toEqual(snapshot);
-  });
-
-  it("wakes a pending refresh backoff when the gateway reconnects", async () => {
-    vi.useFakeTimers();
-    const snapshot = {
-      sessionKey: "agent:main:reconnect-backoff",
-      revision: 1,
-      tabs: [],
-      widgets: [],
-    };
-    const request = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("temporarily unavailable"))
-      .mockResolvedValue(snapshot);
-    const client = {
-      request: request as never,
-      addEventListener: () => () => {},
-    };
-    const provider = new GatewayBoardProvider("agent:main:reconnect-backoff", client);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(request).toHaveBeenCalledOnce();
-
-    provider.attachClient(client, false);
-    provider.attachClient(client, true);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(provider.snapshot$.value).toEqual(snapshot);
-  });
-
-  it("retries a transient board.changed refresh failure", async () => {
-    vi.useFakeTimers();
-    let listener: ((event: { event: string; payload: unknown }) => void) | undefined;
-    const initial = {
-      sessionKey: "agent:main:event-retry",
-      revision: 1,
-      tabs: [{ tabId: "main", title: "Main", position: 0, chatDock: "right" as const }],
-      widgets: [],
-    };
-    const changed = { ...initial, revision: 2 };
-    const request = vi
-      .fn()
-      .mockResolvedValueOnce(initial)
-      .mockRejectedValueOnce(new Error("temporarily unavailable"))
-      .mockResolvedValue(changed);
-    const provider = new GatewayBoardProvider("agent:main:event-retry", {
-      request: request as never,
-      addEventListener: (next) => {
-        listener = next as typeof listener;
-        return () => {};
-      },
-    });
-    await vi.advanceTimersByTimeAsync(0);
-
-    listener?.({
-      event: "board.changed",
-      payload: { sessionKey: "agent:main:event-retry", revision: 2 },
-    });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(provider.snapshot$.value.revision).toBe(1);
-    await vi.advanceTimersByTimeAsync(1_000);
-
-    expect(request).toHaveBeenCalledTimes(3);
-    expect(provider.snapshot$.value.revision).toBe(2);
-  });
-
-  it("passes mutations through and surfaces board commands", async () => {
-    let listener: ((event: { event: string; payload: unknown }) => void) | undefined;
-    const empty = { sessionKey: "agent:main:live", revision: 0, tabs: [], widgets: [] };
-    const pinned = {
-      sessionKey: "agent:main:live",
-      revision: 1,
-      tabs: [{ tabId: "main", title: "Main", position: 0, chatDock: "right" as const }],
-      widgets: [
-        {
-          name: "canvas-cv-1",
-          tabId: "main",
-          contentKind: "html" as const,
-          sizeW: 6,
-          sizeH: 4,
-          position: 0,
-          grantState: "none" as const,
-          revision: 1,
-          instanceId: "canvas-instance",
-          frameUrl: "/frame",
-        },
-      ],
-    };
-    let getCount = 0;
-    const request = vi.fn(async (method: string) => {
-      if (method === "board.get") {
-        getCount += 1;
-        return getCount === 1 ? empty : pinned;
-      }
-      return pinned;
-    });
-    const provider = new GatewayBoardProvider("agent:main:live", {
-      request: request as never,
-      addEventListener: (next) => {
-        listener = next as typeof listener;
-        return () => {};
-      },
-    });
-    await vi.waitFor(() => expect(request).toHaveBeenCalledWith("board.get", expect.anything()));
-    const command = vi.fn();
-    provider.events.subscribe(command);
-
-    await provider.applyOps([{ kind: "tab_update", tabId: "main", chatDock: "left" }]);
-    await provider.grant("canvas-cv-1", "granted");
-    const longTitle = "Pinned ".repeat(20).trim();
-    await provider.pinWidget({ docId: "cv-1", title: longTitle });
-    await provider.pinMcpApp({
-      viewId: "mcp-app-source",
-      name: "mcp-app-opaque",
-      title: "App status",
-      tabId: "main",
-      size: "md",
-      after: "canvas-cv-1",
-    });
-    listener?.({
-      event: "board.command",
-      payload: {
-        sessionKey: "agent:main:live",
-        command: { kind: "focus_tab", tabId: "main" },
-      },
-    });
-
-    expect(request).toHaveBeenCalledWith("board.update", {
-      sessionKey: "agent:main:live",
-      ops: [{ kind: "tab_update", tabId: "main", chatDock: "left" }],
-    });
-    expect(request).toHaveBeenCalledWith("board.widget.grant", {
-      sessionKey: "agent:main:live",
-      name: "canvas-cv-1",
-      decision: "granted",
-      revision: 1,
-      instanceId: "canvas-instance",
-    });
-    expect(request).toHaveBeenCalledWith("board.widget.put", {
-      sessionKey: "agent:main:live",
-      name: "canvas-cv-1",
-      title: Array.from(longTitle).slice(0, 80).join(""),
-      content: { kind: "canvas-doc", docId: "cv-1" },
-    });
-    expect(request).toHaveBeenCalledWith("board.widget.put", {
-      sessionKey: "agent:main:live",
-      name: "mcp-app-opaque",
-      title: "App status",
-      content: { kind: "mcp-app", viewId: "mcp-app-source" },
-      placement: { tabId: "main", size: "md", after: "canvas-cv-1" },
-    });
-    expect(request.mock.calls.filter(([method]) => method === "board.get")).toHaveLength(1);
-    expect(provider.snapshot$.value).toEqual(pinned);
-    expect(command).toHaveBeenCalledWith({
-      sessionKey: "agent:main:live",
-      command: { kind: "focus_tab", tabId: "main" },
-    });
-  });
-
-  it("deduplicates MCP App leases until an explicit refresh", async () => {
-    mockLocation.search = "";
-    let now = 0;
-    vi.spyOn(Date, "now").mockImplementation(() => now);
-    const snapshot = {
-      sessionKey: "agent:main:app",
-      revision: 1,
-      tabs: [{ tabId: "main", title: "Main", position: 0, chatDock: "right" as const }],
-      widgets: [
-        {
-          name: "server-app",
-          tabId: "main",
-          contentKind: "mcp-app" as const,
-          sizeW: 6,
-          sizeH: 4,
-          position: 0,
-          grantState: "none" as const,
-          revision: 1,
-          instanceId: "app-instance",
-        },
-      ],
-    };
-    let lease = 0;
-    const request = vi.fn(async (method: string) => {
-      if (method === "board.get") {
-        return snapshot;
-      }
-      if (method === "board.widget.appView") {
-        lease += 1;
-        return { viewId: `mcp-app-${lease}`, expiresAtMs: lease === 1 ? 10_000 : 20_000 };
-      }
-      throw new Error(`unexpected method: ${method}`);
-    });
-    const provider = new GatewayBoardProvider("agent:main:app", {
-      request: request as never,
-      addEventListener: () => () => {},
-    });
-    await vi.waitFor(() => expect(provider.snapshot$.value.revision).toBe(1));
-
-    await expect(provider.widgetAppView("server-app", 1)).resolves.toMatchObject({
-      status: "ready",
-      viewId: "mcp-app-1",
-    });
-    expect(request).toHaveBeenCalledWith("board.widget.appView", {
-      sessionKey: "agent:main:app",
-      name: "server-app",
-      revision: 1,
-      instanceId: "app-instance",
-    });
-    await expect(provider.widgetAppView("server-app", 1)).resolves.toMatchObject({
-      viewId: "mcp-app-1",
-    });
-    now = 6_000;
-    await expect(provider.widgetAppView("server-app", 1)).resolves.toMatchObject({
-      status: "ready",
-      viewId: "mcp-app-1",
-    });
-    await expect(provider.refreshWidgetAppView("server-app", 1)).resolves.toMatchObject({
-      status: "ready",
-      viewId: "mcp-app-2",
-    });
-    expect(request.mock.calls.filter(([method]) => method === "board.widget.appView")).toHaveLength(
-      2,
-    );
-  });
-
-  it("does not reuse a cached MCP App lease for a same-name replacement", async () => {
-    const cache = new BoardMcpAppViewCache();
-    const widget = {
-      name: "server-app",
-      tabId: "main",
-      contentKind: "mcp-app" as const,
-      sizeW: 6,
-      sizeH: 4,
-      position: 0,
-      grantState: "none" as const,
-      revision: 1,
-      instanceId: "instance-a",
-    };
-    const request = vi
-      .fn()
-      .mockResolvedValueOnce({ viewId: "view-a", expiresAtMs: Date.now() + 60_000 })
-      .mockResolvedValueOnce({ viewId: "view-b", expiresAtMs: Date.now() + 60_000 });
-
-    await expect(cache.resolve(widget, request, false)).resolves.toMatchObject({
-      viewId: "view-a",
-    });
-    await expect(
-      cache.resolve({ ...widget, instanceId: "instance-b" }, request, false),
-    ).resolves.toMatchObject({ viewId: "view-b" });
-    expect(request).toHaveBeenCalledTimes(2);
-  });
-
-  it("contains MCP App re-mint failures as stale widget state and retries on demand", async () => {
-    mockLocation.search = "";
-    const snapshot = {
-      sessionKey: "agent:main:stale-app",
-      revision: 1,
-      tabs: [{ tabId: "main", title: "Main", position: 0, chatDock: "right" as const }],
-      widgets: [
-        {
-          name: "server-app",
-          tabId: "main",
-          contentKind: "mcp-app" as const,
-          sizeW: 6,
-          sizeH: 4,
-          position: 0,
-          grantState: "none" as const,
-          revision: 1,
-          instanceId: "stale-app-instance",
-        },
-      ],
-    };
-    let attempts = 0;
-    const request = vi.fn(async (method: string) => {
-      if (method === "board.get") {
-        return snapshot;
-      }
-      attempts += 1;
-      if (attempts === 1) {
-        throw new Error("origin transcript pruned");
-      }
-      return { viewId: "mcp-app-restored", expiresAtMs: Date.now() + 60_000 };
-    });
-    const provider = new GatewayBoardProvider("agent:main:stale-app", {
-      request: request as never,
-      addEventListener: () => () => {},
-    });
-    await vi.waitFor(() => expect(provider.snapshot$.value.revision).toBe(1));
-
-    await expect(provider.widgetAppView("server-app", 1)).resolves.toEqual({
-      status: "stale",
-      error: "origin transcript pruned",
-    });
-    await expect(provider.refreshWidgetAppView("server-app", 1)).resolves.toMatchObject({
-      status: "ready",
-      viewId: "mcp-app-restored",
-    });
   });
 });

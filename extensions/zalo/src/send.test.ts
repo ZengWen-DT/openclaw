@@ -61,6 +61,7 @@ describe("zalo send", () => {
         text: "hello there",
       },
       undefined,
+      undefined,
     );
     expect(sendPhotoMock).not.toHaveBeenCalled();
     const successful = requireSuccessfulSend(result, "z-msg-1");
@@ -96,6 +97,7 @@ describe("zalo send", () => {
         caption: "caption text",
       },
       undefined,
+      undefined,
     );
     expect(sendMessageMock).not.toHaveBeenCalled();
     const successful = requireSuccessfulSend(result, "z-photo-1");
@@ -104,6 +106,71 @@ describe("zalo send", () => {
     expect(successful.receipt.parts).toHaveLength(1);
     expect(successful.receipt.parts[0]?.platformMessageId).toBe("z-photo-1");
     expect(successful.receipt.parts[0]?.kind).toBe("media");
+  });
+
+  it("sends text through the message API when the media URL is whitespace", async () => {
+    sendMessageMock.mockResolvedValueOnce({
+      ok: true,
+      result: { message_id: "z-msg-with-blank-media" },
+    });
+
+    const result = await sendMessageZalo("dm-chat-blank-media", "hello there", {
+      token: "zalo-token",
+      mediaUrl: "   ",
+    });
+
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "zalo-token",
+      {
+        chat_id: "dm-chat-blank-media",
+        text: "hello there",
+      },
+      undefined,
+      undefined,
+    );
+    expect(sendPhotoMock).not.toHaveBeenCalled();
+    expect(requireSuccessfulSend(result, "z-msg-with-blank-media").receipt.parts[0]?.kind).toBe(
+      "text",
+    );
+  });
+
+  it("normalizes provider and target-kind prefixes before calling the Bot API", async () => {
+    sendMessageMock.mockResolvedValueOnce({
+      ok: true,
+      result: { message_id: "z-msg-prefixed" },
+    });
+    sendPhotoMock.mockResolvedValueOnce({
+      ok: true,
+      result: { message_id: "z-photo-prefixed" },
+    });
+
+    await sendMessageZalo("zalo:group:dm-chat-prefixed-text", "hello", {
+      token: "zalo-token",
+    });
+    await sendMessageZalo("zl:user:dm-chat-prefixed-photo", "", {
+      token: "zalo-token",
+      mediaUrl: "https://example.com/photo.jpg",
+    });
+
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "zalo-token",
+      {
+        chat_id: "dm-chat-prefixed-text",
+        text: "hello",
+      },
+      undefined,
+      undefined,
+    );
+    expect(sendPhotoMock).toHaveBeenCalledWith(
+      "zalo-token",
+      {
+        chat_id: "dm-chat-prefixed-photo",
+        photo: "https://example.com/photo.jpg",
+        caption: undefined,
+      },
+      undefined,
+      undefined,
+    );
   });
 
   it("fails fast for missing token or blank photo URLs", async () => {
@@ -169,8 +236,39 @@ describe("zalo send", () => {
         caption: undefined,
       },
       undefined,
+      undefined,
     );
+    expect(resolveZaloProxyFetchMock).toHaveBeenCalledOnce();
     const successful = requireSuccessfulSend(result, "z-photo-2");
     expect(successful.receipt.platformMessageIds).toEqual(["z-photo-2"]);
+  });
+
+  it("preserves handoff rejection identity without changing provider failures", async () => {
+    const providerError = new Error("provider unavailable");
+    sendMessageMock.mockRejectedValueOnce(providerError);
+
+    expectFailedSend(
+      await sendMessageZalo("dm-chat-provider-error", "hello", { token: "zalo-token" }),
+      providerError.message,
+    );
+
+    const authorityError = new Error("source authority revoked");
+    const assertDirectAdapterHandoff = vi.fn(() => {
+      throw authorityError;
+    });
+    sendMessageMock.mockImplementationOnce(
+      async (_token, _params, _fetcher, assertCurrent: (() => void) | undefined) => {
+        assertCurrent?.();
+        return { ok: true, result: { message_id: "unexpected" } };
+      },
+    );
+
+    await expect(
+      sendMessageZalo("dm-chat-revoked", "hello", {
+        token: "zalo-token",
+        assertDirectAdapterHandoff,
+      }),
+    ).rejects.toBe(authorityError);
+    expect(assertDirectAdapterHandoff).toHaveBeenCalledOnce();
   });
 });

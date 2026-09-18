@@ -13,21 +13,17 @@ import {
   clearLoadInstalledPluginIndexInstallRecordsCache,
   loadInstalledPluginIndexInstallRecords,
   loadInstalledPluginIndexInstallRecordsSync,
-  writePersistedInstalledPluginIndexInstallRecords,
 } from "./installed-plugin-index-records.js";
 import {
   markRetainedManagedNpmInstall,
   resolveRetainedManagedNpmInstallPackageInfo,
 } from "./managed-npm-retention.js";
+import { seedInstalledPluginIndex } from "./test-helpers/installed-plugin-index.js";
 import { writeManagedNpmPlugin } from "./test-helpers/managed-npm-plugin.js";
 
 const PACKAGE_NAME = "@openclaw/discord";
 const PLUGIN_ID = "discord";
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-
-function makeStateDir(): string {
-  return tempDirs.make("openclaw-plugin-generation-precedence-");
-}
 
 function expectRecordFields(record: unknown, expected: Record<string, unknown>) {
   if (!record || typeof record !== "object") {
@@ -101,7 +97,7 @@ afterEach(() => {
 
 describe("managed npm generation-dir loader precedence", () => {
   it("loads the authoritative generation after an upgrade leaves the old flat install", async () => {
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const staleVersion = "2026.6.11";
     const activeVersion = "2026.7.1";
 
@@ -114,7 +110,7 @@ describe("managed npm generation-dir loader precedence", () => {
     // on disk (the case `isUnavailableManagedNpmInstallRecord` does not cover).
     const stalePackageDir = writeManagedFlat(stateDir, staleVersion);
 
-    await writePersistedInstalledPluginIndexInstallRecords(
+    await seedInstalledPluginIndex(
       {
         discord: {
           source: "npm",
@@ -151,7 +147,7 @@ describe("managed npm generation-dir loader precedence", () => {
   });
 
   it("preserves an intentional downgrade when a newer generation lingers", async () => {
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const newerPackageDir = writeManagedGeneration({
       stateDir,
       version: "3.0.0",
@@ -159,7 +155,7 @@ describe("managed npm generation-dir loader precedence", () => {
     });
     const downgradedPackageDir = writeManagedFlat(stateDir, "1.0.0");
 
-    await writePersistedInstalledPluginIndexInstallRecords(
+    await seedInstalledPluginIndex(
       {
         discord: {
           source: "npm",
@@ -184,7 +180,7 @@ describe("managed npm generation-dir loader precedence", () => {
 
   it("matches the authoritative generation case-insensitively on Windows", async () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const newerPackageDir = writeManagedGeneration({
       stateDir,
       version: "3.0.0",
@@ -198,7 +194,7 @@ describe("managed npm generation-dir loader precedence", () => {
       stateDir.toUpperCase(),
     );
 
-    await writePersistedInstalledPluginIndexInstallRecords(
+    await seedInstalledPluginIndex(
       {
         discord: {
           source: "npm",
@@ -215,15 +211,13 @@ describe("managed npm generation-dir loader precedence", () => {
     const emitWarning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
 
     const loaded = await loadInstalledPluginIndexInstallRecords({ stateDir });
-    expectRecordFields(loaded.discord, {
-      installPath: differentlyCasedActivePath,
-      resolvedVersion: "1.0.0",
-    });
+    const record = expectRecordFields(loaded.discord, { resolvedVersion: "1.0.0" });
+    expect(String(record.installPath).toLowerCase()).toBe(downgradedPackageDir.toLowerCase());
     expect(emitWarning).not.toHaveBeenCalled();
   });
 
   it("uses install recency with a structured warning when no authority exists", async () => {
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const recentPackageDir = writeManagedGeneration({
       stateDir,
       version: "1.0.0",
@@ -249,7 +243,7 @@ describe("managed npm generation-dir loader precedence", () => {
   });
 
   it("warns when install recency replaces a dangling managed authority", async () => {
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const npmDir = path.join(stateDir, "npm");
     const recentPackageDir = writeManagedGeneration({
       stateDir,
@@ -268,7 +262,7 @@ describe("managed npm generation-dir loader precedence", () => {
       "node_modules",
       ...PACKAGE_NAME.split("/"),
     );
-    await writePersistedInstalledPluginIndexInstallRecords(
+    await seedInstalledPluginIndex(
       {
         discord: {
           source: "npm",
@@ -294,7 +288,7 @@ describe("managed npm generation-dir loader precedence", () => {
   });
 
   it("does not treat unrelated legacy-root metadata changes as plugin recency", async () => {
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const recentPackageDir = writeManagedGeneration({
       stateDir,
       version: "1.0.0",
@@ -320,7 +314,7 @@ describe("managed npm generation-dir loader precedence", () => {
   });
 
   it("excludes doctor-retired generations when recovering without authority", async () => {
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const retiredPackageDir = writeManagedGeneration({
       stateDir,
       version: "3.0.0",
@@ -341,7 +335,7 @@ describe("managed npm generation-dir loader precedence", () => {
   });
 
   it("excludes a doctor-retired legacy-root package when recovering without authority", async () => {
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const retiredPackageDir = writeManagedLegacy(stateDir, "3.0.0");
     const recoveredPackageDir = writeManagedGeneration({
       stateDir,
@@ -362,13 +356,13 @@ describe("managed npm generation-dir loader precedence", () => {
   });
 
   it("does not repoint an intentional custom npm install outside the managed root", async () => {
-    const stateDir = makeStateDir();
+    const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     // A managed generation with a higher version exists on disk...
     writeManagedGeneration({ stateDir, version: "2.0.0", generationKey: "discord-managed" });
     // ...but the persisted record points at a custom install outside the npm root.
-    const customInstallPath = path.join(stateDir, "custom", "node_modules", "@openclaw", "discord");
+    const customInstallPath = writeManagedFlat(path.join(stateDir, "custom"), "1.0.0");
 
-    await writePersistedInstalledPluginIndexInstallRecords(
+    await seedInstalledPluginIndex(
       {
         discord: {
           source: "npm",

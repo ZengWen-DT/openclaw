@@ -2,6 +2,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import { detectMime } from "@openclaw/media-core/mime";
+import { buildBoardWidgetContentSecurityPolicy } from "../gateway/board-sandbox.js";
 import { FsSafeError, root as fsRoot } from "../infra/fs-safe.js";
 import {
   resolveCanvasDocumentsDir,
@@ -80,14 +81,36 @@ export async function handleCanvasDocumentHttpRequest(
         : ((await detectMime({ filePath: opened.realPath })) ?? "application/octet-stream");
     res.setHeader("Cache-Control", "no-store");
     if (mime === "text/html") {
+      // Measure the decoded representation: toString("utf8") expands invalid
+      // bytes to U+FFFD, so the raw file length can differ from the body sent.
+      const body = opened.data.toString("utf8");
       res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Content-Length", String(Buffer.byteLength(body)));
       if ((await resolveDocumentSandbox(root, relativePath)) === "scripts") {
-        res.setHeader("Content-Security-Policy", "sandbox allow-scripts");
+        // Registered documents allow local renderer scripts in their own CSP;
+        // the response policy must preserve that permission because policies intersect.
+        res.setHeader(
+          "Content-Security-Policy",
+          buildBoardWidgetContentSecurityPolicy({
+            grantState: "none",
+            resourceOrigins: ["'self'"],
+          }),
+        );
+        res.setHeader("Referrer-Policy", "no-referrer");
       }
-      res.end(opened.data.toString("utf8"));
+      if (req.method === "HEAD") {
+        res.end();
+        return true;
+      }
+      res.end(body);
       return true;
     }
     res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Length", String(opened.data.byteLength));
+    if (req.method === "HEAD") {
+      res.end();
+      return true;
+    }
     res.end(opened.data);
     return true;
   } catch (error) {

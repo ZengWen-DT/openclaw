@@ -1,11 +1,55 @@
 /** Shared SecretRef grammar and validation helpers for config, schema, SDK, and gateway parity. */
-import {
-  DEFAULT_SECRET_PROVIDER_ALIAS,
-  isSecretRef,
-  isValidEnvSecretRefId,
-  type SecretRef,
-  type SecretRefSource,
-} from "../config/types.secrets.js";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+
+/** Supported secret reference backends in config. */
+export type SecretRefSource = "env" | "file" | "exec" | "store"; // pragma: allowlist secret
+
+/**
+ * Stable identifier for a secret in a configured source.
+ * Examples:
+ * - env source: provider "default", id "OPENAI_API_KEY"
+ * - file source: provider "mounted-json", id "/providers/openai/apiKey"
+ * - exec source: provider "vault", id "openai/api-key"
+ * - store source: provider "default", id "OPENAI_API_KEY"
+ */
+export type SecretRef = {
+  source: SecretRefSource;
+  provider: string;
+  id: string;
+};
+
+/** Secret-bearing config input: either a literal string or a structured SecretRef. */
+export type SecretInput = string | SecretRef;
+
+/** Provider alias used when a SecretRef omits a source-specific provider. */
+export const DEFAULT_SECRET_PROVIDER_ALIAS = "default"; // pragma: allowlist secret
+/** Strict env-var id shape accepted for env-backed SecretRefs. */
+export const ENV_SECRET_REF_ID_RE = /^[A-Z][A-Z0-9_]{0,127}$/;
+
+/** Return whether an env SecretRef id is a supported uppercase environment variable name. */
+export function isValidEnvSecretRefId(value: string): boolean {
+  return ENV_SECRET_REF_ID_RE.test(value);
+}
+
+/** Narrow a value to the canonical SecretRef object shape. */
+export function isSecretRef(value: unknown): value is SecretRef {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (Object.keys(value).length !== 3) {
+    return false;
+  }
+  return (
+    (value.source === "env" ||
+      value.source === "file" ||
+      value.source === "exec" ||
+      value.source === "store") &&
+    typeof value.provider === "string" &&
+    value.provider.trim().length > 0 &&
+    typeof value.id === "string" &&
+    value.id.trim().length > 0
+  );
+}
 
 /**
  * Runtime secret-reference grammar shared by config parsing, plugin SDK schemas,
@@ -13,7 +57,7 @@ import {
  */
 
 const FILE_SECRET_REF_SEGMENT_PATTERN = /^(?:[^~]|~0|~1)*$/;
-/** Shared alias grammar for env/file/exec secret provider names. */
+/** Shared alias grammar for env/file/exec/store secret provider names. */
 export const SECRET_PROVIDER_ALIAS_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 const EXEC_SECRET_REF_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,255}$/;
 
@@ -43,6 +87,8 @@ type SecretRefDefaultsCarrier = {
       file?: string;
       /** Default provider alias for exec-backed secret refs. */
       exec?: string;
+      /** Default provider alias for shared-store secret refs. */
+      store?: string;
     };
     /** Provider declarations used only when callers ask to prefer the first matching source. */
     providers?: Record<string, { source?: string }>;
@@ -60,12 +106,7 @@ export function resolveDefaultSecretProviderAlias(
   source: SecretRefSource,
   options?: { preferFirstProviderForSource?: boolean },
 ): string {
-  const configured =
-    source === "env"
-      ? config.secrets?.defaults?.env
-      : source === "file"
-        ? config.secrets?.defaults?.file
-        : config.secrets?.defaults?.exec;
+  const configured = config.secrets?.defaults?.[source];
   if (configured?.trim()) {
     return configured.trim();
   }
@@ -84,6 +125,49 @@ export function resolveDefaultSecretProviderAlias(
   }
 
   return DEFAULT_SECRET_PROVIDER_ALIAS;
+}
+
+/** Builds an environment-backed gateway credential using its configured provider alias. */
+export function createGatewayEnvSecretRef(
+  config: SecretRefDefaultsCarrier,
+  envVarName: string,
+): SecretRef {
+  return {
+    source: "env",
+    provider: resolveDefaultSecretProviderAlias(config, "env", {
+      preferFirstProviderForSource: true,
+    }),
+    id: envVarName,
+  };
+}
+
+/** Whether a source-specific built-in provider owns this selected default alias. */
+export function isBuiltInDefaultSecretProviderRef(
+  config: SecretRefDefaultsCarrier,
+  ref: SecretRef,
+): boolean {
+  const configuredSource = config.secrets?.providers?.[ref.provider]?.source;
+  return (
+    configuredSource !== ref.source &&
+    (ref.source === "env" || ref.source === "store") &&
+    ref.provider === resolveDefaultSecretProviderAlias(config, ref.source)
+  );
+}
+
+/** Returns the configured provider source when a SecretRef selects an impossible pairing. */
+export function resolveSecretRefProviderSourceMismatch(
+  config: SecretRefDefaultsCarrier,
+  ref: SecretRef,
+): string | null {
+  const configuredSource = config.secrets?.providers?.[ref.provider]?.source;
+  if (
+    !configuredSource ||
+    configuredSource === ref.source ||
+    isBuiltInDefaultSecretProviderRef(config, ref)
+  ) {
+    return null;
+  }
+  return configuredSource;
 }
 
 /** Validates file secret ref ids against the shared JSON-pointer-style contract. */
@@ -140,6 +224,9 @@ export function isValidSecretRef(ref: SecretRef): boolean {
   }
   if (ref.source === "file") {
     return isValidFileSecretRefId(ref.id);
+  }
+  if (ref.source === "store") {
+    return isValidEnvSecretRefId(ref.id);
   }
   return isValidExecSecretRefId(ref.id);
 }

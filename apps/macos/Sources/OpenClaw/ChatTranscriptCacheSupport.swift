@@ -81,17 +81,21 @@ enum MacChatTranscriptCache {
     /// command outbox, and callers wire both protocol facets from one instance.
     @MainActor
     static func currentGatewayID() -> String? {
-        let root = OpenClawConfigFile.loadDict()
+        self.gatewayID(root: OpenClawConfigFile.loadDict())
+    }
+
+    @MainActor
+    static func gatewayID(root: [String: Any]) -> String? {
         let mode = ConnectionModeResolver.resolve(root: root).mode
         let resolution = GatewayRemoteConfig.resolveTransportResolution(root: root)
         let sshTarget = CommandResolver.connectionSettings(configRoot: root).target
-        // Mirror the tunnel's remote-port resolution (RemotePortTunnel.create)
-        // so the identity matches the gateway the forward actually reaches.
-        let defaultRemotePort = GatewayEnvironment.gatewayPort()
-        let sshHost = CommandResolver.parseSSHTarget(sshTarget)?.host ?? ""
-        let sshRemotePort = RemotePortTunnel.resolveRemotePortOverride(
-            defaultRemotePort: defaultRemotePort,
-            for: sshHost) ?? defaultRemotePort
+        let sshRemotePort: Int = if mode == .remote, resolution.transport == .ssh {
+            RemotePortTunnel.ports(
+                root: root,
+                sshHost: CommandResolver.parseSSHTarget(sshTarget)?.host ?? "").remote
+        } else {
+            18789
+        }
         return self.gatewayID(
             mode: mode,
             localStateDir: OpenClawConfigFile.stateDirURL(),
@@ -107,6 +111,13 @@ enum MacChatTranscriptCache {
     @MainActor
     static func makeContext() -> Context? {
         guard let gatewayID = currentGatewayID() else { return nil }
+        return self.makeContext(gatewayID: gatewayID)
+    }
+
+    /// Explicit profile context. Browser profiles supply their issuer-verified
+    /// account namespace so token renewal preserves data without crossing accounts.
+    @MainActor
+    static func makeContext(gatewayID: String) -> Context? {
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         else {
             return nil

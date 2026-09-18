@@ -2,6 +2,8 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveCronJobBoundSessionKeys } from "../cron/job-session-bindings.js";
 import type { CronJob } from "../cron/types.js";
+import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
+import { sessionChanges } from "../sessions/session-row-changes.js";
 
 type SessionAutomationSource = {
   /** Current in-memory cron jobs; undefined until the cron store is loaded. */
@@ -10,16 +12,11 @@ type SessionAutomationSource = {
 };
 
 let source: SessionAutomationSource | null = null;
-// Bumped on every cron service event so in-place job mutations (enable/disable,
-// auto-disable during runs) invalidate the memo even when the array identity
-// and config reference stay stable.
-let sourceVersion = 0;
 let epochCounter = 0;
 let registeredEpoch = 0;
 
 let memo: {
   jobs: readonly CronJob[];
-  version: number;
   cfg: OpenClawConfig;
   keys: ReadonlySet<string>;
 } | null = null;
@@ -44,8 +41,7 @@ export function registerSessionAutomationSource(
   }
   registeredEpoch = effectiveEpoch;
   source = next;
-  memo = null;
-  sourceVersion += 1;
+  invalidateSessionAutomationIndex();
 }
 
 /**
@@ -57,13 +53,13 @@ export function unregisterSessionAutomationSource(owner: SessionAutomationSource
     return;
   }
   source = null;
-  memo = null;
-  sourceVersion += 1;
+  invalidateSessionAutomationIndex();
 }
 
 /** Called from the cron onEvent hook after any job/store change. */
-export function bumpSessionAutomationVersion(): void {
-  sourceVersion += 1;
+export function invalidateSessionAutomationIndex(): void {
+  memo = null;
+  sessionChanges.emit({ all: true, scope: "automation" });
 }
 
 function buildAutomationKeys(
@@ -77,25 +73,38 @@ function buildAutomationKeys(
       continue;
     }
     for (const key of resolveCronJobBoundSessionKeys(job, { cfg, defaultAgentId })) {
-      keys.add(key);
+      const agentId = job.owner?.agentId ?? defaultAgentId;
+      if (parseAgentSessionKey(key)) {
+        keys.add(key);
+      } else if (agentId) {
+        keys.add(`${normalizeAgentId(agentId)}\0${key}`);
+      }
     }
   }
   return keys;
 }
 
 /** True when an enabled cron job is bound to the canonical session key. */
-export function sessionHasAutomation(sessionKey: string, cfg: OpenClawConfig): boolean {
+export function sessionHasAutomation(
+  sessionKey: string,
+  cfg: OpenClawConfig,
+  agentId?: string,
+): boolean {
   const jobs = source?.getJobs();
   if (!source || !jobs || jobs.length === 0) {
     return false;
   }
-  if (!memo || memo.jobs !== jobs || memo.version !== sourceVersion || memo.cfg !== cfg) {
+  if (!memo || memo.jobs !== jobs || memo.cfg !== cfg) {
     memo = {
       jobs,
-      version: sourceVersion,
       cfg,
       keys: buildAutomationKeys(jobs, cfg, source.getDefaultAgentId()),
     };
   }
-  return memo.keys.has(sessionKey);
+  const identity = parseAgentSessionKey(sessionKey)
+    ? sessionKey
+    : agentId
+      ? `${normalizeAgentId(agentId)}\0${sessionKey}`
+      : undefined;
+  return identity ? memo.keys.has(identity) : false;
 }

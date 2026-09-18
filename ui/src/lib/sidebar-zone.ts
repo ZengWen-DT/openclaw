@@ -20,6 +20,8 @@ export function reconcileSidebarZone(
   pinnedSessions: readonly SidebarPinnedSession[],
   validRoutes: readonly SidebarNavRoute[],
   knownUnpinnedKeys: ReadonlySet<string> = new Set(),
+  pluginNavigationKeys: ReadonlySet<string> = new Set(),
+  defaultPluginNavigationKeys: ReadonlySet<string> = new Set(),
 ): { entries: SidebarZoneEntry[]; sidebarEntries: string[] } {
   const pinnedKeys = new Set(pinnedSessions.map((session) => session.key));
   const validRouteSet = new Set(validRoutes);
@@ -45,6 +47,16 @@ export function reconcileSidebarZone(
       canonical.push(canonicalKey);
       continue;
     }
+    if (entry.type === "plugin") {
+      seen.add(canonicalKey);
+      canonical.push(canonicalKey);
+      // Registration can disappear on reload, disconnect, or permission loss;
+      // an unavailable plugin must not erase the operator's saved placement.
+      if (pluginNavigationKeys.has(entry.key)) {
+        entries.push(entry);
+      }
+      continue;
+    }
     if (pinnedKeys.has(entry.key)) {
       seen.add(canonicalKey);
       entries.push(entry);
@@ -63,6 +75,18 @@ export function reconcileSidebarZone(
     const entry = { type: "session", key: session.key } as const;
     const serialized = serializeSidebarEntry(entry);
     if (!seen.has(serialized)) {
+      seen.add(serialized);
+      entries.push(entry);
+      canonical.push(serialized);
+    }
+  }
+
+  // Plugin defaults join the same ordered zone as explicit pins. Rendering and
+  // drag writes must see the same complete order, including newly loaded plugins.
+  for (const key of defaultPluginNavigationKeys) {
+    const entry = { type: "plugin", key } as const;
+    const serialized = serializeSidebarEntry(entry);
+    if (pluginNavigationKeys.has(key) && !seen.has(serialized)) {
       seen.add(serialized);
       entries.push(entry);
       canonical.push(serialized);

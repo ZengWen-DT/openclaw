@@ -107,7 +107,9 @@ function createMockFetch(entries: Array<{ match: RegExp; response: Response }>):
     if (!entry) {
       return new Response("not found", { status: 404 });
     }
-    return entry.response.clone();
+    // Fetch returns one body. Cloning tees it, so canceling the returned branch
+    // would wait forever for the untouched fixture branch to be canceled too.
+    return entry.response;
   }) as typeof fetch;
 }
 
@@ -174,10 +176,7 @@ describe("downloadMSTeamsBotFrameworkAttachment", () => {
     const fetchFn = createMockFetch([
       {
         match: /\/v3\/attachments\/att-1$/,
-        response: new Response(JSON.stringify(info), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
+        response: Response.json(info),
       },
       {
         match: /\/v3\/attachments\/att-1\/views\/original$/,
@@ -216,10 +215,7 @@ describe("downloadMSTeamsBotFrameworkAttachment", () => {
     const fetchFn = createMockFetch([
       {
         match: /\/v3\/attachments\/att-1$/,
-        response: new Response(JSON.stringify(info), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
+        response: Response.json(info),
       },
       {
         match: /\/v3\/attachments\/att-1\/views\/original$/,
@@ -301,14 +297,11 @@ describe("downloadMSTeamsBotFrameworkAttachment", () => {
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       seenAuth.push(new Headers(init?.headers).get("authorization"));
       if (url.endsWith("/v3/attachments/att-1")) {
-        return new Response(
-          JSON.stringify({
-            name: "doc.pdf",
-            type: "application/pdf",
-            views: [{ viewId: "original", size: fileBytes.byteLength }],
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
+        return Response.json({
+          name: "doc.pdf",
+          type: "application/pdf",
+          views: [{ viewId: "original", size: fileBytes.byteLength }],
+        });
       }
       if (url.endsWith("/v3/attachments/att-1/views/original")) {
         return new Response(fileBytes, {
@@ -402,14 +395,11 @@ describe("downloadMSTeamsBotFrameworkAttachment", () => {
           typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
         fetchCalls.push({ url, init });
         if (url.endsWith("/v3/attachments/att-1")) {
-          return new Response(
-            JSON.stringify({
-              name: "doc.pdf",
-              type: "application/pdf",
-              views: [{ viewId: "original", size: fileBytes.byteLength }],
-            }),
-            { status: 200, headers: { "content-type": "application/json" } },
-          );
+          return Response.json({
+            name: "doc.pdf",
+            type: "application/pdf",
+            views: [{ viewId: "original", size: fileBytes.byteLength }],
+          });
         }
         if (url.endsWith("/v3/attachments/att-1/views/original")) {
           return new Response(fileBytes, {

@@ -1,3 +1,4 @@
+import { asDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
 /**
  * Sandbox registry pruning.
  *
@@ -5,15 +6,14 @@
  */
 import { getRuntimeConfig } from "../../config/config.js";
 import { defaultRuntime } from "../../runtime.js";
-import { asDateTimestampMs } from "../../shared/number-coercion.js";
-import { getSandboxBackendManager } from "./backend.js";
+import { getSandboxBackendManager, usesSandboxRuntimeReservations } from "./backend.js";
 import { stopCachedBrowserBridgesForContainer } from "./browser-bridges.js";
 import { dockerSandboxBackendManager } from "./docker-backend.js";
 import {
   readBrowserRegistry,
   readRegistry,
   removeBrowserRegistryEntry,
-  removeRegistryEntry,
+  removeSandboxRegistryRuntime,
   type SandboxBrowserRegistryEntry,
   type SandboxRegistryEntry,
 } from "./registry.js";
@@ -47,9 +47,10 @@ function shouldPruneSandboxEntry(cfg: SandboxConfig, now: number, entry: Pruneab
 async function pruneSandboxRegistryEntries<TEntry extends SandboxRegistryEntry>(params: {
   cfg: SandboxConfig;
   read: () => Promise<{ entries: TEntry[] }>;
-  remove: (containerName: string) => Promise<void>;
-  removeRuntime: (entry: TEntry) => Promise<void>;
-  beforeRemove?: (entry: TEntry) => Promise<void>;
+  remove: (
+    entry: TEntry,
+    shouldRemove: (current: SandboxRegistryEntry) => boolean,
+  ) => Promise<void>;
 }) {
   const now = Date.now();
   if (params.cfg.prune.idleHours === 0 && params.cfg.prune.maxAgeDays === 0) {
@@ -61,9 +62,7 @@ async function pruneSandboxRegistryEntries<TEntry extends SandboxRegistryEntry>(
       continue;
     }
     try {
-      await params.beforeRemove?.(entry);
-      await params.removeRuntime(entry);
-      await params.remove(entry.containerName);
+      await params.remove(entry, (current) => shouldPruneSandboxEntry(params.cfg, now, current));
     } catch (error) {
       const message =
         error instanceof Error
@@ -84,14 +83,24 @@ async function pruneSandboxContainers(cfg: SandboxConfig) {
   await pruneSandboxRegistryEntries<SandboxRegistryEntry>({
     cfg,
     read: readRegistry,
-    remove: removeRegistryEntry,
-    removeRuntime: async (entry) => {
-      const manager = getSandboxBackendManager(entry.backendId ?? "docker");
-      await manager?.removeRuntime({
+    remove: (entry, shouldRemove) =>
+      removeSandboxRegistryRuntime(
         entry,
-        config,
-      });
-    },
+        async (current) => {
+          const backendId = current.backendId ?? "docker";
+          const manager = getSandboxBackendManager(backendId);
+          if (!manager) {
+            throw new Error(
+              `Sandbox backend "${backendId}" is unavailable; enable its plugin before removing this runtime.`,
+            );
+          }
+          await manager.removeRuntime({ entry: current, config });
+        },
+        {
+          reserveRuntime: usesSandboxRuntimeReservations(entry.backendId ?? "docker"),
+          shouldRemove,
+        },
+      ),
   });
 }
 
@@ -107,8 +116,8 @@ async function pruneSandboxBrowsers(cfg: SandboxConfig) {
   >({
     cfg,
     read: readBrowserRegistry,
-    remove: removeBrowserRegistryEntry,
-    removeRuntime: async (entry) => {
+    remove: async (entry) => {
+      await stopCachedBrowserBridgesForContainer(entry.containerName);
       await dockerSandboxBackendManager.removeRuntime({
         entry: {
           ...entry,
@@ -118,9 +127,7 @@ async function pruneSandboxBrowsers(cfg: SandboxConfig) {
         },
         config,
       });
-    },
-    beforeRemove: async (entry) => {
-      await stopCachedBrowserBridgesForContainer(entry.containerName);
+      await removeBrowserRegistryEntry(entry.containerName);
     },
   });
 }
