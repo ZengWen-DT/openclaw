@@ -137,6 +137,24 @@ describe("handleAbortChat", () => {
     expect(host.chatRunId).toBe("run-live");
   });
 
+  it("shows a successful abort's transcript-persistence warning", async () => {
+    const warning = "The streamed assistant message could not be saved.";
+    const request = vi.fn(async () => ({
+      ok: true,
+      aborted: true,
+      runIds: ["run-live"],
+      warning,
+    }));
+    const host = makeAbortHost({
+      client: createTestGatewayClient(request),
+      chatRunId: "run-live",
+    });
+
+    await handleAbortChat(host, { preserveDraft: true });
+
+    expect(host.chatError).toBe(warning);
+  });
+
   it("settles a recovered embedded run when sessions.abort reports no active run", async () => {
     const request = vi.fn(async () => ({ ok: true, abortedRunId: null, status: "no-active-run" }));
     const refreshCurrentChat = vi.fn(async () => {});

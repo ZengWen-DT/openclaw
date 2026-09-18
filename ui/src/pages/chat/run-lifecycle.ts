@@ -267,7 +267,9 @@ function queuedSessionAbortParams(
 
 type ChatAbortOptions = { preserveDraft?: boolean };
 
-type ChatAbortRequestResult = { ok: true; noActiveRun: boolean } | { ok: false; error: unknown };
+type ChatAbortRequestResult =
+  | { ok: true; noActiveRun: boolean; warning?: string }
+  | { ok: false; error: unknown };
 
 /**
  * Only an explicit Gateway "nothing to abort" answer counts: chat.abort
@@ -282,6 +284,14 @@ function readNoActiveRunResponse(response: unknown): boolean {
     ("aborted" in response && response.aborted === false) ||
     ("status" in response && response.status === "no-active-run")
   );
+}
+
+function readAbortWarning(response: unknown): string | undefined {
+  if (!response || typeof response !== "object" || !("warning" in response)) {
+    return undefined;
+  }
+  const warning = response.warning;
+  return typeof warning === "string" && warning.trim() ? warning : undefined;
 }
 
 async function requestChatAbort(
@@ -316,7 +326,12 @@ async function requestChatAbort(
         ...(intent.clearQueued ? { clearQueued: true } : {}),
       });
     }
-    return { ok: true, noActiveRun: readNoActiveRunResponse(response) };
+    const warning = readAbortWarning(response);
+    return {
+      ok: true,
+      noActiveRun: readNoActiveRunResponse(response),
+      ...(warning ? { warning } : {}),
+    };
   } catch (err) {
     return { ok: false, error: err };
   }
@@ -371,6 +386,9 @@ async function abortChatRun(state: ChatAbortRunState): Promise<void> {
   if (result.noActiveRun) {
     await settleNoopAbort(state, intent);
   }
+  if (result.warning) {
+    setChatError(state, result.warning);
+  }
 }
 
 export async function replayPendingChatAbort(host: ChatAbortHost): Promise<boolean> {
@@ -399,6 +417,9 @@ export async function replayPendingChatAbort(host: ChatAbortHost): Promise<boole
   if (result.ok) {
     if (result.noActiveRun) {
       await settleNoopAbort(host, intent);
+    }
+    if (result.warning) {
+      setChatError(host, result.warning);
     }
     return true;
   }

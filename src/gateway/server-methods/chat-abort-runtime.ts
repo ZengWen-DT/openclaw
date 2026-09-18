@@ -45,9 +45,9 @@ import {
   normalizeUnknownChatText as normalizeUnknownText,
 } from "./chat-text-normalization.js";
 import {
+  ABORTED_PARTIAL_PERSISTENCE_WARNING,
   captureAbortedPartial,
   persistAbortedPartials,
-  queueAbortedPartialPersistenceFailures,
   type AbortedPartialSnapshot,
   type ChatAbortOrigin,
   type ChatAbortSessionSnapshot,
@@ -98,6 +98,14 @@ export function descendantAbortError(
         `${subject} stopped, but descendant cancellation was incomplete: ${result.error}`,
       )
     : undefined;
+}
+
+/** Keeps transcript-loss visibility when abort cleanup itself must return an error. */
+export function withAbortedPartialPersistenceWarning(
+  error: ErrorShape,
+  warning: string | undefined,
+): ErrorShape {
+  return warning ? { ...error, message: `${error.message} ${warning}` } : error;
 }
 
 /** Queued collectors retain scheduler ownership while Gateway admission is still pending. */
@@ -425,6 +433,7 @@ type ChatSessionAbortResult = {
   runIds: string[];
   unauthorized: boolean;
   error?: ErrorShape;
+  warning?: string;
   descendants?: Awaited<ReturnType<typeof abortControlledSubagents>>;
 };
 
@@ -629,20 +638,19 @@ function prepareChatSessionAbort(params: ChatSessionAbortParams, selectedRunId?:
     canCascade: canRunLifecycleCleanup && !hasUnauthorizedLifecycleOwner,
     hasOtherWork,
     abort: abortAuthorizedRuns,
-    async finish(result: Pick<ChatSessionAbortResult, "aborted" | "runIds">) {
+    async finish(result: Pick<ChatSessionAbortResult, "aborted" | "runIds">): Promise<boolean> {
+      let partialPersistenceFailed = false;
       if (result.aborted && snapshots.length > 0) {
         const abortedRunIds = new Set(result.runIds);
-        const failed = await persistAbortedPartials({
+        partialPersistenceFailed = await persistAbortedPartials({
           context: params.context,
           snapshots: snapshots.filter((snapshot) => abortedRunIds.has(snapshot.runId)),
         });
-        if (failed.length > 0) {
-          queueAbortedPartialPersistenceFailures(failed);
-        }
       }
       if (params.session && !params.session.ok) {
         throw params.session.error;
       }
+      return partialPersistenceFailed;
     },
   };
 }
@@ -678,6 +686,11 @@ export async function abortChatRunsForSessionKeyWithPartials(
   if (!result.unauthorized && !result.error) {
     params.onCancellationStarted?.();
   }
-  await plan.finish(result);
-  return { ...result, aborted: result.aborted || Boolean(descendants?.killed), descendants };
+  const partialPersistenceFailed = await plan.finish(result);
+  return {
+    ...result,
+    aborted: result.aborted || Boolean(descendants?.killed),
+    descendants,
+    ...(partialPersistenceFailed ? { warning: ABORTED_PARTIAL_PERSISTENCE_WARNING } : {}),
+  };
 }
