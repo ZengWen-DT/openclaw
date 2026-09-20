@@ -7,6 +7,75 @@ import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts"
 const suite = createControlUiE2eSuite({ name: "Control UI Stop response ownership" });
 
 suite.define(() => {
+  it.each(["button", "command"] as const)(
+    "shows a delayed save warning after Stop through the %s",
+    async (input) => {
+      await suite.withPage(
+        {
+          viewport: { width: 1200, height: 800 },
+          recordVideo: { dir: suite.artifactDir, size: { width: 1200, height: 800 } },
+        },
+        async ({ page }) => {
+          const sessionKey = "agent:main:main";
+          const gateway = await installMockGateway(page, { sessionKey });
+          await page.goto(controlUiSessionUrl(suite.server.baseUrl, sessionKey));
+          const composer = page.locator(".agent-chat__input textarea");
+          const stop = page.getByRole("button", { name: "Stop generating" });
+          await composer.fill("Explain the proposed schedule.");
+          await page.getByRole("button", { name: "Send message", exact: true }).click();
+          const sent = await gateway.waitForRequest("chat.send");
+          const runId = String(asOptionalRecord(sent.params)?.idempotencyKey);
+          const text = "The first step is to review the schedule with the team.";
+          await gateway.emitGatewayEvent("chat", {
+            sessionKey,
+            runId,
+            state: "delta",
+            deltaText: text,
+          });
+          await page.locator(".chat-bubble").getByText(text, { exact: true }).waitFor();
+          await gateway.deferNext("chat.abort");
+          if (input === "button") {
+            await stop.click();
+          } else {
+            await composer.fill("/stop");
+            await composer.press("Enter");
+          }
+          await gateway.waitForRequest("chat.abort");
+          await gateway.emitGatewayEvent("chat", {
+            sessionKey,
+            runId,
+            state: "aborted",
+            message: { role: "assistant", content: [{ type: "text", text }] },
+          });
+          await stop.waitFor({ state: "detached" });
+          const warning =
+            "The run stopped, but an assistant reply could not be saved to history. Copy any visible text you want to keep before leaving this chat.";
+          await gateway.resolveDeferred("chat.abort", {
+            ok: true,
+            aborted: true,
+            runIds: [runId],
+            warning,
+          });
+          await page.evaluate(
+            () =>
+              new Promise<void>((resolve) => {
+                requestAnimationFrame(() => resolve());
+              }),
+          );
+          await page.screenshot({
+            path: path.join(suite.artifactDir, input + "-save-warning.png"),
+            fullPage: false,
+          });
+          await page.getByText(warning, { exact: true }).waitFor();
+          expect(await gateway.getRequests("chat.abort")).toHaveLength(1);
+          expect(
+            await page.locator(".chat-bubble").getByText(text, { exact: true }).isVisible(),
+          ).toBe(true);
+        },
+      );
+    },
+  );
+
   it.each(["current", "replacement"] as const)(
     "keeps a delayed Stop rejection with its original run after %s work",
     async (owner) => {

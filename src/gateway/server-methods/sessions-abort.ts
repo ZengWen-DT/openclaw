@@ -57,6 +57,7 @@ import {
   abortQueuedCollectorSession,
   descendantAbortError,
 } from "./chat-abort-runtime.js";
+import { abortedPartialPersistenceError } from "./chat-aborted-partial.js";
 import { emitSessionsChanged } from "./session-change-event.js";
 import {
   bindGatewayRequestHandlerMutationAuthority,
@@ -452,6 +453,7 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
     let failedResponse: Parameters<typeof respond> | undefined;
     let descendantsCancelled = false;
     let responseMeta: Record<string, unknown> | undefined;
+    let abortWarning: string | undefined;
     const persistedSessionId = sessionEntry?.sessionId;
     const capturedSessionEmbeddedRun = persistedSessionId
       ? resolveActiveEmbeddedRunOwner(persistedSessionId)
@@ -492,21 +494,33 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
     let mcpRetirement: Promise<boolean> | undefined;
     let pendingMcpController: ChatAbortControllerEntry | undefined;
     const settleAbortPersistence = async (runIds: readonly string[]) => {
-      await embeddedAbortPersistence;
-      await Promise.all(
-        runIds.flatMap((runId) => {
-          const entry = preAbortRuns.get(runId);
-          return entry ? [waitForChatAbortTerminalPersistence(entry)] : [];
-        }),
-      );
-      if (persistedSessionId && pendingMcpController?.controller.signal.aborted) {
-        assertAbortCurrent();
-        mcpRetirement ??= retireSessionMcpRuntime({
-          sessionId: persistedSessionId,
-          reason: "session-stop",
-        });
+      try {
+        await embeddedAbortPersistence;
+        await Promise.all(
+          runIds.flatMap((runId) => {
+            const entry = preAbortRuns.get(runId);
+            return entry ? [waitForChatAbortTerminalPersistence(entry)] : [];
+          }),
+        );
+        if (persistedSessionId && pendingMcpController?.controller.signal.aborted) {
+          assertAbortCurrent();
+          mcpRetirement ??= retireSessionMcpRuntime({
+            sessionId: persistedSessionId,
+            reason: "session-stop",
+          });
+        }
+        await mcpRetirement;
+        if (descendantsCancelled && yieldedParent) {
+          // Child cancellation consumes the wake; join its parent's terminal write too.
+          await persistSessionAbort(yieldedParent);
+        }
+      } catch (error) {
+        if (failedResponse) {
+          context.logGateway.warn("sessions.abort cleanup failed after cancellation was rejected");
+          return;
+        }
+        throw abortedPartialPersistenceError(error, abortWarning);
       }
-      await mcpRetirement;
     };
     const onAuthorizedAfterQueuedAbort =
       !requestedRunId && (clearQueued || persistedSessionId)
@@ -573,6 +587,11 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
     });
     if (queuedAbort) {
       const result = await queuedAbort;
+      if (result.ok) {
+        abortWarning = result.value.warning;
+      } else {
+        failedResponse = [false, undefined, result.error];
+      }
       await settleAbortPersistence(result.ok ? result.value.runIds : []);
       if (!result.ok) {
         respond(false, undefined, result.error);
@@ -583,6 +602,7 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
             ok: true,
             abortedRunId: result.value.runIds[0] ?? null,
             status: result.value.aborted ? "aborted" : "no-active-run",
+            ...(abortWarning ? { warning: abortWarning } : {}),
           },
           undefined,
           undefined,
@@ -607,6 +627,10 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
             }
             chatAbortSucceeded = true;
             responseMeta = meta;
+            abortWarning =
+              payload && typeof payload === "object" && "warning" in payload
+                ? normalizeOptionalString(payload.warning)
+                : undefined;
             const runIds =
               payload &&
               typeof payload === "object" &&
@@ -664,11 +688,6 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
       },
     );
     await settleAbortPersistence(abortedRunIds);
-    if (descendantsCancelled && yieldedParent) {
-      // Child cancellation consumes the wake; the captured parent still needs
-      // its terminal write before either response, even if a sibling failed to stop.
-      await persistSessionAbort(yieldedParent);
-    }
     if (!chatAbortSucceeded) {
       if (failedResponse) {
         respond(...failedResponse);
@@ -681,6 +700,7 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
         ok: true,
         abortedRunId,
         status: aborted ? "aborted" : "no-active-run",
+        ...(abortWarning ? { warning: abortWarning } : {}),
       },
       undefined,
       responseMeta,

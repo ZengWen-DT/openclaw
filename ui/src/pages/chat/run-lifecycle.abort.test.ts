@@ -11,6 +11,7 @@ import {
   hasAbortableSessionRun,
   hasDirectSessionRun,
   replayPendingChatAbort,
+  reconcileChatRunLifecycle,
 } from "./run-lifecycle.ts";
 
 function makeSessionsResult(rows: (Pick<GatewaySessionRow, "key"> & Partial<GatewaySessionRow>)[]) {
@@ -137,6 +138,60 @@ describe("handleAbortChat", () => {
     expect(refreshCurrentChat).not.toHaveBeenCalled();
     expect(host.chatRunId).toBe("run-live");
   });
+
+  it.each(
+    (["online", "replay"] as const).flatMap((mode) =>
+      (["active", "terminal", "replacement", "pending"] as const)
+        .map((owner) => ({ mode, owner, rejected: false }))
+        .concat({ mode, owner: "terminal", rejected: true }),
+    ),
+  )(
+    "keeps $mode save warnings with their $owner owner (rejected: $rejected)",
+    async ({ mode, owner, rejected }) => {
+      const response = createDeferred<unknown>();
+      const host = makeAbortHost({
+        client: createTestGatewayClient(vi.fn(() => response.promise)),
+        connected: mode === "online",
+        chatRunId: "stopped-run",
+        requestUpdate: vi.fn(),
+      });
+      let stopped = handleAbortChat(host, { preserveDraft: true });
+      if (mode === "replay") {
+        await stopped;
+        host.connected = true;
+        stopped = replayPendingChatAbort(host).then(() => {});
+      }
+      if (owner !== "active") {
+        reconcileChatRunLifecycle(host, {
+          outcome: "interrupted",
+          runId: "stopped-run",
+          clearLocalRun: true,
+          armLocalTerminalReconcile: true,
+          publishRunStatus: false,
+        });
+      }
+      if (owner === "replacement") {
+        host.chatRunId = "replacement-run";
+      } else if (owner === "pending") {
+        host.chatQueue = [{ sendState: "sending", sendRunId: "replacement-run" }];
+      }
+      vi.mocked(host.requestUpdate!).mockClear();
+      const warning = "The stopped reply could not be saved to history.";
+      if (rejected) {
+        response.reject(new Error(warning));
+      } else {
+        response.resolve({ aborted: true, warning });
+      }
+      await stopped;
+      if (owner === "active" || owner === "terminal") {
+        expect(host.chatRunError).toMatchObject({ summary: warning, runId: "stopped-run" });
+        expect(host.requestUpdate).toHaveBeenCalledOnce();
+      } else {
+        expect(host.chatRunError ?? null).toBeNull();
+        expect(host.requestUpdate).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it("settles a recovered embedded run when sessions.abort reports no active run", async () => {
     const request = vi.fn(async () => ({ ok: true, abortedRunId: null, status: "no-active-run" }));
