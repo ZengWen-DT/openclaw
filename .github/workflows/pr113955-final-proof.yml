@@ -1,0 +1,40 @@
+name: PR 113955 final proof
+
+on:
+  push:
+    branches: [proof/113955-final]
+
+permissions:
+  contents: read
+
+jobs:
+  chromium:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: >-
+          pnpm exec oxfmt --check
+          extensions/browser/src/browser/pw-session-cdp-transport.ts
+          extensions/browser/src/browser/pw-session-connection.ts
+          extensions/browser/src/browser/pw-session-cdp-transport.test-support.ts
+          extensions/browser/src/browser/pw-session.connection.test-support.ts
+          extensions/browser/src/browser/pw-session-cdp-transport.test.ts
+          extensions/browser/src/browser/pw-session-unresponsive-target.test.ts
+          extensions/browser/src/browser/pw-session-cold-connect.chromium.test.ts
+      - run: >-
+          node scripts/run-vitest.mjs
+          extensions/browser/src/browser/pw-session-cdp-transport.test.ts
+          extensions/browser/src/browser/pw-session-unresponsive-target.test.ts
+          extensions/browser/src/browser/pw-session.pinned-transport.test.ts
+          extensions/browser/src/browser/pw-session.connections.test.ts
+      - run: node --import tsx scripts/ensure-playwright-chromium.mts --require-playwright-chromium
+      - run: node scripts/run-vitest.mjs extensions/browser/src/browser/pw-session-cold-connect.chromium.test.ts
+        env:
+          OPENCLAW_BROWSER_COLD_CONNECT_E2E: "1"
