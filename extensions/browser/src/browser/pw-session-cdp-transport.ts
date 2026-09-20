@@ -10,6 +10,27 @@ type CdpSocketLookup = typeof dnsLookupCb;
 // Playwright allocates positive command IDs and reserves -9999 for Browser.close.
 // Keep transport-owned replies below that range so Playwright never consumes them.
 const FIRST_INTERNAL_COMMAND_ID = -10_000;
+const MAX_DIAGNOSTIC_TARGETS = 3;
+const MAX_DIAGNOSTIC_TARGET_ID_CHARS = 128;
+
+export class UnresponsiveCdpTargetError extends Error {
+  constructor(readonly targetIds: string[]) {
+    const targets = targetIds.map((targetId) => JSON.stringify(targetId)).join(", ");
+    const suffix = targetIds.length === 1 ? "" : "s";
+    super(
+      `Playwright connection timed out while page target${suffix} ${targets} did not respond during initialization. Close the target in the browser or provider dashboard, then retry. If it cannot be closed there, restart the affected browser profile.`,
+    );
+    this.name = "UnresponsiveCdpTargetError";
+  }
+}
+
+function isConnectTimeout(error: unknown): boolean {
+  if (error instanceof Error && error.name === "TimeoutError") {
+    return true;
+  }
+  const message = formatErrorMessage(error).toLowerCase();
+  return message.includes("timeout") || message.includes("timed out");
+}
 
 // Playwright's browser-root handler requires browserContextId for non-browser targets.
 // Release only those root targets; nested sessions belong to Playwright's frame handler.
@@ -99,6 +120,9 @@ export async function connectOverCdpTransport(
   opts: CdpTransportOptions,
 ): Promise<Browser> {
   const wire = opts.preparedTransport ?? (await openCdpTransportSocket(connectionUrl, opts));
+  const pageTargetIdsBySession = new Map<string, string>();
+  const pendingTargetCommands = new Map<number, string>();
+  let trackInitializationCommands = true;
   try {
     let onMessage: ((message: object) => void) | undefined;
     let onClose: ((reason?: string) => void) | undefined;
@@ -180,7 +204,20 @@ export async function connectOverCdpTransport(
         if (closingReason || transportClosed) {
           throw new Error("CDP transport closed");
         }
-        wire.send(message);
+        const command = asOptionalRecord(message);
+        const id = command?.id;
+        const sessionId = readStringField(command, "sessionId");
+        if (trackInitializationCommands && typeof id === "number" && id > 0 && sessionId) {
+          pendingTargetCommands.set(id, sessionId);
+        }
+        try {
+          wire.send(message);
+        } catch (error) {
+          if (typeof id === "number") {
+            pendingTargetCommands.delete(id);
+          }
+          throw error;
+        }
       },
       close: () => {
         closeTransportSocket();
@@ -229,6 +266,34 @@ export async function connectOverCdpTransport(
             }
             return;
           }
+          if (typeof id === "number") {
+            pendingTargetCommands.delete(id);
+          }
+          const method = readStringField(parsed, "method");
+          const params = asOptionalRecord(parsed.params);
+          if (trackInitializationCommands && method === "Target.attachedToTarget") {
+            const sessionId = readStringField(params, "sessionId");
+            const targetInfo = asOptionalRecord(params?.targetInfo);
+            const targetId = readStringField(targetInfo, "targetId");
+            if (
+              sessionId &&
+              targetId &&
+              targetId.length <= MAX_DIAGNOSTIC_TARGET_ID_CHARS &&
+              readStringField(targetInfo, "type") === "page"
+            ) {
+              pageTargetIdsBySession.set(sessionId, targetId);
+            }
+          } else if (trackInitializationCommands && method === "Target.detachedFromTarget") {
+            const sessionId = readStringField(params, "sessionId");
+            if (sessionId) {
+              pageTargetIdsBySession.delete(sessionId);
+              for (const [commandId, pendingSessionId] of pendingTargetCommands) {
+                if (pendingSessionId === sessionId) {
+                  pendingTargetCommands.delete(commandId);
+                }
+              }
+            }
+          }
           const contextlessParams = contextlessTargetParams(parsed);
           if (contextlessParams) {
             releaseContextlessTarget(contextlessParams);
@@ -242,9 +307,32 @@ export async function connectOverCdpTransport(
       onclose: (reason?: string) =>
         scheduleTransportClosed(closingReason ?? reason ?? "CDP socket closed"),
     });
-    return await getPlaywrightCore().chromium.connectOverCDP(transport, { timeout: opts.timeout });
+    const browser = await getPlaywrightCore().chromium.connectOverCDP(transport, {
+      timeout: opts.timeout,
+    });
+    // Target-command state diagnoses only the cold attach. Stop retaining
+    // traffic once Playwright owns a usable browser for the cached session.
+    trackInitializationCommands = false;
+    pageTargetIdsBySession.clear();
+    pendingTargetCommands.clear();
+    return browser;
   } catch (error) {
     wire.close();
+    if (isConnectTimeout(error)) {
+      // Playwright waits for every attached page to initialize. Preserve the
+      // target/session facts already observed on this transport so operators
+      // can remove only the renderer that blocked a cold connection.
+      const targetIds = [
+        ...new Set(
+          [...pendingTargetCommands.values()]
+            .map((sessionId) => pageTargetIdsBySession.get(sessionId))
+            .filter((targetId): targetId is string => Boolean(targetId)),
+        ),
+      ].slice(0, MAX_DIAGNOSTIC_TARGETS);
+      if (targetIds.length > 0) {
+        throw new UnresponsiveCdpTargetError(targetIds);
+      }
+    }
     throw error;
   }
 }
