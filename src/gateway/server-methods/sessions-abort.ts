@@ -515,10 +515,6 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
           await persistSessionAbort(yieldedParent);
         }
       } catch (error) {
-        if (failedResponse) {
-          context.logGateway.warn("sessions.abort cleanup failed after cancellation was rejected");
-          return;
-        }
         throw abortedPartialPersistenceError(error, abortWarning);
       }
     };
@@ -589,8 +585,6 @@ export const sessionAbortHandlers: GatewayRequestHandlers = {
       const result = await queuedAbort;
       if (result.ok) {
         abortWarning = result.value.warning;
-      } else {
-        failedResponse = [false, undefined, result.error];
       }
       await settleAbortPersistence(result.ok ? result.value.runIds : []);
       if (!result.ok) {

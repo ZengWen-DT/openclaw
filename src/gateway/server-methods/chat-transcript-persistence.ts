@@ -430,7 +430,7 @@ export async function persistAbortedPartials(params: {
         throw new Error(error);
       }
       warning =
-        "The run stopped, but an assistant reply could not be saved to history. Copy any visible text you want to keep before leaving this chat.";
+        "Stopped, but a reply could not be saved to history. Copy any visible text before leaving this chat.";
     }
   }
   return warning;

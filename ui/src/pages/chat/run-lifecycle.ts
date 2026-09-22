@@ -132,7 +132,7 @@ type ChatAbortRunState = SessionScopeHost & {
   lastError?: string | null;
   chatError?: string | null;
   chatRunError?: ChatRunError | null;
-  chatQueue?: readonly Pick<ChatQueueItem, "sendState" | "sendRunId">[];
+  chatQueue?: readonly ChatQueueItem[];
   lastLocalTerminalReconcile?: LocalTerminalReconcile | null;
   requestUpdate?: () => void;
   /** Reloads history and the authoritative session row. */

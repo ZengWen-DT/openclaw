@@ -32,7 +32,10 @@ import {
   abortChatRunsForSessionKeyWithPartials,
   descendantAbortError,
 } from "./chat-abort-runtime.js";
-import { withAbortedPartialPersistenceWarning } from "./chat-aborted-partial.js";
+import {
+  abortedPartialPersistenceError,
+  withAbortedPartialPersistenceWarning,
+} from "./chat-aborted-partial.js";
 import { hasRestartRecoveryTerminalRun, resolveDurableChatClaim } from "./chat-restart-recovery.js";
 import {
   ACTIVE_LEAF_CHANGED_ERROR_REASON,
@@ -515,14 +518,24 @@ export async function runChatSendPreAdmission(
       });
       // Descendant cancellation aggregates errors; preserve the admission reason.
       if (guard.failure) {
-        throw guard.failure.error;
+        throw abortedPartialPersistenceError(guard.failure.error, res.warning);
       }
     } catch (error) {
       const admissionError = guard.failure ? guard.failure.error : error;
       if (admissionError instanceof SessionMutationAuthorizationChangedError) {
-        throw admissionError;
+        throw error instanceof SessionMutationAuthorizationChangedError ? error : admissionError;
       }
-      respondChatSendAdmissionError(admissionError, respond);
+      respondChatSendAdmissionError(admissionError, (ok, payload, failure, meta) => {
+        // Classify the original admission error without discarding an attached save warning.
+        respond(
+          ok,
+          payload,
+          failure && error instanceof Error && error.cause === admissionError
+            ? { ...failure, message: error.message }
+            : failure,
+          meta,
+        );
+      });
       return false;
     }
     const error = res.unauthorized
