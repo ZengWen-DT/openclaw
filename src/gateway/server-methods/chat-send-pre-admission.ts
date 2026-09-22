@@ -525,7 +525,7 @@ export async function runChatSendPreAdmission(
       if (admissionError instanceof SessionMutationAuthorizationChangedError) {
         throw error instanceof SessionMutationAuthorizationChangedError ? error : admissionError;
       }
-      respondChatSendAdmissionError(admissionError, (ok, payload, failure, meta) => {
+      respondChatSendAdmissionError(admissionError, (ok, payload, failure) => {
         // Classify the original admission error without discarding an attached save warning.
         respond(
           ok,
@@ -533,7 +533,6 @@ export async function runChatSendPreAdmission(
           failure && error instanceof Error && error.cause === admissionError
             ? { ...failure, message: error.message }
             : failure,
-          meta,
         );
       });
       return false;
