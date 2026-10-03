@@ -1,0 +1,42 @@
+{
+  "candidate_commit": "d9071846f4711756e3b6bbaff8582a525c8d22b4",
+  "candidate_tree": "ba0e635dd9c1080fb6a1b57e601122f78e4c34b8",
+  "baseline": "de14009aa2226f27188fd599472fbec7014847b3",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 6031,
+      "sha256": "faa764d0987fd191390592cd9968188f628b3a51cadd4e7673679d4e06de4b70"
+    },
+    {
+      "path": "build-verify.mjs",
+      "bytes": 804,
+      "sha256": "eae9e723eecfb08c5ed89f8d542ac9487cc02796741633dfebf470f07cb7e213"
+    },
+    {
+      "path": "gateway-authority-fallback.mts",
+      "bytes": 11260,
+      "sha256": "a8983072ae9e1897eeff48f8a70398bc5a04f51d04d9aea7ee71deded94edd55"
+    },
+    {
+      "path": "gateway-final-loader-controls.mts",
+      "bytes": 15075,
+      "sha256": "7189c3edecaa0aece9b2d87c91a597b9d8ec1ab94b4a1742b92233164e1699ff"
+    },
+    {
+      "path": "gateway-final-readonly-routing.mts",
+      "bytes": 11663,
+      "sha256": "ac9ed9a7b96d1917880f150c27ec0048173c3eb337e14327f788e8652b63503d"
+    },
+    {
+      "path": "gateway-repro.mts",
+      "bytes": 9794,
+      "sha256": "cfa3b14d6563b41eff10c009d4355bfe2d1d4f0d4d47b0bf6e12497a5022d0de"
+    },
+    {
+      "path": "results.json",
+      "bytes": 5471,
+      "sha256": "f1498989b9928e160c07ed62565f08f84416dee43ebc68ce87840b095aa58737"
+    }
+  ]
+}

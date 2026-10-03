@@ -1,0 +1,193 @@
+{
+  "issue": "https://github.com/openclaw/openclaw/issues/161885",
+  "baseline": "de14009aa2226f27188fd599472fbec7014847b3",
+  "candidate_commit": "d9071846f4711756e3b6bbaff8582a525c8d22b4",
+  "candidate_tree": "ba0e635dd9c1080fb6a1b57e601122f78e4c34b8",
+  "publication_note": "Executed against this exact source tree as a staged delta on baseline; the API commit was created afterward. Commit metadata changed; all source blobs and the full tree are identical. Not an installed-package claim.",
+  "environment": {
+    "os": "Linux",
+    "node": "24.19.0",
+    "pnpm": "12.5.1",
+    "dependencies": "frozen pnpm-lock.yaml",
+    "model_transport": "deterministic local CLI JSONL and HTTP loopback; no commercial calls"
+  },
+  "baseline_talk": [
+    {
+      "agent": "main",
+      "cli_user_calls": 0,
+      "http_model_calls": 0,
+      "result_text": null,
+      "error_name": "ProviderAuthError"
+    },
+    {
+      "agent": "withfallback",
+      "cli_user_calls": 0,
+      "http_model_calls": 0,
+      "result_text": null,
+      "error_name": "FailoverError"
+    },
+    {
+      "agent": "direct",
+      "cli_user_calls": 0,
+      "http_model_calls": 1,
+      "result_text": "LOOPBACK_FIXTURE_ANSWER",
+      "error_name": null
+    }
+  ],
+  "final_readonly_talk": [
+    {
+      "agent": "main",
+      "scopes": [
+        "operator.read",
+        "operator.talk"
+      ],
+      "result_text": "CLI_FIXTURE_ANSWER",
+      "error_name": null
+    },
+    {
+      "agent": "withfallback",
+      "scopes": [
+        "operator.read",
+        "operator.talk"
+      ],
+      "result_text": "LOOPBACK_FIXTURE_ANSWER",
+      "error_name": null
+    },
+    {
+      "agent": "direct",
+      "scopes": [
+        "operator.read",
+        "operator.talk"
+      ],
+      "result_text": "LOOPBACK_FIXTURE_ANSWER",
+      "error_name": null
+    }
+  ],
+  "final_readonly_cli_policy": {
+    "native_tools": "none (--tools empty)",
+    "allowed_mcp_tools": [
+      "web_search",
+      "web_fetch",
+      "memory_search",
+      "memory_get",
+      "read"
+    ]
+  },
+  "final_claimed_turns": [
+    {
+      "agent": "main",
+      "turn": 0,
+      "text": "CLI_FIXTURE_ANSWER",
+      "claim_accepted": true
+    },
+    {
+      "agent": "main",
+      "turn": 1,
+      "text": "CLI_FIXTURE_ANSWER",
+      "claim_accepted": true
+    },
+    {
+      "agent": "withfallback",
+      "turn": 0,
+      "text": "LOOPBACK_FIXTURE_ANSWER",
+      "claim_accepted": true
+    },
+    {
+      "agent": "withfallback",
+      "turn": 1,
+      "text": "LOOPBACK_FIXTURE_ANSWER",
+      "claim_accepted": true
+    },
+    {
+      "agent": "direct",
+      "turn": 0,
+      "text": "LOOPBACK_FIXTURE_ANSWER",
+      "claim_accepted": true
+    },
+    {
+      "agent": "direct",
+      "turn": 1,
+      "text": "LOOPBACK_FIXTURE_ANSWER",
+      "claim_accepted": true
+    }
+  ],
+  "final_cli_steering": [
+    {
+      "kind": "cli-steering-replacement",
+      "steeringError": {
+        "name": "NotSupportedError",
+        "message": "This agent runtime cannot accept in-place voice steering"
+      },
+      "cancelled": {
+        "error": {
+          "name": "AbortError",
+          "message": "Realtime voice agent consult cancelled"
+        }
+      },
+      "replacement": {
+        "text": "CLI_FIXTURE_ANSWER"
+      }
+    }
+  ],
+  "final_transition_cancellation": [
+    {
+      "kind": "transition-cancellation",
+      "cancelled": {
+        "error": {
+          "name": "AbortError",
+          "message": "Realtime voice agent consult cancelled"
+        }
+      },
+      "transitionObserved": true,
+      "successorRequests": 0
+    }
+  ],
+  "history_scope": "Pre-consult visible human sentinel and both assistant answers retained for CLI and fallback. Direct embedded drops that sentinel on both original and candidate; not fixed here. Generated consult prompts stay hidden.",
+  "direct_cancellation": {
+    "outcome": "AbortError",
+    "upstream_closed": true,
+    "extra_assistant_answers": 0,
+    "failure_append_claim": false
+  },
+  "validation": {
+    "targeted_tests": {
+      "passed": 106,
+      "wall_seconds": 66.036
+    },
+    "build": {
+      "exit": 0,
+      "wall_seconds": 1357.726,
+      "profile": "all canonical full steps; supported tsdown concurrency 1"
+    },
+    "core_types": "pass",
+    "gateway_other_test_types": "pass",
+    "agents_other_test_types": "pass",
+    "changed_lint_format_ratchets": "pass",
+    "knip": "pass",
+    "runtime_import_cycles": 0,
+    "openai_full_lane": {
+      "passed": 1251,
+      "failed": 5,
+      "skipped": 1,
+      "files": 91,
+      "wall_seconds": 237.685,
+      "baseline_passed": 1249,
+      "baseline_failed": 5,
+      "baseline_skipped": 1
+    },
+    "global_extension_types": "exit137 memory limit; no pass claimed",
+    "formal_autoreview": "no final result; unconfirmed",
+    "independent_review": "final exact ten-file patch reviewed; no remaining actionable P0-P2"
+  },
+  "scope": "Browser Talk/native GPT-Live consult callback only; no public SDK/config/permission changes. Meeting, voice-call and FaceTime plugin consultation paths unchanged.",
+  "sanitization": "Derived observations only. Raw Gateway events, synthetic runtime grants, full argv, session identifiers, host paths and private logs excluded.",
+  "inspected_terminal_events": {
+    "method": "Separate inspection of recorded agent/lifecycle events, not an assertion inside the Gateway fixture",
+    "runs": 10,
+    "per_run": 1,
+    "phases": {
+      "end": 7,
+      "error": 3
+    }
+  }
+}

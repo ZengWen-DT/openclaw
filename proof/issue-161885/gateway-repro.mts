@@ -1,0 +1,112 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import http from 'node:http';
+import { pathToFileURL } from 'node:url';
+const root = process.cwd();
+const evidence = path.resolve(root, '../issue161885-evidence');
+const source = (file: string) => import(pathToFileURL(path.join(root, file)).href);
+const home = await fs.mkdtemp(path.join(os.tmpdir(), 'issue161885-'));
+const state = path.join(home, 'state'), temp = path.join(home, 'tmp'), bin = path.join(home, 'bin'), plugin = path.join(home, 'voice-fixture');
+for (const dir of [state,temp,bin,plugin]) await fs.mkdir(dir, {recursive:true, mode:0o700});
+// This fixture receives no real account data. Only the selected Node/pnpm toolchain survives.
+const toolchain = { PATH: process.env.PATH, COREPACK_HOME: process.env.COREPACK_HOME };
+for (const key of Object.keys(process.env)) delete process.env[key];
+Object.assign(process.env, toolchain, {
+ PATH: `${bin}:${toolchain.PATH}`, HOME: home, OPENCLAW_HOME: home, OPENCLAW_STATE_DIR: state,
+ OPENCLAW_CONFIG_PATH: path.join(state,'openclaw.json'), CLAUDE_CONFIG_DIR: path.join(home,'claude'),
+ XDG_CACHE_HOME:temp, TMPDIR:temp, TMP:temp, TEMP:temp, LANG:'C.UTF-8',
+ OPENCLAW_NO_AUTO_UPDATE:'1', DO_NOT_TRACK:'1', CLAWHUB_DISABLE_TELEMETRY:'1',
+ OPENCLAW_DISABLE_BONJOUR:'1', OPENCLAW_SKIP_CHANNELS:'1', OPENCLAW_SKIP_CRON:'1',
+ OPENCLAW_SKIP_BROWSER_CONTROL_SERVER:'1', OPENCLAW_SKIP_CANVAS_HOST:'1', OPENCLAW_SKIP_GMAIL_WATCHER:'1',
+ CI:'1', FORCE_COLOR:'0', NO_COLOR:'1', GOMEMLIMIT:'2GiB',
+});
+const cliLog=path.join(home,'cli.log');
+await fs.writeFile(path.join(bin,'claude'), `#!${process.execPath}\n` + String.raw`
+const fs=require('node:fs'); const readline=require('node:readline');
+const log=(x)=>fs.appendFileSync(${JSON.stringify(cliLog)}, JSON.stringify(x)+'\n');
+if(process.argv.includes('--version')){console.log('2.1.274 (Claude Code)');process.exit(0)}
+log({kind:'launch',pid:process.pid,argv:process.argv.slice(2)});
+const send=x=>process.stdout.write(JSON.stringify(x)+'\n');
+for await (const line of readline.createInterface({input:process.stdin})) {
+ const m=JSON.parse(line);
+ if(m.type==='control_request'&&m.request.subtype==='initialize') send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{commands:[],models:[]}}});
+ if(m.type==='user') {
+  log({kind:'user',text:m.message.content,pid:process.pid});
+  const answer='CLI_FIXTURE_ANSWER';
+  send({type:'assistant',message:{role:'assistant',content:[{type:'text',text:answer}]}});
+  send({type:'result',subtype:'success',is_error:false,result:answer,session_id:'11111111-2222-4333-8444-555555555555',usage:{input_tokens:1,output_tokens:1}});
+ }
+}
+`.replace('const fs=require', "const fs=require").replace('for await (const line', '(async()=>{for await (const line') + '\n})();\n', {mode:0o755});
+await fs.writeFile(path.join(plugin,'package.json'),JSON.stringify({name:'voice-fixture',type:'commonjs',main:'index.js',openclaw:{extensions:['./index.js'],runtimeExtensions:['./index.js']},peerDependencies:{openclaw:'>=2026.1.1'}}));
+await fs.writeFile(path.join(plugin,'openclaw.plugin.json'),JSON.stringify({id:'voice-fixture',activation:{onStartup:true},configSchema:{type:'object',additionalProperties:false,properties:{}}}));
+await fs.writeFile(path.join(plugin,'index.js'),`module.exports={id:'voice-fixture',register(api){
+ api.registerRealtimeVoiceProvider({id:'voice-fixture',label:'Synthetic Talk transport',defaultModel:'fixture',
+ capabilities:{transports:['webrtc'],inputAudioFormats:['pcm16'],outputAudioFormats:['pcm16'],supportsBrowserSession:true},
+ isConfigured:()=>true,createBridge(){throw new Error('No media fixture');},
+ async createBrowserSession(req){globalThis[Symbol.for('issue161885.voice-requests')]??=[];globalThis[Symbol.for('issue161885.voice-requests')].push(req);return {provider:'voice-fixture',transport:'webrtc',model:'fixture',clientSecret:'synthetic-no-media',offerUrl:'http://127.0.0.1/unused'};}
+ });
+}};`);
+const requests: Array<any>=[];
+const provider=http.createServer(async(req,res)=>{
+ let body='';for await(const part of req)body+=part;
+ const input=JSON.parse(body);requests.push({url:req.url,input});
+ console.log('LOOPBACK_REQUEST',req.url,input.model);
+ res.writeHead(200,{'content-type':'text/event-stream'});
+ const send=(x:any)=>res.write(`data: ${JSON.stringify(x)}\n\n`);
+ send({id:'fixture',object:'chat.completion.chunk',created:1,model:'fixture',choices:[{index:0,delta:{role:'assistant',content:'LOOPBACK_FIXTURE_ANSWER'},finish_reason:null}]});
+ send({id:'fixture',object:'chat.completion.chunk',created:1,model:'fixture',choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:1,completion_tokens:1,total_tokens:2}});
+ res.end('data: [DONE]\n\n');
+});
+await new Promise<void>(resolve=>provider.listen(0,'127.0.0.1',resolve));
+const port=(provider.address() as any).port;
+const primary='anthropic/claude-opus-5-5',fallback='loopback/fixture';
+const config={
+ gateway:{mode:'local',bind:'loopback',auth:{mode:'token',token:'synthetic-issue161885-token'},controlUi:{enabled:false}},
+ plugins:{allow:['voice-fixture','anthropic','openai'],load:{paths:[plugin]},entries:{'voice-fixture':{enabled:true},anthropic:{enabled:true},openai:{enabled:true}}},
+ agents:{ownership:'explicit',defaults:{workspace:path.join(home,'workspace'),heartbeat:{every:'0m'},model:{primary,fallbacks:[]},models:{[primary]:{agentRuntime:{id:'claude-cli'}},[fallback]:{agentRuntime:{id:'openclaw'}}}},entries:{main:{model:{primary,fallbacks:[]}},withfallback:{model:{primary,fallbacks:[fallback]}},direct:{model:{primary:fallback,fallbacks:[]}}}},
+ models:{catalogRefresh:{enabled:false},providers:{loopback:{baseUrl:`http://127.0.0.1:${port}/v1`,apiKey:'synthetic-loopback-only',api:'openai-completions',models:[{id:'fixture',name:'Fixture',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:32000,maxTokens:1000}]}}},
+ talk:{realtime:{provider:'voice-fixture',model:'fixture',providers:{'voice-fixture':{}}}},
+ cron:{enabled:false},browser:{enabled:false},update:{checkOnStart:false},telemetry:{enabled:false},logging:{file:path.join(home,'gateway.log')},
+};
+await fs.writeFile(process.env.OPENCLAW_CONFIG_PATH!,JSON.stringify(config));
+const {acquireTestPortBlock}=await source('src/test-utils/port-claims.ts');
+const claim=await acquireTestPortBlock({offsets:[0,1,2,3]});
+const {startGatewayServer}=await source('src/gateway/server.ts');
+const {GatewayClient}=await source('src/gateway/client.ts');
+let server:any,client:any;
+const results:any[]=[];
+const events:any[]=[];
+const cliRows=async()=>{try{return (await fs.readFile(cliLog,'utf8')).trim().split('\n').filter(Boolean).map(x=>JSON.parse(x));}catch{return [];}};
+try{
+ await claim.release();
+ server=await startGatewayServer(claim.port,{bind:'loopback',auth:{mode:'token',token:'synthetic-issue161885-token'},controlUiEnabled:false});
+ client=await new Promise((resolve,reject)=>{const c=new GatewayClient({url:`ws://127.0.0.1:${claim.port}`,token:'synthetic-issue161885-token',clientName:'test',mode:'test',clientVersion:'repro',platform:'linux',role:'operator',scopes:['operator.admin','operator.read','operator.write','operator.talk'],onHelloOk:()=>resolve(c),onConnectError:reject,onEvent:(e:any)=>events.push(e)});c.start();});
+ console.log('GATEWAY_READY');
+ for(const agent of ['main','withfallback','direct']) {
+  const sessionKey=`agent:${agent}:talk-proof`;
+  const created=await client.request('talk.client.create',{sessionKey,provider:'voice-fixture',model:'fixture',transport:'webrtc'});
+  const req=(globalThis as any)[Symbol.for('issue161885.voice-requests')].at(-1);
+  assert.equal(typeof req.runAgentConsult,'function');
+  const beforeCli=(await cliRows()).filter(x=>x.kind==='user').length,beforeProvider=requests.length;
+  const start=Date.now(); let result:any,error:any;
+  try{result=await req.runAgentConsult({prompt:`Return a concise answer for ${agent}.`,signal:AbortSignal.timeout(45000)});}catch(e:any){error={name:e.name,message:e.message,stack:e.stack};}
+  const row={kind:'talk',agent,sessionKey,elapsedMs:Date.now()-start,result,error,cliCalls:(await cliRows()).filter(x=>x.kind==='user').length-beforeCli,providerCalls:requests.length-beforeProvider};
+  results.push(row);console.log('CASE',JSON.stringify(row));
+  const history=await client.request('chat.history',{sessionKey,limit:30});results.push({kind:'history',agent,history});
+  await client.request('talk.client.close',{sessionKey,voiceSessionId:created.voiceSessionId});
+ }
+ const started=await client.request('agent',{sessionKey:'agent:main:normal-proof',message:'Return one concise answer.',idempotencyKey:'issue161885-normal-control',deliver:false,timeout:30,cleanupBundleMcpOnRunEnd:true});
+ console.log('NORMAL_ACCEPTED',JSON.stringify(started));
+ const waited=await client.request('agent.wait',{runId:started.runId,timeoutMs:45000});results.push({kind:'normal',started,waited});console.log('NORMAL_RESULT',JSON.stringify(waited));
+ results.push({kind:'normal-history',history:await client.request('chat.history',{sessionKey:'agent:main:normal-proof',limit:30})});
+}finally{
+ await fs.writeFile(path.join(evidence,'repro-results.json'),JSON.stringify({home,head:'de14009aa2226f27188fd599472fbec7014847b3',results,cli:await cliRows(),requests,events},null,2));
+ client?.stop();if(server)await server.close({reason:'isolated fixture finished',restartExpectedMs:null});
+ await new Promise<void>(resolve=>provider.close(()=>resolve()));
+ await fs.copyFile(path.join(home,'gateway.log'),path.join(evidence,'gateway-runtime.log')).catch(()=>{});
+ await fs.writeFile(path.join(evidence,'fixture-home.txt'),home+'\n');
+ console.log('FIXTURE_CLOSED',home);
+}
