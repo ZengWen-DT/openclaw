@@ -1,0 +1,71 @@
+name: PR 153765 rebased Chromium proof
+
+on:
+  push:
+    branches: [proof/153765-rebase-20261003]
+
+permissions:
+  contents: read
+
+jobs:
+  chromium:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      OPENCLAW_VITEST_MAX_WORKERS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: be801ffb6e32ddb31905406c2533e93552414042
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+      - name: Install pinned dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+      - name: Verify exact production revision
+        run: |
+          mkdir -p proof-logs
+          {
+            test "$(git rev-parse HEAD)" = "be801ffb6e32ddb31905406c2533e93552414042"
+            git rev-parse HEAD
+            git rev-parse HEAD^{tree}
+            git diff --exit-code
+            node --version
+            pnpm --version
+          } | tee proof-logs/revision.log
+      - name: Check formatting
+        run: >-
+          pnpm exec oxfmt --check
+          extensions/browser/src/browser/pw-session-cdp-transport.ts
+          extensions/browser/src/browser/pw-session-connection.ts
+          extensions/browser/src/browser/pw-session-cdp-transport.test-support.ts
+          extensions/browser/src/browser/pw-session.connection.test-support.ts
+          extensions/browser/src/browser/pw-session-cdp-transport.test.ts
+          extensions/browser/src/browser/pw-session-unresponsive-target.test.ts
+          extensions/browser/src/browser/pw-session-cold-connect.chromium.test.ts
+      - name: Install real Chromium
+        run: node --import ./scripts/tsx.mjs scripts/ensure-playwright-chromium.mts --require-playwright-chromium
+      - name: Run transport, engine, and blocked-renderer proof
+        env:
+          OPENCLAW_BROWSER_COLD_CONNECT_E2E: "1"
+        run: |
+          TIMEFORMAT='WALL_SECONDS=%R'
+          {
+            time pnpm test \
+              extensions/browser/src/browser/pw-session-cdp-transport.test.ts \
+              extensions/browser/src/browser/pw-session-unresponsive-target.test.ts \
+              extensions/browser/src/browser/pw-session.pinned-transport.test.ts \
+              extensions/browser/src/browser/pw-session.connections.test.ts \
+              extensions/browser/src/browser/lightpanda-cdp.test.ts \
+              extensions/browser/src/browser/pw-session-cold-connect.chromium.test.ts
+          } 2>&1 | tee proof-logs/test.log
+      - name: Upload current-head proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr153765-be801ffb-proof
+          path: proof-logs/
+          retention-days: 14
