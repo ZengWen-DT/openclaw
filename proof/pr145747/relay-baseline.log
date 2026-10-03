@@ -1,0 +1,199 @@
+{
+  "proof": "synthetic authenticated NIP-42 WebSocket relay; no hosted Buzz service",
+  "entrypoint": "buildThreadingToolContext -> runMessageAction -> Buzz outbound adapter -> sendBuzzTextOneShot -> signed relay publication",
+  "variant": "unmodified-main",
+  "channelSha256": "a5ee1f12462ea5d85e9aed4918dd3fe55946fafc417ba4114284f216e031683c",
+  "generatedIdentitiesOnly": true,
+  "authenticatedConnections": 8,
+  "acceptedMessages": 6,
+  "results": [
+    {
+      "scenario": "implicit-mid-thread",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "child",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        false,
+        "invalid: root tag does not match thread ancestry"
+      ],
+      "resultKind": "error",
+      "error": "invalid: root tag does not match thread ancestry",
+      "ambientThread": null
+    },
+    {
+      "scenario": "canonical-uppercase-room",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": null
+    },
+    {
+      "scenario": "different-room",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-b"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": null
+    },
+    {
+      "scenario": "explicit-child",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "child",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        false,
+        "invalid: root tag does not match thread ancestry"
+      ],
+      "resultKind": "error",
+      "error": "invalid: root tag does not match thread ancestry",
+      "ambientThread": null
+    },
+    {
+      "scenario": "explicit-root",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "root",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": null
+    },
+    {
+      "scenario": "top-level",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": null
+    },
+    {
+      "scenario": "null-thread-opt-out",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": null
+    },
+    {
+      "scenario": "root-trigger",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "root",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": null
+    }
+  ]
+}
+BUZZ_BASELINE_REJECTION_CONFIRMED
+real 22.14
+user 15.77
+sys 1.65

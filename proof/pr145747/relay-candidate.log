@@ -1,0 +1,211 @@
+{
+  "proof": "synthetic authenticated NIP-42 WebSocket relay; no hosted Buzz service",
+  "entrypoint": "buildThreadingToolContext -> runMessageAction -> Buzz outbound adapter -> sendBuzzTextOneShot -> signed relay publication",
+  "variant": "candidate",
+  "channelSha256": "3fbe7df6880613b053eac02439d68f8ee6cf38e11c978f2c6e2df9ca4b8bc2ba",
+  "generatedIdentitiesOnly": true,
+  "authenticatedConnections": 8,
+  "acceptedMessages": 8,
+  "results": [
+    {
+      "scenario": "implicit-mid-thread",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "root",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": "root"
+    },
+    {
+      "scenario": "canonical-uppercase-room",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "root",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": "root"
+    },
+    {
+      "scenario": "different-room",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-b"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": "root"
+    },
+    {
+      "scenario": "explicit-child",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "root",
+          "",
+          "root"
+        ],
+        [
+          "e",
+          "child",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": "root"
+    },
+    {
+      "scenario": "explicit-root",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "root",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": "root"
+    },
+    {
+      "scenario": "top-level",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": "root"
+    },
+    {
+      "scenario": "null-thread-opt-out",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": "root"
+    },
+    {
+      "scenario": "root-trigger",
+      "authenticated": true,
+      "signatureValid": true,
+      "tags": [
+        [
+          "h",
+          "room-a"
+        ],
+        [
+          "e",
+          "root",
+          "",
+          "reply"
+        ]
+      ],
+      "response": [
+        "OK",
+        "<signed-event-id>",
+        true,
+        ""
+      ],
+      "resultKind": "send",
+      "error": null,
+      "ambientThread": null
+    }
+  ]
+}
+BUZZ_SHARED_DISPATCH_RELAY_PROOF_GREEN
+real 22.59
+user 15.71
+sys 1.79
