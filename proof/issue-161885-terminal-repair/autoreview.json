@@ -1,0 +1,26 @@
+{
+  "findings": [],
+  "overall_correctness": "patch is correct",
+  "overall_explanation": "No actionable P0\u2013P2 defects were established in the staged change. Preflight is covered by the terminal backstop; CLI and embedded candidates share the admitted fallback and lifecycle owners; steering distinguishes non-steerable admissions from stale authority; cancellation and replacement preserve settlement ordering. Generated prompts retain hidden transcript custody. Current evidence reports 180 passing tests and guards. The prior 697-test run, full-build steps and scoped Gateway replay concern identical production blobs on the prior tree, not validation of the current upstream composition. Actual browser/provider append effects remain unproven, and the direct-route human-sentinel disappearance lacks a baseline comparison establishing a regression from this patch.",
+  "overall_confidence": 0.88,
+  "provider_report": {
+    "findings": [],
+    "overall_correctness": "patch is correct",
+    "overall_explanation": "No actionable P0\u2013P2 defects were established in the staged change. Preflight is covered by the terminal backstop; CLI and embedded candidates share the admitted fallback and lifecycle owners; steering distinguishes non-steerable admissions from stale authority; cancellation and replacement preserve settlement ordering. Generated prompts retain hidden transcript custody. Current evidence reports 180 passing tests and guards. The prior 697-test run, full-build steps and scoped Gateway replay concern identical production blobs on the prior tree, not validation of the current upstream composition. Actual browser/provider append effects remain unproven, and the direct-route human-sentinel disappearance lacks a baseline comparison establishing a regression from this patch.",
+    "overall_confidence": 0.88
+  },
+  "usage": {
+    "attempts": 1,
+    "reported_attempts": 1,
+    "unknown_attempts": 0,
+    "partial_attempts": 0,
+    "complete": true,
+    "tokens": {
+      "input_tokens": 856454,
+      "cached_input_tokens": 770304,
+      "output_tokens": 5193,
+      "reasoning_output_tokens": 2593
+    }
+  },
+  "review_status": "scoped-clean"
+}

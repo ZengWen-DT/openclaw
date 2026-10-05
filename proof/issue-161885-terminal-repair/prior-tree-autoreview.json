@@ -1,0 +1,13 @@
+{
+  "findings": [],
+  "overall_correctness": "patch is correct",
+  "overall_explanation": "No actionable P0\u2013P2 defect is established by the diff and supplied evidence. The scoped tests and sanitized runtime record support per-candidate CLI routing, fallback, single terminal ownership, cancellation, and hidden generated prompts. The direct-route fixture loses a previously visible user message, but the evidence lacks a pre-change comparison or a demonstrated cause in this patch. Full global checks and live microphone/provider behavior remain unproven.",
+  "overall_confidence": 0.76,
+  "provider_report": {
+    "findings": [],
+    "overall_correctness": "patch is correct",
+    "overall_explanation": "No actionable P0\u2013P2 defect is established by the diff and supplied evidence. The scoped tests and sanitized runtime record support per-candidate CLI routing, fallback, single terminal ownership, cancellation, and hidden generated prompts. The direct-route fixture loses a previously visible user message, but the evidence lacks a pre-change comparison or a demonstrated cause in this patch. Full global checks and live microphone/provider behavior remain unproven.",
+    "overall_confidence": 0.76
+  },
+  "review_status": "scoped-clean"
+}

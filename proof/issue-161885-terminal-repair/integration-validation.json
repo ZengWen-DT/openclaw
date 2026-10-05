@@ -1,0 +1,202 @@
+{
+  "base": "8dbf0538e72f7ca09504640dcf80ef089f4550f9",
+  "tree": "cee305578f2ee173f1136930713f86a9e20fdfb8",
+  "prior_reviewed_tree": "61d9f1df2cc6b2d313609d49564c897bdc5e977e",
+  "baseline_resolution": "Current main minus exactly the four existing retired Talk mock entries; all other upstream bytes preserved.",
+  "baseline_blob": "f1daa97ae009b30911349c068a00174ab2c8e883",
+  "production_blob_equivalence": {
+    "extensions/openai/realtime-quicksilver-delegation-controller.ts": true,
+    "src/agents/embedded-agent-runner/runs.completion.ts": true,
+    "src/agents/embedded-agent-runner/runs.ts": true,
+    "src/gateway/talk/agent-consult-execution.ts": true,
+    "src/gateway/talk/client-agent-consult.ts": true
+  },
+  "changed_paths": [
+    "config/test-mock-exports-baseline.txt",
+    "extensions/openai/realtime-quicksilver-delegation-controller.ts",
+    "extensions/openai/realtime-quicksilver-delegation.test.ts",
+    "src/agents/embedded-agent-runner/runs.completion.ts",
+    "src/agents/embedded-agent-runner/runs.test.ts",
+    "src/agents/embedded-agent-runner/runs.ts",
+    "src/gateway/talk/agent-consult-execution.ts",
+    "src/gateway/talk/client-agent-consult.routing.test.ts",
+    "src/gateway/talk/client-agent-consult.ts",
+    "src/gateway/talk/client-gateway-control.agent-consult.retry-context.test.ts",
+    "src/gateway/talk/client-gateway-control.agent-consult.test.ts",
+    "src/gateway/talk/client-gateway-control.agent-import-failure.test.ts",
+    "src/gateway/talk/handlers/client-native-actions.test.ts",
+    "src/gateway/talk/handlers/client-native-control.test-support.ts",
+    "src/gateway/talk/handlers/client-native-control.test.ts",
+    "src/gateway/talk/handlers/client-native-readiness.test.ts",
+    "src/gateway/test/talk-client-agent-consult.requester-final.test.ts",
+    "test/vitest/vitest.gateway-server-paths.mjs"
+  ],
+  "patch_sha256": "d9ea14ca5cee55f21a7a373c54eb661bdeeb5839b37de0bf65f7703a24ac692d",
+  "files": [
+    {
+      "path": "config/test-mock-exports-baseline.txt",
+      "mode": "100644",
+      "blob": "f1daa97ae009b30911349c068a00174ab2c8e883",
+      "bytes": 1659611,
+      "sha256": "5b505e9fd7636899e89ba64d7c9f4e11b68f39071cc12914c79a5d9419ca1dfe"
+    },
+    {
+      "path": "extensions/openai/realtime-quicksilver-delegation-controller.ts",
+      "mode": "100644",
+      "blob": "0177b14272751fb89edd6bc9498aab9f98e208ea",
+      "bytes": 20641,
+      "sha256": "7696a3068282ac980b9b2e49bf8bdc6030181569b5091934fa2d50d9a761437d"
+    },
+    {
+      "path": "extensions/openai/realtime-quicksilver-delegation.test.ts",
+      "mode": "100644",
+      "blob": "a88402b6d94e91d8750ae43f2b4a93bc4d8cdf12",
+      "bytes": 37470,
+      "sha256": "e4330ff27ea25c24d8f221322c0f86cef53974d6bab16bfaa216c3492a7dd01f"
+    },
+    {
+      "path": "src/agents/embedded-agent-runner/runs.completion.ts",
+      "mode": "100644",
+      "blob": "d11f981216c865312b37482fdd9b2700f6956706",
+      "bytes": 4171,
+      "sha256": "cd8fe14341b00a0909a51539374053dfacb9170e77491ae7917430870e81123f"
+    },
+    {
+      "path": "src/agents/embedded-agent-runner/runs.test.ts",
+      "mode": "100644",
+      "blob": "0af808dc5714c33dfa894a968cbd4433dc821779",
+      "bytes": 18432,
+      "sha256": "1866f158dda427246106aad2706e941390a13b8cd3b55d1922ccc25f5a6c556e"
+    },
+    {
+      "path": "src/agents/embedded-agent-runner/runs.ts",
+      "mode": "100644",
+      "blob": "61ec18756815acaf28ceba0eedbd15e9e717caf8",
+      "bytes": 60334,
+      "sha256": "011674cde6570cdc4d2fbb19853c829dfd0920ef600791ac6a0c0dd2dcc04eb7"
+    },
+    {
+      "path": "src/gateway/talk/agent-consult-execution.ts",
+      "mode": "100644",
+      "blob": "6188fc6051f56c718752378fdadfaa3c75f231f9",
+      "bytes": 15136,
+      "sha256": "061d5ce6075a819e668b2c3c880cbc8caacc744f7ca6f0e23ced77720328e3cb"
+    },
+    {
+      "path": "src/gateway/talk/client-agent-consult.routing.test.ts",
+      "mode": "100644",
+      "blob": "f540a504db8269e80a4a5d432a45211c52ca26df",
+      "bytes": 15862,
+      "sha256": "4350f337687ebf0e917f099d9bc2e8eae6cc80faff0450fcd92f4a956bf86257"
+    },
+    {
+      "path": "src/gateway/talk/client-agent-consult.ts",
+      "mode": "100644",
+      "blob": "5f386df23904fa6fc0eaa5dc12b12d93c3fcd8d8",
+      "bytes": 26784,
+      "sha256": "fd1edcbf8d1444809f8fb54007102c0a97c2a928c9709d5093e860a62ffeef7a"
+    },
+    {
+      "path": "src/gateway/talk/client-gateway-control.agent-consult.retry-context.test.ts",
+      "mode": "100644",
+      "blob": "9049faf39efc619e656b304253e31005545ae024",
+      "bytes": 4401,
+      "sha256": "2ca7fe5a9c2aedbcf987d80b1c5c72a657bc3c4008282675bb7ca8d16b09c332"
+    },
+    {
+      "path": "src/gateway/talk/client-gateway-control.agent-consult.test.ts",
+      "mode": "100644",
+      "blob": "7f6f8fcfec568d651bbef6520debb3acc2360807",
+      "bytes": 36678,
+      "sha256": "be9c78c909b7c4d9e0fa56c54c5be297ef6918a29b17efc61d2e8fa990d8d412"
+    },
+    {
+      "path": "src/gateway/talk/client-gateway-control.agent-import-failure.test.ts",
+      "mode": "100644",
+      "blob": "2eea9580edfe55e2c4277573442fadfd327cd9d4",
+      "bytes": 2140,
+      "sha256": "d1949c2c3d1acabb28e94c645f28b1b822e4226c590cf71e9e0ee7c5b5511068"
+    },
+    {
+      "path": "src/gateway/talk/handlers/client-native-actions.test.ts",
+      "mode": "100644",
+      "blob": "4e37bb1f072c0966265989a05231cf03ae01e611",
+      "bytes": 43040,
+      "sha256": "e08ec4eefed14e211d3142f5eb1a979c5e04b56c54857bc19fd2cffb5f98343c"
+    },
+    {
+      "path": "src/gateway/talk/handlers/client-native-control.test-support.ts",
+      "mode": "100644",
+      "blob": "a5b7fa8d59f64ecbfc6789fc7edb76f6384a782a",
+      "bytes": 28620,
+      "sha256": "472d891215f65f77671ec394f010a3f690d4b88cbf8f2f420e02345a7e470f82"
+    },
+    {
+      "path": "src/gateway/talk/handlers/client-native-control.test.ts",
+      "mode": "100644",
+      "blob": "595c671b1c529fe76619c579433ca84527879203",
+      "bytes": 17005,
+      "sha256": "8763e5089ad90814efa2d5a5a0ed58b0e47b3a2e344660348a44fdbf5e7f058f"
+    },
+    {
+      "path": "src/gateway/talk/handlers/client-native-readiness.test.ts",
+      "mode": "100644",
+      "blob": "370e7a68fa9c5d04d925eecbe3da9ad065bf36db",
+      "bytes": 3444,
+      "sha256": "8529ba6c9bdf6a6136200a53e5dac5879c7eff6627b76200a696860e8d7204fe"
+    },
+    {
+      "path": "src/gateway/test/talk-client-agent-consult.requester-final.test.ts",
+      "mode": "100644",
+      "blob": "5d6a095516a861d8bbf12f4f870b2afe642ae208",
+      "bytes": 7613,
+      "sha256": "5bda28b0f3c3f59dd415149ab8ef4f0463cc9b62d64b47c7251b6b11d6447f11"
+    },
+    {
+      "path": "test/vitest/vitest.gateway-server-paths.mjs",
+      "mode": "100644",
+      "blob": "6ac92bc90cb61450b5a02694aab0729e43283883",
+      "bytes": 33296,
+      "sha256": "4faed1d74cf464a76ee39b991559b1eb22b2813779e2ed1e6ddf7ac1449ade8f"
+    }
+  ],
+  "install": {
+    "exit": 0,
+    "wall_seconds": 81.699,
+    "lock_blob": "b2573236be1aeb15879819000055d73f0b1077cd",
+    "package_manager": "pnpm12.5.1",
+    "method": "frozen lock; isolated virtual store; hardlink import from task-owned content store; old reviewed node_modules verified separate inodes"
+  },
+  "guards": {
+    "exit": 0,
+    "mock_factories": 10763,
+    "line_cap_changed_source_files": 17,
+    "max_lines_suppressions": 626
+  },
+  "tests": {
+    "exit": 0,
+    "passed": 180,
+    "files": 9,
+    "vitest_shards": 8,
+    "wall_seconds": 231.497
+  },
+  "full_current_tree_build": "not rerun",
+  "current_global_check": "not rerun",
+  "current_gateway_replay": "not rerun; prior61d9proof retained as explicitly historical product-blob-equivalent evidence",
+  "source_commit": "e7cfae3f6cb0aabe4633e82bac09c967ce8ec284",
+  "formal_review": {
+    "status": "scoped-clean",
+    "priority": "P0-P2",
+    "findings": 0,
+    "exit_code": 0,
+    "report_sha256": "45ec7d98265288b02295eefb80f5452fc28279aae760c421841702f0779fea2d",
+    "status_sha256": "a8546376b8f89714f4667c592cf5c0e92595460cdc1c1b890d5c02a414cda784",
+    "note": "An interrupted first attempt produced no validated report. One fresh canonical recovery completed successfully."
+  },
+  "latest_main_probe": {
+    "main": "b02eab15853b6471d1869f2a2cb0f135b7aefe4d",
+    "merge_exit": 0,
+    "merge_tree": "ef4faab870de994f34f0812bf0466dff0d5a161a",
+    "scope": "Textual merge simulation, not runtime or full-gate validation of that later tree."
+  }
+}

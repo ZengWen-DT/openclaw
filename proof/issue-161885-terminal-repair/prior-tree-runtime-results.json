@@ -1,0 +1,1029 @@
+{
+  "schema_version": 1,
+  "status": "scoped_checks_passed",
+  "scope": "Isolated real source Gateway with actual host-injected consultation callback, deterministic local CLI JSONL executable, and HTTP loopback model fixture; synthetic Talk media offer is nonfunctional",
+  "expected_source_head": "3c0f7e4c5cdade301b896970c9afbf4ab253de5e",
+  "expected_source_tree": "61d9f1df2cc6b2d313609d49564c897bdc5e977e",
+  "publication_readiness": "Not decided by this extractor; reconcile scoped checks, unproven fields, complete host logs, source/build provenance, and separately recorded regression/gate results",
+  "provenance": {
+    "inputs": {
+      "readonly": {
+        "result_sha256": "cda0175892d79114f4fce3c5cef298f160f77d1e66de32ae5f389ef3b56b3fc5",
+        "harness_sha256": "32e7a754c43071eff00462d578990cb6085fc54dd7ee14f308a23e5f9e1f123e",
+        "recorded_head_matches_expected": true,
+        "recorded_tree_matches_expected": true,
+        "host_command_exit_code": 0,
+        "host_exit_receipt_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+        "host_log_sha256": "38dfb167c1856edc3c8d5a904e4389c5d1f901e6c93872593116a4c2cde89ec5",
+        "fixture_closed_marker_count": 1,
+        "owned_idle_children_signaled_on_cleanup": [
+          4
+        ],
+        "gateway_clean_shutdown_marker_count": 1,
+        "cleanup_evidence_scope": "Original fixture host checked each recorded PID's exact fixture command path before SIGTERM. No child-exit join or global reaping assertion; later process-namespace continuity was not established.",
+        "elapsed_seconds_recorded": 108.9
+      },
+      "controls": {
+        "result_sha256": "e7fa25d8df308a10b65a15b28bc97be0a074f06abd113d62ad8da5caf6aed74d",
+        "harness_sha256": "d7e9449aa04fb316f9c5d23eee46d25bcd6019ab8e740966b8e59752d076627f",
+        "recorded_head_matches_expected": true,
+        "recorded_tree_matches_expected": true,
+        "host_command_exit_code": 0,
+        "host_exit_receipt_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+        "host_log_sha256": "41dd5ae5efb91c5d76871db81d95be6b61759b4bb0a7a0dd5ed48c83396b40f8",
+        "fixture_closed_marker_count": 1,
+        "owned_idle_children_signaled_on_cleanup": [
+          2
+        ],
+        "gateway_clean_shutdown_marker_count": 1,
+        "cleanup_evidence_scope": "Original fixture host checked each recorded PID's exact fixture command path before SIGTERM. No child-exit join or global reaping assertion; later process-namespace continuity was not established.",
+        "elapsed_seconds_recorded": 93.98
+      }
+    },
+    "post_run_state": {
+      "supplied": true,
+      "expected_head_match": true,
+      "expected_tree_match": true,
+      "tracked_worktree_clean": true,
+      "untracked_files_reported_absent": true,
+      "receipt_sha256": "9f80f319e94a0f2419ab37054e6445b263176c8a5f900dddfff6cfdccaa5f6d8",
+      "method": "Caller-supplied post-run observation; extractor does not access checkout or Git index"
+    },
+    "extractor_sha256": "52fa44351eac31d07a23262213e2b0f1a6ad475bd121d84f4777c2861a3b2c11",
+    "not_a_committed_head_claim": true
+  },
+  "observed": {
+    "readonly_talk": [
+      {
+        "agent": "main",
+        "expected_fixture_answer_observed": true,
+        "error_name": null,
+        "restricted_scopes_recorded": true,
+        "history": {
+          "available": true,
+          "visible_message_count": 1,
+          "visible_user_count": 0,
+          "visible_assistant_count": 1,
+          "human_sentinel_user_count": 0,
+          "cli_assistant_answer_count": 1,
+          "loopback_assistant_answer_count": 0,
+          "visible_generated_consult_user_count": 0
+        }
+      },
+      {
+        "agent": "withfallback",
+        "expected_fixture_answer_observed": true,
+        "error_name": null,
+        "restricted_scopes_recorded": true,
+        "history": {
+          "available": true,
+          "visible_message_count": 1,
+          "visible_user_count": 0,
+          "visible_assistant_count": 1,
+          "human_sentinel_user_count": 0,
+          "cli_assistant_answer_count": 0,
+          "loopback_assistant_answer_count": 1,
+          "visible_generated_consult_user_count": 0
+        }
+      },
+      {
+        "agent": "direct",
+        "expected_fixture_answer_observed": true,
+        "error_name": null,
+        "restricted_scopes_recorded": true,
+        "history": {
+          "available": true,
+          "visible_message_count": 1,
+          "visible_user_count": 0,
+          "visible_assistant_count": 1,
+          "human_sentinel_user_count": 0,
+          "cli_assistant_answer_count": 0,
+          "loopback_assistant_answer_count": 1,
+          "visible_generated_consult_user_count": 0
+        }
+      }
+    ],
+    "ordinary_writer_controls": [
+      {
+        "kind": "normal",
+        "wait_status_ok": true
+      },
+      {
+        "kind": "normal-fallback",
+        "wait_status_ok": true
+      }
+    ],
+    "readonly_cli_launch_policy": {
+      "mapping_basis": "first two of exactly four JSONL launches, using fixed sequential fixture order; launch-policy observation, not attempted tool-call enforcement",
+      "launches": [
+        {
+          "launch_ordinal": 1,
+          "native_tools_explicitly_empty": true,
+          "allowed_mcp_tool_names": [
+            "memory_get",
+            "memory_search",
+            "read",
+            "web_fetch",
+            "web_search"
+          ],
+          "other_allowed_tool_count": 0,
+          "wildcard_observed": false,
+          "exact_expected_readonly_mcp_policy": true,
+          "reduced_launch_policy_observed": true
+        },
+        {
+          "launch_ordinal": 2,
+          "native_tools_explicitly_empty": true,
+          "allowed_mcp_tool_names": [
+            "memory_get",
+            "memory_search",
+            "read",
+            "web_fetch",
+            "web_search"
+          ],
+          "other_allowed_tool_count": 0,
+          "wildcard_observed": false,
+          "exact_expected_readonly_mcp_policy": true,
+          "reduced_launch_policy_observed": true
+        },
+        {
+          "launch_ordinal": 3,
+          "native_tools_explicitly_empty": false,
+          "allowed_mcp_tool_names": [],
+          "other_allowed_tool_count": 1,
+          "wildcard_observed": true,
+          "exact_expected_readonly_mcp_policy": false,
+          "reduced_launch_policy_observed": false
+        },
+        {
+          "launch_ordinal": 4,
+          "native_tools_explicitly_empty": false,
+          "allowed_mcp_tool_names": [],
+          "other_allowed_tool_count": 1,
+          "wildcard_observed": true,
+          "exact_expected_readonly_mcp_policy": false,
+          "reduced_launch_policy_observed": false
+        }
+      ]
+    },
+    "adopted_claim_turns": [
+      {
+        "agent": "main",
+        "turn": 0,
+        "answer_and_first_claim_observed": true
+      },
+      {
+        "agent": "main",
+        "turn": 1,
+        "answer_and_first_claim_observed": true
+      },
+      {
+        "agent": "withfallback",
+        "turn": 0,
+        "answer_and_first_claim_observed": true
+      },
+      {
+        "agent": "withfallback",
+        "turn": 1,
+        "answer_and_first_claim_observed": true
+      },
+      {
+        "agent": "direct",
+        "turn": 0,
+        "answer_and_first_claim_observed": true
+      },
+      {
+        "agent": "direct",
+        "turn": 1,
+        "answer_and_first_claim_observed": true
+      }
+    ],
+    "history": [
+      {
+        "agent": "main",
+        "before": {
+          "available": true,
+          "visible_message_count": 1,
+          "visible_user_count": 1,
+          "visible_assistant_count": 0,
+          "human_sentinel_user_count": 1,
+          "cli_assistant_answer_count": 0,
+          "loopback_assistant_answer_count": 0,
+          "visible_generated_consult_user_count": 0
+        },
+        "after_two_turns": {
+          "available": true,
+          "visible_message_count": 3,
+          "visible_user_count": 1,
+          "visible_assistant_count": 2,
+          "human_sentinel_user_count": 1,
+          "cli_assistant_answer_count": 2,
+          "loopback_assistant_answer_count": 0,
+          "visible_generated_consult_user_count": 0
+        },
+        "direct_sentinel_regression_gate": null
+      },
+      {
+        "agent": "withfallback",
+        "before": {
+          "available": true,
+          "visible_message_count": 1,
+          "visible_user_count": 1,
+          "visible_assistant_count": 0,
+          "human_sentinel_user_count": 1,
+          "cli_assistant_answer_count": 0,
+          "loopback_assistant_answer_count": 0,
+          "visible_generated_consult_user_count": 0
+        },
+        "after_two_turns": {
+          "available": true,
+          "visible_message_count": 3,
+          "visible_user_count": 1,
+          "visible_assistant_count": 2,
+          "human_sentinel_user_count": 1,
+          "cli_assistant_answer_count": 0,
+          "loopback_assistant_answer_count": 2,
+          "visible_generated_consult_user_count": 0
+        },
+        "direct_sentinel_regression_gate": null
+      },
+      {
+        "agent": "direct",
+        "before": {
+          "available": true,
+          "visible_message_count": 1,
+          "visible_user_count": 1,
+          "visible_assistant_count": 0,
+          "human_sentinel_user_count": 1,
+          "cli_assistant_answer_count": 0,
+          "loopback_assistant_answer_count": 0,
+          "visible_generated_consult_user_count": 0
+        },
+        "after_two_turns": {
+          "available": true,
+          "visible_message_count": 2,
+          "visible_user_count": 0,
+          "visible_assistant_count": 2,
+          "human_sentinel_user_count": 0,
+          "cli_assistant_answer_count": 0,
+          "loopback_assistant_answer_count": 2,
+          "visible_generated_consult_user_count": 0
+        },
+        "direct_sentinel_regression_gate": "not asserted; report this observation without claiming a fresh baseline comparison"
+      }
+    ],
+    "cli_steering_cancel_replacement": {
+      "recorded_contract_satisfied": true
+    },
+    "candidate_boundary_cancellation": {
+      "recorded_contract_satisfied": true,
+      "successor_http_requests": 0,
+      "scope": "same configured CLI-to-HTTP fallback boundary exercised once"
+    },
+    "direct_cancellation": {
+      "recorded_contract_satisfied": true,
+      "history": {
+        "available": true,
+        "visible_message_count": 2,
+        "visible_user_count": 0,
+        "visible_assistant_count": 2,
+        "human_sentinel_user_count": 0,
+        "cli_assistant_answer_count": 0,
+        "loopback_assistant_answer_count": 2,
+        "visible_generated_consult_user_count": 0
+      },
+      "upstream_close_awaited_before_record": true
+    },
+    "terminal_events": {
+      "readonly": {
+        "scope": "Recorded Gateway agent/lifecycle events before fixture result snapshot; raw run/session IDs omitted",
+        "runs": [
+          {
+            "run_alias": "readonly-run-01",
+            "route": "main",
+            "phase_counts": {
+              "end": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "readonly-run-02",
+            "route": "withfallback",
+            "phase_counts": {
+              "end": 1,
+              "fallback_step": 2,
+              "finishing": 1,
+              "model": 1,
+              "start": 2
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 1
+          },
+          {
+            "run_alias": "readonly-run-03",
+            "route": "direct",
+            "phase_counts": {
+              "end": 1,
+              "finishing": 1,
+              "model": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "readonly-run-04",
+            "route": "normal-main",
+            "phase_counts": {
+              "end": 1,
+              "finishing": 1,
+              "model": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "readonly-run-05",
+            "route": "normal-fallback",
+            "phase_counts": {
+              "end": 1,
+              "fallback_step": 2,
+              "finishing": 1,
+              "model": 3,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 1
+          }
+        ],
+        "run_count": 5,
+        "malformed_lifecycle_event_count": 0
+      },
+      "controls": {
+        "scope": "Recorded Gateway agent/lifecycle events before fixture result snapshot; raw run/session IDs omitted",
+        "runs": [
+          {
+            "run_alias": "controls-run-01",
+            "route": "main",
+            "phase_counts": {
+              "end": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "controls-run-02",
+            "route": "main",
+            "phase_counts": {
+              "end": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "controls-run-03",
+            "route": "main",
+            "phase_counts": {
+              "error": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "error"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "controls-run-04",
+            "route": "main",
+            "phase_counts": {
+              "end": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "controls-run-05",
+            "route": "withfallback",
+            "phase_counts": {
+              "end": 1,
+              "fallback_step": 2,
+              "finishing": 1,
+              "model": 1,
+              "start": 2
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 1
+          },
+          {
+            "run_alias": "controls-run-06",
+            "route": "withfallback",
+            "phase_counts": {
+              "end": 1,
+              "fallback_step": 2,
+              "finishing": 1,
+              "model": 1,
+              "start": 2
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 1
+          },
+          {
+            "run_alias": "controls-run-07",
+            "route": "withfallback",
+            "phase_counts": {
+              "error": 1,
+              "fallback_step": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "error"
+            ],
+            "fallback_next_candidate_event_count": 1
+          },
+          {
+            "run_alias": "controls-run-08",
+            "route": "direct",
+            "phase_counts": {
+              "end": 1,
+              "finishing": 1,
+              "model": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "controls-run-09",
+            "route": "direct",
+            "phase_counts": {
+              "end": 1,
+              "finishing": 1,
+              "model": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "end"
+            ],
+            "fallback_next_candidate_event_count": 0
+          },
+          {
+            "run_alias": "controls-run-10",
+            "route": "direct",
+            "phase_counts": {
+              "error": 1,
+              "model": 1,
+              "start": 1
+            },
+            "other_phase_count": 0,
+            "terminal_count": 1,
+            "terminal_phases": [
+              "error"
+            ],
+            "fallback_next_candidate_event_count": 0
+          }
+        ],
+        "run_count": 10,
+        "malformed_lifecycle_event_count": 0
+      }
+    }
+  },
+  "harness_assertions_not_independently_recorded": [
+    "Each of six repeated adopted successful turns refuses a second claimAppend; requires unchanged harness and successful host exit",
+    "CLI steering rejection does not itself abort its signal; later explicit cancellation rejects and denies failure claim; replacement claims once",
+    "Candidate-boundary cancellation denies failure append claim"
+  ],
+  "checks": [
+    {
+      "check": "readonly_pinned_harness",
+      "passed": true,
+      "evidence": "script_sha256"
+    },
+    {
+      "check": "readonly_source_head",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_source_tree",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_host_command_exit_zero",
+      "passed": true,
+      "evidence": "caller_supplied_host_exit_status"
+    },
+    {
+      "check": "readonly_host_exit_receipt_matches",
+      "passed": true,
+      "evidence": "host_exit_receipt"
+    },
+    {
+      "check": "readonly_one_completed_cleanup_marker",
+      "passed": true,
+      "evidence": "host_log"
+    },
+    {
+      "check": "readonly_one_clean_gateway_shutdown_marker",
+      "passed": true,
+      "evidence": "host_log"
+    },
+    {
+      "check": "controls_pinned_harness",
+      "passed": true,
+      "evidence": "script_sha256"
+    },
+    {
+      "check": "controls_source_head",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_source_tree",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_host_command_exit_zero",
+      "passed": true,
+      "evidence": "caller_supplied_host_exit_status"
+    },
+    {
+      "check": "controls_host_exit_receipt_matches",
+      "passed": true,
+      "evidence": "host_exit_receipt"
+    },
+    {
+      "check": "controls_one_completed_cleanup_marker",
+      "passed": true,
+      "evidence": "host_log"
+    },
+    {
+      "check": "controls_one_clean_gateway_shutdown_marker",
+      "passed": true,
+      "evidence": "host_log"
+    },
+    {
+      "check": "readonly_main_one_result",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_main_expected_answer",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_main_restricted_scopes",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_main_history_available",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_main_generated_prompt_hidden",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_withfallback_one_result",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_withfallback_expected_answer",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_withfallback_restricted_scopes",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_withfallback_history_available",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_withfallback_generated_prompt_hidden",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_direct_one_result",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_direct_expected_answer",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_direct_restricted_scopes",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_direct_history_available",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_direct_generated_prompt_hidden",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "normal_one_result",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "normal_wait_status_ok",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "normal-fallback_one_result",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "normal-fallback_wait_status_ok",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_exactly_four_jsonl_launches_for_ordered_policy_mapping",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_first_two_talk_launches_reduced",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_two_claimed_turns",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_turn_0_answer_and_claim",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_turn_1_answer_and_claim",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_before-history_one_snapshot",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_after-history_one_snapshot",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_initial_sentinel_visible",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_initial_answers_absent",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_two_answers_retained",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_only_two_visible_assistant_messages",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_generated_prompts_hidden",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_no_other_visible_user_turns",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_human_sentinel_retained",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_two_claimed_turns",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_turn_0_answer_and_claim",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_turn_1_answer_and_claim",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_before-history_one_snapshot",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_after-history_one_snapshot",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_initial_sentinel_visible",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_initial_answers_absent",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_two_answers_retained",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_only_two_visible_assistant_messages",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_generated_prompts_hidden",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_no_other_visible_user_turns",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_human_sentinel_retained",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_two_claimed_turns",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_turn_0_answer_and_claim",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_turn_1_answer_and_claim",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_before-history_one_snapshot",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_after-history_one_snapshot",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_initial_sentinel_visible",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_initial_answers_absent",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_two_answers_retained",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_only_two_visible_assistant_messages",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_generated_prompts_hidden",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_no_other_visible_user_turns",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_cli_steering_replacement_one_result",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_cli_steering_cancel_replacement",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_candidate_boundary_cancel_no_successor",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_cancellation_and_no_failure_claim",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_cancel_no_extra_answer",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_cancel_visible_history_unchanged",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_cancel_prompt_hidden",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_five_distinct_recorded_lifecycle_runs",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_each_run_has_exactly_one_end_terminal",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_lifecycle_route_cardinality",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_no_malformed_lifecycle_events",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_ten_distinct_recorded_lifecycle_runs",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_each_run_has_exactly_one_terminal",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_lifecycle_route_cardinality",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_terminal_outcomes_seven_end_three_error",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_main_terminal_order_matches_scenarios",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_withfallback_terminal_order_matches_scenarios",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_direct_terminal_order_matches_scenarios",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_no_malformed_lifecycle_events",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_cancelled_fallback_run_has_boundary_and_one_error",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "readonly_result_arrays_well_formed",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "controls_result_arrays_well_formed",
+      "passed": true,
+      "evidence": "recorded_values"
+    },
+    {
+      "check": "post_run_identity_and_clean_worktree",
+      "passed": true,
+      "evidence": "caller_supplied_post_run_source_observation"
+    }
+  ],
+  "failed_checks": [],
+  "unproven": [
+    "Actual provider sendAppend or browser/voice assistant transcript append custody; claimAppend only proves claim acceptance, not an append side effect",
+    "Preflight-failure terminal-backstop/adopted-failure append custody; these replay scenarios do not exercise it; report production regressions separately",
+    "Live microphone, functioning WebRTC/media, commercial provider or real Claude Code integration, device, installed package, updater, release, or deployment",
+    "Reduced-tool enforcement against an attempted forbidden tool call; replay observes launch arguments only",
+    "Fresh baseline comparison on the current main base; recovered publication is prior-source evidence only",
+    "Exhaustive cancellation boundaries, fallback directions, multi-candidate/retry schedules, reconnect races, or events emitted after the saved snapshot",
+    "Joined CLI-child shutdown or global child reaping; unchanged fixtures record command-path-checked SIGTERM attempts but do not await child exits, and later process-namespace continuity was not established",
+    "Current toolchain/dependency versions, build identity, external review, full checks, or CI status unless separately established"
+  ],
+  "sanitization": "Whitelist-only derivation. No raw Gateway events, run/session identifiers, runtime grants, full argv/prompts, host paths/PIDs/ports, error messages, credentials, or raw logs included."
+}

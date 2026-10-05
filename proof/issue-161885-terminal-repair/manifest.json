@@ -1,0 +1,79 @@
+{
+  "source_commit": "e7cfae3f6cb0aabe4633e82bac09c967ce8ec284",
+  "source_tree": "cee305578f2ee173f1136930713f86a9e20fdfb8",
+  "source_parent": "8dbf0538e72f7ca09504640dcf80ef089f4550f9",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 5742,
+      "sha256": "96529ff91b0db081f7a91ea74f064878a0b4c70d58574a955fcad520fa4ec995"
+    },
+    {
+      "path": "autoreview-status.json",
+      "bytes": 487,
+      "sha256": "a8546376b8f89714f4667c592cf5c0e92595460cdc1c1b890d5c02a414cda784"
+    },
+    {
+      "path": "autoreview.json",
+      "bytes": 2178,
+      "sha256": "45ec7d98265288b02295eefb80f5452fc28279aae760c421841702f0779fea2d"
+    },
+    {
+      "path": "build-verify.mjs",
+      "bytes": 804,
+      "sha256": "eae9e723eecfb08c5ed89f8d542ac9487cc02796741633dfebf470f07cb7e213"
+    },
+    {
+      "path": "extract-runtime-evidence.py",
+      "bytes": 26841,
+      "sha256": "52fa44351eac31d07a23262213e2b0f1a6ad475bd121d84f4777c2861a3b2c11"
+    },
+    {
+      "path": "gateway-final-loader-controls.mts",
+      "bytes": 15492,
+      "sha256": "d7e9449aa04fb316f9c5d23eee46d25bcd6019ab8e740966b8e59752d076627f"
+    },
+    {
+      "path": "gateway-final-readonly-routing.mts",
+      "bytes": 12080,
+      "sha256": "32e7a754c43071eff00462d578990cb6085fc54dd7ee14f308a23e5f9e1f123e"
+    },
+    {
+      "path": "integration-validation.json",
+      "bytes": 8390,
+      "sha256": "97927adadad4acf6f621e6d6b1fabc3a5eda4d9f35504313f616f15b7b2ac152"
+    },
+    {
+      "path": "prior-tree-autoreview-status.json",
+      "bytes": 190,
+      "sha256": "4952bb808a093ec5d433d6936a6dbbf99dcfce34da03f40b988c3ac5581233e2"
+    },
+    {
+      "path": "prior-tree-autoreview.json",
+      "bytes": 1255,
+      "sha256": "8486d94253df91250fee9c621cf4c3c2a25688292e86a30182f6884a4489ea17"
+    },
+    {
+      "path": "prior-tree-runtime-results.json",
+      "bytes": 31621,
+      "sha256": "5568915582b29eafba9a5d952d36fe4cbb59e5d60b871f7160d6bedec1467f80"
+    },
+    {
+      "path": "prior-tree-source.patch",
+      "bytes": 74603,
+      "sha256": "eedec175b1b76425273c0a5e1d034c5b71200e8ca05093d4c968afa4f3809ea2"
+    },
+    {
+      "path": "prior-tree-validation.json",
+      "bytes": 6209,
+      "sha256": "b723c3cdf577fe11f124911a3e85aefe2ea41b1688a101361967512a04ca633d"
+    },
+    {
+      "path": "source.patch",
+      "bytes": 74660,
+      "sha256": "d9ea14ca5cee55f21a7a373c54eb661bdeeb5839b37de0bf65f7703a24ac692d"
+    }
+  ],
+  "manifest_self_hash_excluded": true,
+  "raw_runtime_outputs_excluded": true
+}

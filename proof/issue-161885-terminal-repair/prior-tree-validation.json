@@ -1,0 +1,193 @@
+{
+  "source_base": "3c0f7e4c5cdade301b896970c9afbf4ab253de5e",
+  "source_tree": "61d9f1df2cc6b2d313609d49564c897bdc5e977e",
+  "scope": "Browser Talk model-scoped CLI routing and terminal preflight; no live microphone/commercial provider or installed-package proof",
+  "toolchain": {
+    "node": "24.19.0",
+    "pnpm": "12.5.1",
+    "dependencies": "Frozen pnpm-lock.yaml; independent physical installation"
+  },
+  "regressions": {
+    "preflight_original": {
+      "passed": 12,
+      "failed": 3,
+      "wall_seconds": 67.571
+    },
+    "final_red_selected": {
+      "failed": 3,
+      "skipped": 12,
+      "wall_seconds": 40.011
+    },
+    "first_green": {
+      "passed": 15,
+      "wall_seconds": 45.427
+    },
+    "broader_predecessor": {
+      "tree": "65f2d4b066323d4449bd134971768fba0d7e4592",
+      "passed": 667,
+      "files": 38,
+      "wall_seconds": 547.758
+    },
+    "after_cli_contract_cleanup": {
+      "tree": "3662c05e399c714385aceba6057b578beae433af",
+      "passed": 45,
+      "files": 2,
+      "wall_seconds": 64.016
+    },
+    "final_exact_tree": {
+      "tree": "61d9f1df2cc6b2d313609d49564c897bdc5e977e",
+      "passed": 697,
+      "files": 39,
+      "vitest_shards": 5,
+      "wall_seconds": 522.763
+    }
+  },
+  "gates": {
+    "full_check": {
+      "result": "exit137",
+      "wall_seconds": 380.747,
+      "passed": "All preflight guards including104npm locks; core and UI production types",
+      "blocked": "Global extension production typing, no TypeScript diagnostic; no retry"
+    },
+    "full_build": {
+      "result": "pass",
+      "wall_seconds": 1696.478,
+      "phase_seconds": 1690,
+      "method": "Every canonical full build step; tsdown concurrency1; documented private QA mode scoped to build child; explicit supported 6144MiB heap because process cgroup limit is not visible.",
+      "initial_preflight": "Hidden-cgroup memory preflight refused in 4.739 seconds before output removal. Its raw local diagnostic log is deliberately excluded from this public bundle."
+    },
+    "fresh_gateway_replay": {
+      "readonly": {
+        "host_exit": 0,
+        "wall_seconds": 108.9
+      },
+      "controls": {
+        "host_exit": 0,
+        "wall_seconds": 93.98
+      },
+      "results": "See prior-tree-runtime-results.json; both original host exits were 0 and all 93 derived scoped evidence checks passed.",
+      "derived_report": {
+        "status": "scoped_checks_passed",
+        "sha256": "5568915582b29eafba9a5d952d36fe4cbb59e5d60b871f7160d6bedec1467f80",
+        "checks": 93,
+        "note": "Derived evidence validations, not additional software tests; no live media/provider, installed-package, current-baseline or full-gate claim."
+      }
+    },
+    "affected_test_type_graphs": {
+      "gateway-other": {
+        "result": "pass",
+        "wall_seconds": 67.31
+      },
+      "agents-other": {
+        "result": "pass",
+        "wall_seconds": 63.325
+      }
+    },
+    "full_lint": {
+      "result": "exit1",
+      "wall_seconds": 2068.935,
+      "passed_shards": [
+        "core:stripe:1",
+        "core:stripe:3",
+        "core:stripe:4",
+        "extensions:root",
+        "extensions:01",
+        "extensions:02",
+        "extensions:03",
+        "extensions:05",
+        "extensions:06",
+        "extensions:07",
+        "extensions:08",
+        "extensions:09",
+        "extensions:10",
+        "extensions:11",
+        "extensions:12",
+        "extensions:13",
+        "extensions:14",
+        "extensions:15",
+        "extensions:16",
+        "extensions:17",
+        "extensions:18",
+        "extensions:19",
+        "extensions:20",
+        "extensions:21",
+        "scripts"
+      ],
+      "failed_shards": [
+        [
+          "core:stripe:2",
+          "1"
+        ],
+        [
+          "core:stripe:5",
+          "1"
+        ],
+        [
+          "extensions:04",
+          "1"
+        ]
+      ],
+      "failure": "Each failed shard reported tsgolint child SIGKILL without a lint rule diagnostic; full lint is not a pass; final stylesheet stage was not reached."
+    },
+    "changed_core_typed_lint": {
+      "result": "pass",
+      "wall_seconds": 33.425,
+      "command": "node scripts/run-oxlint.mjs --tsconfig config/tsconfig/oxlint.core.json <all changed src TS files>"
+    },
+    "openai_package_types": {
+      "result": "pass",
+      "wall_seconds": 2.818,
+      "command": "node scripts/run-tsgo.mjs -p extensions/openai/tsconfig.json"
+    },
+    "full_format": {
+      "result": "pass",
+      "wall_seconds": 15.825,
+      "files": 47195
+    },
+    "final_affected_tests": "pass; final exact tree697tests/39files",
+    "remaining_canonical_checks": {
+      "commands": {
+        "tsgo:scripts": 0,
+        "tsgo:test:root": 137,
+        "lint:webhook:no-low-level-body-read": 0,
+        "check:no-runtime-action-load-config": 0,
+        "check:deprecated-api-usage": 0,
+        "check:wrapper-shadowing": 0,
+        "check:temp-path-guardrails": 0,
+        "lint:auth:no-pairing-store-group": 0,
+        "lint:auth:pairing-account-scope": 0,
+        "check:import-cycles": 0,
+        "lint:plugins:no-extension-test-core-imports": 0,
+        "deps:pins:check": 0,
+        "check:coercion-helpers": 0,
+        "check-deadcode-exports": 0
+      },
+      "script_types_wall_seconds": 73.98,
+      "root_types": {
+        "result": "exit137",
+        "passed": [
+          "root-tooling",
+          "root-scripts",
+          "root-e2e"
+        ],
+        "failed": "root-other; exit137 without TypeScript diagnostic",
+        "wall_seconds": 333.129
+      },
+      "dead_exports": {
+        "production": 0,
+        "full_tree": 0,
+        "scripts": 0,
+        "result": "pass",
+        "wall_seconds": 98.195
+      }
+    }
+  },
+  "formal_review": {
+    "status": "scoped-clean",
+    "priorities": "P0-P2",
+    "findings": 0,
+    "report_sha256": "8486d94253df91250fee9c621cf4c3c2a25688292e86a30182f6884a4489ea17"
+  },
+  "historical_proof": "https://github.com/ZengWen-DT/openclaw/tree/63fd7984c15074226751dc0fb2119706b77b9198/proof/issue-161885",
+  "execution_note": "The exact final source tree was executed as a staged delta on the pinned base. Publication commit metadata is created later; no metadata-only rerun claim."
+}
