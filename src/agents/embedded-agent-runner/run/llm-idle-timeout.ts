@@ -351,7 +351,7 @@ export function streamWithIdleTimeout(
           streamAbortController.signal,
           (progress) => {
             armTimer(progress);
-            if (runId && areDiagnosticsEnabledForProcess()) {
+            if (progress && runId && areDiagnosticsEnabledForProcess()) {
               markDiagnosticRunProgress({ runId, reason: "model_call:stream_progress" });
             }
           },
