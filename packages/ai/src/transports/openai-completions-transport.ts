@@ -535,11 +535,7 @@ function createManagedCompletionsClient(
         },
       }),
     );
-    return new Response(transformed, {
-      headers: response.headers,
-      status: response.status,
-      statusText: response.statusText,
-    });
+    return new Response(transformed, response);
   };
   const clientConfig = buildOpenAICompletionsClientConfig(
     model,

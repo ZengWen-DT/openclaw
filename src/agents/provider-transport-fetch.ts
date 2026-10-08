@@ -130,13 +130,9 @@ async function classifyOpenAISdkStreamBody(response: Response): Promise<OpenAISd
 }
 
 function withOpenAISdkStreamContentType(response: Response, contentType: string): Response {
-  const headers = new Headers(response.headers);
-  headers.set("content-type", contentType);
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
+  const normalized = new Response(response.body, response);
+  normalized.headers.set("content-type", contentType);
+  return normalized;
 }
 
 async function normalizeOpenAISdkStreamContentType(params: {
