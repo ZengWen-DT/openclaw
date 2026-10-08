@@ -411,7 +411,10 @@ describe("buildGuardedModelFetch", () => {
           headers: { "content-type": contentType },
         }),
       );
-      const response = await request(streaming);
+      const response = await buildGuardedModelFetch(model, undefined, { onSseComment: vi.fn() })(
+        `${model.baseUrl}/responses`,
+        streaming,
+      );
       await expect(response.body!.cancel("consumer stopped")).resolves.toBeUndefined();
       expect(cancel).toHaveBeenCalledOnce();
       expect(release).toHaveBeenCalledOnce();
@@ -553,24 +556,15 @@ describe("buildGuardedModelFetch SSE readability", () => {
     },
   );
 
-  it("reports discarded SSE comments without reporting other unreadable frames", async () => {
-    respond([": keep", 'alive\n\nevent: ping\n\ndata: {"ok": true}\n\n'], "text/event-stream");
-    const onSseComment = vi.fn();
-    const response = await buildGuardedModelFetch(completionModel, undefined, { onSseComment })(
-      url,
-      {
-        method: "POST",
-      },
-    );
-
-    await expect(response.text()).resolves.toBe('data: {"ok": true}\n\n');
-    expect(onSseComment).toHaveBeenCalledTimes(1);
-  });
-
   it.each(["sanitized", "official", "opt-out"])(
     "observes comment lines without event separators on %s streams",
     async (mode) => {
-      const chunks = ["\uFEFF: keep", "alive\r", "\n: second\n: third\r", 'data: {"ok": true}\n\n'];
+      const chunks = [
+        "\uFEFF: keep",
+        "alive\r",
+        "\n: second\n: third\r",
+        'event: ping\n\ndata: {"ok": true}\n\n',
+      ];
       respond(chunks, "text/event-stream");
       const target =
         mode === "official"
@@ -583,7 +577,7 @@ describe("buildGuardedModelFetch SSE readability", () => {
       })(`${target.baseUrl}/responses`, { method: "POST" });
 
       if (mode === "sanitized") {
-        await expect(response.text()).resolves.toBe(chunks.join("").replace(/^\uFEFF/u, ""));
+        await expect(response.text()).resolves.toBe('data: {"ok": true}\n\n');
       } else {
         expect(new Uint8Array(await response.arrayBuffer())).toEqual(
           new TextEncoder().encode(chunks.join("")),
@@ -592,29 +586,6 @@ describe("buildGuardedModelFetch SSE readability", () => {
       expect(onSseComment).toHaveBeenCalledTimes(3);
     },
   );
-
-  it("propagates cancellation through comment observation and releases the request", async () => {
-    const cancel = vi.fn();
-    const release = vi.fn(async () => {});
-    fetchWithSsrFGuardMock.mockResolvedValue({
-      response: new Response(new ReadableStream<Uint8Array>({ cancel }), {
-        headers: { "content-type": "text/event-stream" },
-      }),
-      finalUrl: url,
-      release,
-    });
-    const onSseComment = vi.fn();
-    const response = await buildGuardedModelFetch(completionModel, undefined, {
-      onSseComment,
-      sanitizeSse: false,
-    })(url, { method: "POST" });
-
-    await response.body?.cancel("caller stopped");
-
-    expect(cancel).toHaveBeenCalledWith("caller stopped");
-    expect(release).toHaveBeenCalledOnce();
-    expect(onSseComment).not.toHaveBeenCalled();
-  });
 
   it.each([
     {

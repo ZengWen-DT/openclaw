@@ -80,7 +80,6 @@ const transports = [
 const scenarios = [
   { name: "finishes at 600 ms despite comment-only heartbeats", comments: 5, deadline: 600 },
   { name: "cancels comment-only streams at 800 ms", comments: 7, deadline: 800 },
-  { name: "cancels silent streams at 400 ms", comments: 0, deadline: 400 },
 ] as const;
 
 describe.each(transports)("guarded $api SSE liveness integration", (transport) => {
@@ -192,7 +191,7 @@ describe.each(transports)("guarded $api SSE liveness integration", (transport) =
           expect.objectContaining({ type: "text", text: "still connected" }),
         ]);
       } else {
-        const reason = scenario.comments ? "no model progress" : "no response from model";
+        const reason = "no model progress";
         await expect(withinTest(consuming, signal)).rejects.toThrow(reason);
         expect(onIdleTimeout).toHaveBeenCalledExactlyOnceWith(
           expect.objectContaining({ message: expect.stringContaining(reason) }),

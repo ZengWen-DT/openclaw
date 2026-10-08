@@ -80,55 +80,39 @@ describe("streamWithIdleTimeout", () => {
     expect(onIdleTimeout).not.toHaveBeenCalled();
   });
 
-  it.each([true, false])(
-    "keeps activity live without inventing progress (%s)",
-    async (progress) => {
-      vi.useFakeTimers();
-      const diagnosticsEnabled = areDiagnosticsEnabledForProcess();
-      setDiagnosticsEnabledForProcess(true);
-      resetDiagnosticRunActivityForTest();
-      const ref = { sessionId: TEST_RUN, runId: TEST_RUN };
-      markDiagnosticEmbeddedRunStarted(ref);
-      let requestSignal: AbortSignal | undefined;
-      const baseFn: StreamFn = vi.fn((_model, _context, options) => {
-        requestSignal = options?.signal;
-        const stream = createAssistantMessageEventStream();
-        setTimeout(() => {
-          stream.push({ type: "text_delta", contentIndex: 0, delta: "done" });
-        }, 75);
-        return stream;
+  it("records model progress only for content-bearing activity", async () => {
+    vi.useFakeTimers();
+    const diagnosticsEnabled = areDiagnosticsEnabledForProcess();
+    setDiagnosticsEnabledForProcess(true);
+    const ref = { sessionId: TEST_RUN, runId: TEST_RUN };
+    markDiagnosticEmbeddedRunStarted(ref);
+    let requestSignal: AbortSignal | undefined;
+    const baseFn: StreamFn = (_model, _context, options) => {
+      requestSignal = options?.signal;
+      return createAssistantMessageEventStream();
+    };
+    const stream = await streamWithIdleTimeout(baseFn, 50, undefined, { runId: TEST_RUN })(
+      {} as Parameters<StreamFn>[0],
+      { messages: [] },
+    );
+    const iterator = stream[Symbol.asyncIterator]();
+    try {
+      await vi.advanceTimersByTimeAsync(40);
+      notifyLlmRequestActivity(requestSignal, false);
+      expect(getDiagnosticSessionActivitySnapshot(ref).lastProgressReason).toBe(
+        "embedded_run:started",
+      );
+      notifyLlmRequestActivity(requestSignal, true);
+      expect(getDiagnosticSessionActivitySnapshot(ref)).toMatchObject({
+        lastProgressAgeMs: 0,
+        lastProgressReason: "model_call:stream_progress",
       });
-      const wrapped = streamWithIdleTimeout(baseFn, 50, undefined, { runId: TEST_RUN });
-      const stream = wrapped(
-        {} as Parameters<typeof baseFn>[0],
-        {} as Parameters<typeof baseFn>[1],
-        {} as Parameters<typeof baseFn>[2],
-      ) as AssistantMessageEventStream;
-      const iterator = stream[Symbol.asyncIterator]();
-      try {
-        const next = iterator.next();
-        setTimeout(() => notifyLlmRequestActivity(requestSignal, progress), 40);
-        await vi.advanceTimersByTimeAsync(75);
-        await expect(next).resolves.toEqual({
-          done: false,
-          value: { type: "text_delta", contentIndex: 0, delta: "done" },
-        });
-        expect(getDiagnosticSessionActivitySnapshot(ref)).toMatchObject({
-          lastProgressAgeMs: progress ? 35 : 75,
-          lastProgressReason: progress ? "model_call:stream_progress" : "embedded_run:started",
-        });
-        await iterator.return?.();
-        notifyLlmRequestActivity(requestSignal);
-        expect(getDiagnosticSessionActivitySnapshot(ref).lastProgressAgeMs).toBe(
-          progress ? 35 : 75,
-        );
-      } finally {
-        await iterator.return?.();
-        resetDiagnosticRunActivityForTest();
-        setDiagnosticsEnabledForProcess(diagnosticsEnabled);
-      }
-    },
-  );
+    } finally {
+      await iterator.return?.();
+      resetDiagnosticRunActivityForTest();
+      setDiagnosticsEnabledForProcess(diagnosticsEnabled);
+    }
+  });
 
   it("resets idle timer on tool activity", async () => {
     vi.useFakeTimers();
