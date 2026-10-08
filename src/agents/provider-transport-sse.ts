@@ -151,6 +151,14 @@ export function prepareOpenAISdkSseResponse(
             controller.close();
             return;
           }
+          if (synthesizeJson) {
+            totalBytes += chunk.value.byteLength;
+            if (totalBytes > SSE_SYNTHESIZE_JSON_MAX_BYTES) {
+              throw new Error(
+                `Streaming JSON body exceeded ${SSE_SYNTHESIZE_JSON_MAX_BYTES} bytes while synthesizing SSE frames`,
+              );
+            }
+          }
           const text = decoder.decode(chunk.value, { stream: true });
           // Observe complete comment lines even without event separators. Keep only
           // line state, so an unbounded comment cannot grow observer memory.
@@ -169,14 +177,6 @@ export function prepareOpenAISdkSseResponse(
           if (!options.sanitize) {
             controller.enqueue(chunk.value);
             return;
-          }
-          if (synthesizeJson) {
-            totalBytes += chunk.value.byteLength;
-            if (totalBytes > SSE_SYNTHESIZE_JSON_MAX_BYTES) {
-              throw new Error(
-                `Streaming JSON body exceeded ${SSE_SYNTHESIZE_JSON_MAX_BYTES} bytes while synthesizing SSE frames`,
-              );
-            }
           }
           buffer += text;
         }
