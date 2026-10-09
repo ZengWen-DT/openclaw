@@ -543,7 +543,12 @@ export function createCliJsonlStreamingParser(params: CliJsonlStreamingParserOpt
         onToolResult: params.onToolResult,
       });
     }
-    if (claudeStreamJson || params.onToolUseStart || params.onToolResult) {
+    if (
+      claudeStreamJson ||
+      params.onToolUseStart ||
+      params.onToolInputDelta ||
+      params.onToolResult
+    ) {
       const onToolUseStart =
         claudeStreamJson && parsed.type === "assistant"
           ? (tool: Parameters<NonNullable<typeof params.onToolUseStart>>[0]) => {
@@ -561,6 +566,7 @@ export function createCliJsonlStreamingParser(params: CliJsonlStreamingParserOpt
         parsed,
         tracker: toolTracker,
         onToolUseStart,
+        onToolInputDelta: params.onToolInputDelta,
         onToolResult: params.onToolResult,
       });
     }
@@ -651,17 +657,21 @@ export function createCliJsonlStreamingParser(params: CliJsonlStreamingParserOpt
       }
     },
     finish() {
-      if (parseErrorText) {
-        return;
-      }
-      const tail = lineBuffer.pending;
-      lineBuffer.pending = "";
-      if (tail) {
-        handleJsonlLine(tail);
-      }
-      finishTaggedReasoningMessage();
-      if (classifyClaudeCommentary) {
-        flushPendingClaudeAssistantText();
+      try {
+        if (parseErrorText) {
+          return;
+        }
+        const tail = lineBuffer.pending;
+        lineBuffer.pending = "";
+        if (tail) {
+          handleJsonlLine(tail);
+        }
+        finishTaggedReasoningMessage();
+        if (classifyClaudeCommentary) {
+          flushPendingClaudeAssistantText();
+        }
+      } finally {
+        toolTracker.inputProgressById.clear();
       }
     },
     getErrorText() {
