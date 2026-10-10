@@ -28,8 +28,16 @@ import {
   type SessionAccessScope,
   updateSessionEntry,
 } from "../../config/sessions/session-accessor.js";
+import {
+  captureExternalSessionCommitGuard,
+  sessionEntryCommitGuardOptions,
+} from "../../config/sessions/session-source-authority.js";
 import { normalizeResolvedMaintenanceConfigInput } from "../../config/sessions/store-maintenance.js";
 import type { SessionAcpMeta, SessionEntry } from "../../config/sessions/types.js";
+import {
+  getSessionEntryAsync,
+  getSessionEntryByIdAsync,
+} from "../../plugin-sdk/session-store-runtime-internal.js";
 import {
   captureSessionInitializationOwner,
   createSessionInitialization,
@@ -79,14 +87,6 @@ function getSessionEntry(params: RuntimeSessionStoreReadParams): SessionEntry | 
   return loadSessionEntryReadOnly(toSessionAccessScope(params));
 }
 
-async function getSessionEntryAsync(
-  params: RuntimeSessionStoreReadParams,
-): Promise<SessionEntry | undefined> {
-  const { readSessionEntryReadOnlyInWorker } =
-    await import("../../config/sessions/session-entry-read-runtime.js");
-  return await readSessionEntryReadOnlyInWorker(toSessionAccessScope(params));
-}
-
 const listSessionEntries: RuntimeSession["listSessionEntries"] = (params = {}) => {
   const listEntries = params.readOnly
     ? listAccessorSessionEntriesReadOnly
@@ -108,8 +108,9 @@ const listSessionEntries: RuntimeSession["listSessionEntries"] = (params = {}) =
 
 const patchSessionEntry: RuntimeSession["patchSessionEntry"] = async (params) => {
   return await patchAccessorSessionEntry(toSessionAccessScope(params), params.update, {
-    workerGuard: {},
-    assertCommitAllowed: params.assertCommitAllowed,
+    ...sessionEntryCommitGuardOptions(
+      captureExternalSessionCommitGuard(params.assertCommitAllowed),
+    ),
     fallbackEntry: params.fallbackEntry,
     maintenanceConfig:
       params.maintenanceConfig !== undefined
@@ -480,7 +481,7 @@ async function createSessionEntry(
             {
               preserveActivity: true,
               requireWriteSuccess: true,
-              assertCommitAllowed: () => initialization?.handle.assertCurrent(),
+              ...sessionEntryCommitGuardOptions(creationOwner.assertCurrent),
             },
           );
           if (!finalized) {
@@ -699,7 +700,14 @@ export function createRuntimeAgent(): PluginRuntime["agent"] {
     createSessionEntry,
     getSessionEntry,
     getSessionEntryAsync,
+    getSessionEntryByIdAsync,
     listSessionEntries,
+    createSessionEntryListReader: async (
+      params: Parameters<RuntimeSession["createSessionEntryListReader"]>[0],
+    ) =>
+      (
+        await import("../../config/sessions/session-entry-read-runtime.js")
+      ).createSessionEntryListReader(params),
     patchSessionEntry,
     upsertSessionEntry,
     runWithWorkAdmission: runWithSessionWorkAdmission,

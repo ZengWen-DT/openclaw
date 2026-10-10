@@ -195,6 +195,16 @@ function recoveryHints(run: ReportInput, nextAction?: string): string[] {
   if (run.reason === UPDATE_FOREIGN_DESTINATION_REASON) {
     return nextAction ? [] : [`Next step: ${UPDATE_DESTINATION_RECOVERY}`];
   }
+  if (
+    run.reason === "state-migrated-no-rollback" ||
+    run.verification.rollbackOutcome?.reason === "state-migrated-no-rollback"
+  ) {
+    return nextAction
+      ? []
+      : [
+          "State may have changed during migration, so rolling back code alone is unsafe. Keep the new installation and backups; inspect openclaw update status and run openclaw doctor before recovery.",
+        ];
+  }
   const hint =
     run.reason && Object.hasOwn(FAILURE_RECOVERY_HINTS, run.reason)
       ? FAILURE_RECOVERY_HINTS[run.reason]
@@ -300,7 +310,7 @@ export function renderUpdateRunReport(
     const candidateVersion = admission.candidateVersion
       ? ` (${bounded(admission.candidateVersion, 120)})`
       : "";
-    lines.push(`Admission: ${admission.owner}${candidateVersion}.`);
+    lines.push(`Update safety checks ran in the ${admission.owner} updater${candidateVersion}.`);
     if (admission.checks?.length) {
       lines.push(
         `Admission checks: ${admission.checks.map((check) => `${bounded(check.name, 120)}: ${check.status}`).join(", ")}.`,

@@ -102,19 +102,15 @@ export function createCliJsonlStreamingParser(params: CliJsonlStreamingParserOpt
     params.onAssistantDelta({ text: assistantText, delta, sessionId, usage });
   };
 
-  const flushPendingClaudeAssistantText = () => {
+  const flushPendingClaudeText = (kind: "assistant" | "commentary") => {
     if (!pendingClaudeText) {
       return;
     }
-    const delta = pendingClaudeText;
+    const text = kind === "commentary" ? pendingClaudeText.trim() : pendingClaudeText;
     pendingClaudeText = "";
-    appendAssistantText(delta);
-  };
-
-  const flushPendingClaudeCommentaryText = () => {
-    const text = pendingClaudeText.trim();
-    pendingClaudeText = "";
-    if (text) {
+    if (kind === "assistant") {
+      appendAssistantText(text);
+    } else if (text) {
       params.onCommentaryText?.(text);
     }
   };
@@ -362,7 +358,7 @@ export function createCliJsonlStreamingParser(params: CliJsonlStreamingParserOpt
     if (parsed.type === "result") {
       finishTaggedReasoningMessage();
       if (classifyClaudeCommentary) {
-        flushPendingClaudeAssistantText();
+        flushPendingClaudeText("assistant");
       }
     }
 
@@ -500,9 +496,9 @@ export function createCliJsonlStreamingParser(params: CliJsonlStreamingParserOpt
       }
       if (classifyClaudeCommentary) {
         if (isToolUseBlockStart) {
-          flushPendingClaudeCommentaryText();
+          flushPendingClaudeText("commentary");
         } else if (evt.type === "content_block_start" || evt.type === "message_stop") {
-          flushPendingClaudeAssistantText();
+          flushPendingClaudeText("assistant");
         }
       }
     }
@@ -555,7 +551,7 @@ export function createCliJsonlStreamingParser(params: CliJsonlStreamingParserOpt
               sawToolUseSinceText = true;
               currentMessageHadToolUse = true;
               if (classifyClaudeCommentary) {
-                flushPendingClaudeCommentaryText();
+                flushPendingClaudeText("commentary");
               }
               params.onToolUseStart?.(tool);
             }
@@ -668,7 +664,7 @@ export function createCliJsonlStreamingParser(params: CliJsonlStreamingParserOpt
         }
         finishTaggedReasoningMessage();
         if (classifyClaudeCommentary) {
-          flushPendingClaudeAssistantText();
+          flushPendingClaudeText("assistant");
         }
       } finally {
         toolTracker.inputProgressById.clear();

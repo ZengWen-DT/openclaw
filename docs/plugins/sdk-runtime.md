@@ -309,13 +309,11 @@ SDK helpers that return bare results retain their resources until the owning
 host closes. Callers do not need to dispose those results; see
 [Prepared simple completions](/plugins/sdk-runtime/models#prepared-simple-completions).
 
-For a bounded, accepted persistence sequence,
-`openOpenClawAgentSqliteWorkerStore` from `openclaw/plugin-sdk/sqlite-runtime`
-accepts `retainExecutionUntilClose: true` in its worker options. The caller must
-close that store when the sequence settles, including on failure. This retains
-the existing executor between commands without holding a writer turn across
-preparation. Each command keeps its own live authority checks. Omit the option
-for cached stores whose lifetime can outlast accepted work.
+First-party bounded persistence sequences retain their original agent executor
+before asynchronous preparation and release it after publication cleanup. The
+private `sqlite-runtime` facade exposes that existing owner and its recorded
+native identity; each worker command keeps its own FIFO turn and live authority
+checks. Native maintenance and private shadow stores keep their existing owners.
 
 First-party runtime callers can use `withOpenClawAgentDatabaseRuntime` from the
 same subpath to admit cold agent storage in its existing executor before
@@ -331,6 +329,16 @@ of opaque SDK callbacks. Cold restoration can recheck those prepared components
 and their stored predicates while retaining the full synchronous assertion for
 native commit. Custom SDK assertion wrappers are not executed in restoration
 worker grants; existing writer adapter selection remains unchanged.
+
+`await api.runtime.agent.session.createSessionEntryListReader({ agentId, storePath, env? })`
+creates a read-only metadata inventory reader for a durable session store.
+Await the returned function to read `{ entries, assertCurrent }`. It reuses
+entries only after a worker verifies the same database connection and revision;
+foreign commits and reopened databases invalidate them. Entries exclude saved
+prompt snapshots and derived participants. Treat them as immutable. The returned
+assertion checks physical source identity, not sharing permissions or row freshness;
+revalidate access before publishing data after an await. Keep the reader within
+its consumer's lifecycle and discard it when configuration changes.
 
 `cleanupSessionLifecycleArtifacts` from `openclaw/plugin-sdk/session-store-runtime`
 joins the selected database owner's pending startup preparation before capturing
