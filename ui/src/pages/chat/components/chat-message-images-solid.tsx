@@ -554,6 +554,7 @@ export function MessageImages(props: MessageImagesProps): JSX.Element {
   let scope = "";
   let policyKey: string | undefined;
   let canonicalMessageKey: string | undefined;
+  let messageId: string | undefined;
   let localSubmission = false;
   const projection = createMemo(() => {
     const images = props.images;
@@ -568,7 +569,7 @@ export function MessageImages(props: MessageImagesProps): JSX.Element {
     const continuing =
       scope === nextScope &&
       (!localSubmission || options?.localSubmission !== false) &&
-      (canonicalMessageKey === options?.canonicalMessageKey ||
+      ((canonicalMessageKey === options?.canonicalMessageKey && messageId === options?.messageId) ||
         (localSubmission && !canonicalMessageKey));
     const nextLocalSubmission = continuing ? localSubmission : options?.localSubmission === true;
     const adoptingSlots =
@@ -606,6 +607,7 @@ export function MessageImages(props: MessageImagesProps): JSX.Element {
     scope = nextScope;
     policyKey = options?.policyKey;
     canonicalMessageKey = options?.canonicalMessageKey;
+    messageId = options?.messageId;
     localSubmission =
       nextLocalSubmission &&
       !(options?.canonicalMessageKey && images.every((image) => image.factIndex !== undefined));

@@ -1,6 +1,11 @@
 import { normalizeRouteBasePath } from "@openclaw/uirouter";
 
-export type AssistantMediaContext = { sessionKey?: string; agentId?: string; policyKey?: string };
+export type AssistantMediaContext = {
+  sessionKey?: string;
+  agentId?: string;
+  policyKey?: string;
+  messageId?: string;
+};
 
 export function buildAssistantMediaUrl(
   source: string,
@@ -19,6 +24,9 @@ export function buildAssistantMediaUrl(
   }
   if (context?.agentId) {
     params.set("agentId", context.agentId);
+  }
+  if (context?.messageId) {
+    params.set("messageId", context.messageId);
   }
   if (filename) {
     params.set("filename", filename);

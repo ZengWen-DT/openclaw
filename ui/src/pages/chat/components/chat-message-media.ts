@@ -36,6 +36,7 @@ export type ImageRenderOptions = {
   sessionKey?: string;
   agentId?: string;
   policyKey?: string;
+  messageId?: string;
   canonicalMessageKey?: string;
   localSubmission?: boolean;
   connectionEpoch?: number;

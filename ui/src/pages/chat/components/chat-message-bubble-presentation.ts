@@ -44,17 +44,30 @@ function messageVideoSlots(
   );
 }
 
-function imageMessageIdentity(message: unknown, sessionKey: string | undefined) {
+function messageMediaIdentity(message: unknown, sessionKey: string | undefined) {
   const identity = readSessionMessageIdentity(message);
-  if (identity?.role !== "user" || identity.isImported) {
+  if (!identity || identity.isImported) {
     return { localSubmission: false };
+  }
+  if (identity.role !== "user") {
+    return {
+      localSubmission: false,
+      ...(identity.id &&
+      !identity.id.startsWith(CHAT_PENDING_INPUT_MESSAGE_PREFIX) &&
+      !isPendingSendMessage(message)
+        ? { messageId: identity.id }
+        : {}),
+    };
   }
   if (!identity.id || isPendingSendMessage(message)) {
     return { localSubmission: Boolean(identity.sendId) };
   }
   return identity.id.startsWith(CHAT_PENDING_INPUT_MESSAGE_PREFIX)
     ? {}
-    : { canonicalMessageKey: JSON.stringify([sessionKey, identity.id, identity.sequence]) };
+    : {
+        messageId: identity.id,
+        canonicalMessageKey: JSON.stringify([sessionKey, identity.id, identity.sequence]),
+      };
 }
 
 export function prepareGroupedMessage(
@@ -132,7 +145,7 @@ export function prepareGroupedMessage(
     sessionKey: opts.sessionKey,
     agentId: opts.agentId,
     policyKey: opts.mediaPolicyKey,
-    ...(hasImages ? imageMessageIdentity(message, opts.sessionKey) : {}),
+    ...messageMediaIdentity(message, opts.sessionKey),
     connectionEpoch: opts.connectionEpoch,
     resourceBasePath: opts.resourceBasePath,
     authToken: opts.assistantAttachmentAuthToken,

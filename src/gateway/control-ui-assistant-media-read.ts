@@ -147,6 +147,7 @@ export async function resolveAssistantMediaAvailability(
         agentId,
         session: policy.session,
         reader: policy.reader,
+        messageId: policy.messageId,
         ...(file ? { file } : {}),
       }),
     };

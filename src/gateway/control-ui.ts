@@ -9,6 +9,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveDevInstallGitBranch } from "../infra/dev-install-branch.js";
 import { openLocalFileSafely } from "../infra/fs-safe.js";
 import { createHttpRequestAbortSignal } from "../infra/http-request-lifecycle.js";
+import { parseInboundMediaUri } from "../media/inbound-media-uri.js";
 import {
   replacePlaybackFileExtension,
   resolvePlaybackTranscode,
@@ -166,6 +167,21 @@ export async function handleControlUiAssistantMediaRequest(
   }
   const sessionKey = url.searchParams.get("sessionKey")?.trim() || undefined;
   const agentId = sessionKey ? url.searchParams.get("agentId")?.trim() || undefined : opts?.agentId;
+  const messageId = url.searchParams.get("messageId")?.trim();
+  let savedAttachment: { messageId: string; inboundId: string } | undefined;
+  if (sessionKey && messageId && /^media:\/\//iu.test(source)) {
+    try {
+      const inbound = parseInboundMediaUri(source);
+      if (!inbound || messageId.length > 1024) {
+        respondControlUiNotFound(res);
+        return true;
+      }
+      savedAttachment = { messageId, inboundId: inbound.id };
+    } catch {
+      respondControlUiNotFound(res);
+      return true;
+    }
+  }
   const relativeSource = !path.isAbsolute(source) && !/^[a-z][a-z0-9+.-]*:/iu.test(source);
   // Relative tickets bind the resolved path; authenticate their reader before resolving the cwd.
   const ticketCandidate = verifyAssistantMediaTicket(
@@ -186,6 +202,7 @@ export async function handleControlUiAssistantMediaRequest(
         res,
         cfg: opts?.cfg ?? opts?.config,
         allowQueryToken: !explicitAllow,
+        requiredOperatorMethod: savedAttachment ? "chat.message.get" : undefined,
       })
     : undefined;
   if (needsAuthentication && !requestAuth) {
@@ -220,17 +237,28 @@ export async function handleControlUiAssistantMediaRequest(
       return true;
     }
   }
-  const policyParams = { config: opts?.config ?? {}, sessionKey, agentId };
+  const policyParams = { config: opts?.config ?? {}, sessionKey, agentId, savedAttachment };
   const policy = await resolveAssistantMediaPolicy({
     ...policyParams,
     requestAuth: requestAuth ?? undefined,
     reader: isMetaRequest || ingress ? undefined : ticketCandidate?.reader,
+  }).catch((error: unknown) => {
+    if (savedAttachment) {
+      return undefined;
+    }
+    throw error;
   });
   if (!policy) {
     respondControlUiNotFound(res);
     return true;
   }
-  using mediaPolicy = { ...policy, [Symbol.dispose]: () => policy.placementRead?.release() };
+  using mediaPolicy = {
+    ...policy,
+    [Symbol.dispose]: () => {
+      policy.savedAttachmentRead?.release();
+      policy.placementRead?.release();
+    },
+  };
   if (relativeSource) {
     if (policy.remote || !policy.executionCwd || !path.isAbsolute(policy.executionCwd)) {
       respondControlUiNotFound(res);
@@ -247,7 +275,8 @@ export async function handleControlUiAssistantMediaRequest(
     ticket &&
     ticket.session?.sessionKey === policy.session?.sessionKey &&
     ticket.session?.agentId === policy.session?.agentId &&
-    ticket.session?.sessionId === policy.session?.sessionId;
+    ticket.session?.sessionId === policy.session?.sessionId &&
+    ticket.messageId === savedAttachment?.messageId;
   if (!isMetaRequest && url.searchParams.has("mediaTicket") && (!ticket || !sameSession)) {
     respondControlUiNotFound(res);
     return true;

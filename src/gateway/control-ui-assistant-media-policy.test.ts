@@ -119,6 +119,7 @@ async function request(
   source: string,
   options: {
     ticket?: string;
+    messageId?: string;
     allow?: boolean;
     bytes?: boolean;
     sessionKey?: string;
@@ -134,6 +135,9 @@ async function request(
   }
   if (!options.omitAgent) {
     query.set("agentId", options.agentId ?? "main");
+  }
+  if (options.messageId) {
+    query.set("messageId", options.messageId);
   }
   if (!options.bytes) {
     query.set("meta", "1");
@@ -172,6 +176,15 @@ async function request(
 // The real HTTP boundary plus real files protect session-root admission and exact-file grants;
 // existing media tests cover static agent roots only.
 describe("assistant image session policy", () => {
+  it("requires a verified person for the narrow saved-attachment exception without named roles", async () => {
+    state.auth.mockResolvedValue({
+      authMethod: "device-token",
+      operatorScopes: ["operator.sessions.read"],
+    });
+    const denied = await request("media://inbound/saved.txt", { messageId: "saved-message" });
+    expect(denied.res.statusCode).toBe(404);
+  });
+
   it("binds relative media tickets to the execution directory within the session root", async () => {
     const first = path.join(project, "first");
     const second = path.join(project, "second");

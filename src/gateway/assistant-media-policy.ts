@@ -17,6 +17,7 @@ import { isIncognitoSessionKey } from "../routing/session-key.js";
 import { safeEqualSecret } from "../security/secret-equal.js";
 import { normalizeSessionKeyPreservingOpaquePeerIds } from "../sessions/session-key-utils.js";
 import { captureResidentUserProfileAccess } from "../state/user-profile-list.js";
+import { prepareSavedAssistantAttachmentRead } from "./assistant-media-saved-attachment.js";
 import { applyHttpOperatorRoleScopeCeiling, resolveHttpProfile } from "./http-auth-user-profile.js";
 import type { AuthorizedControlUiReadRequest } from "./http-auth-utils.js";
 import { authorizeOperatorScopesForMethod } from "./method-scopes.js";
@@ -44,6 +45,7 @@ export function assertAssistantMediaPolicyCurrent(
   requestAuth: AuthorizedControlUiReadRequest | undefined,
 ) {
   policy.assertCurrent?.();
+  policy.savedAttachmentRead?.assertCurrent();
   // Ordinary session activity changes the global access epoch without revoking media tickets.
   const current = resolvePreparedAssistantMediaPolicy(
     { ...selection, reader: policy.reader },
@@ -66,6 +68,7 @@ export function assertAssistantMediaPolicyCurrent(
     current.session?.agentId !== policy.session?.agentId ||
     current.session?.sessionId !== policy.session?.sessionId ||
     current.remote !== policy.remote ||
+    current.narrowSavedAttachment !== policy.narrowSavedAttachment ||
     current.executionCwd !== policy.executionCwd ||
     current.workspaceOnly !== policy.workspaceOnly ||
     current.localRoots.length !== policy.localRoots.length ||
@@ -87,6 +90,7 @@ type AssistantMediaReader = Pick<
 function resolveAssistantMediaReaderAuth(
   reader: AssistantMediaReader,
   config: OpenClawConfig,
+  savedAttachment: boolean,
 ): AuthorizedControlUiReadRequest | undefined {
   try {
     const currentProfile = reader.profileId
@@ -96,7 +100,12 @@ function resolveAssistantMediaReaderAuth(
         )
       : undefined;
     const operatorScopes = applyHttpOperatorRoleScopeCeiling(reader.operatorScopes, currentProfile);
-    if (!authorizeOperatorScopesForMethod("assistant.media.get", operatorScopes).allowed) {
+    if (
+      !authorizeOperatorScopesForMethod(
+        savedAttachment ? "chat.message.get" : "assistant.media.get",
+        operatorScopes,
+      ).allowed
+    ) {
       return undefined;
     }
     return { authMethod: reader.authMethod, operatorScopes, ...currentProfile };
@@ -111,6 +120,7 @@ type AssistantMediaPolicyParams = {
   agentId?: string;
   requestAuth?: AuthorizedControlUiReadRequest;
   reader?: AssistantMediaReader;
+  savedAttachment?: { messageId: string; inboundId: string };
 };
 type AssistantMediaSessionRead = Pick<
   GatewaySessionEntryRead,
@@ -151,7 +161,9 @@ async function resolveAssistantMediaSessionPolicy(params: AssistantMediaPolicyPa
       assertCurrent = () => assertRoutingCurrent(getRuntimeConfig());
       const durable = await loadGatewaySessionEntryReadOnlyAsync(params.sessionKey, {
         agentId: owner.agentId,
-        projection: "list",
+        // Saved locators need retained exact metadata for subsequent live checks;
+        // list projections intentionally do not populate those authority facts.
+        projection: params.savedAttachment ? [] : "list",
       });
       readSession = () => {
         assertCurrent?.();
@@ -199,8 +211,19 @@ function resolvePreparedAssistantMediaPolicy(
         }
       : undefined);
   const auth =
-    params.requestAuth ?? (reader ? resolveAssistantMediaReaderAuth(reader, config) : undefined);
+    params.requestAuth ??
+    (reader
+      ? resolveAssistantMediaReaderAuth(reader, config, Boolean(params.savedAttachment))
+      : undefined);
   if (!auth || !reader) {
+    return undefined;
+  }
+  const narrowSavedAttachment =
+    Boolean(params.savedAttachment) &&
+    !authorizeOperatorScopesForMethod("assistant.media.get", auth.operatorScopes).allowed;
+  // The saved-message exception uses the same verified-person admission as
+  // chat.message.get. A session-scoped credential alone cannot name a reader.
+  if (narrowSavedAttachment && !auth.authenticatedUserProfile) {
     return undefined;
   }
   const agentId = loaded?.agentId ?? params.agentId;
@@ -219,10 +242,10 @@ function resolvePreparedAssistantMediaPolicy(
           return undefined;
         }
         if (
-          auth.operatorRolePolicy &&
+          (auth.operatorRolePolicy || narrowSavedAttachment) &&
           !createProfileSessionEntryFilter({
             profileId,
-            sessionCap: auth.operatorRolePolicy.sessions.others,
+            sessionCap: auth.operatorRolePolicy?.sessions.others,
           })(loaded.canonicalKey, entry)
         ) {
           return undefined;
@@ -261,6 +284,8 @@ function resolvePreparedAssistantMediaPolicy(
     localRoots,
     workspaceOnly,
     reader,
+    messageId: params.savedAttachment?.messageId,
+    narrowSavedAttachment,
     canAllow: auth.operatorScopes.includes("operator.admin"),
   };
 }
@@ -277,6 +302,7 @@ export async function resolveAssistantMediaPolicy(params: AssistantMediaPolicyPa
           policy.session.sessionId,
         )
       : undefined;
+  let savedAttachmentRead: Awaited<ReturnType<typeof prepareSavedAssistantAttachmentRead>>;
   try {
     if (policy.session && context) {
       const placement = placementRead
@@ -285,8 +311,24 @@ export async function resolveAssistantMediaPolicy(params: AssistantMediaPolicyPa
       // Cloud placement owns its filesystem independently of the session exec-node setting.
       policy.remote ||= isCloudWorkerPlacementState(placement?.state);
     }
-    return { ...policy, placementRead };
+    if (params.savedAttachment && policy.narrowSavedAttachment) {
+      if (!policy.session) {
+        placementRead?.release();
+        return undefined;
+      }
+      savedAttachmentRead = await prepareSavedAssistantAttachmentRead({
+        config: params.config,
+        session: policy.session,
+        ...params.savedAttachment,
+      });
+      if (!savedAttachmentRead) {
+        placementRead?.release();
+        return undefined;
+      }
+    }
+    return { ...policy, placementRead, savedAttachmentRead };
   } catch (error) {
+    savedAttachmentRead?.release();
     placementRead?.release();
     throw error;
   }
@@ -304,6 +346,7 @@ export type AssistantMediaTicketPayload = {
   reader: AssistantMediaReader;
   agentId?: string;
   file?: { realPath: string; dev: string; ino: string };
+  messageId?: string;
 };
 
 function signAssistantMediaTicketPayload(encodedPayload: string): string {

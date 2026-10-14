@@ -16,6 +16,7 @@ export function ChatAttachmentAdmission(props: AttachmentAdmissionProps): JSX.El
       props.attachments.map((attachment) => [attachment.url, attachment.artifactId]),
       props.options.sessionKey,
       props.options.agentId,
+      props.options.messageId,
       props.options.connectionEpoch,
       props.options.resourceBasePath,
       props.options.authToken,
