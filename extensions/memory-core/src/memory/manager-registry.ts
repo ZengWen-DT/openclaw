@@ -1,9 +1,10 @@
 // Memory Core plugin module owns manager cache and close serialization.
 import { toErrorObject } from "openclaw/plugin-sdk/error-runtime";
 import { enqueueKeyedTask } from "openclaw/plugin-sdk/keyed-async-queue";
-import type {
-  MemoryEmbeddingProviderAdapter,
-  MemoryEmbeddingProviderCreateResult,
+import {
+  getRuntimeAuthProfileStoreCredentialsRevision,
+  type MemoryEmbeddingProviderAdapter,
+  type MemoryEmbeddingProviderCreateResult,
 } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 import {
   createSubsystemLogger,
@@ -21,6 +22,7 @@ import {
   type MemoryReloadState,
 } from "./lifecycle.js";
 
+const EMBEDDING_PROBE_CACHE_TTL_MS = 30_000;
 const log = createSubsystemLogger("memory");
 
 export type MemoryIndexManagerPurpose = "default" | "status" | "cli" | "maintenance";
@@ -70,6 +72,7 @@ export type MemoryEmbeddingProbeCacheEntry = {
   adapters: readonly MemoryEmbeddingProviderAdapter[];
   checkedAtMs: number;
   expireAtMs: number;
+  credentialsRevision: number;
 };
 
 type ProviderFactory = () => Promise<MemoryEmbeddingProviderCreateResult>;
@@ -128,9 +131,50 @@ export class MemoryManagerRegistry<T extends ClosableMemoryManager> {
     return await create();
   }
 
-  canPublishProbe(manager: T): boolean {
+  cacheProbeResult(
+    manager: T,
+    result: MemoryEmbeddingProbeResult,
+    credentialsRevision = getRuntimeAuthProfileStoreCredentialsRevision(),
+  ): MemoryEmbeddingProbeResult {
     const owner = this.managers.get(manager);
-    return owner !== undefined && !owner.retiring;
+    if (
+      !owner ||
+      owner.retiring ||
+      credentialsRevision !== getRuntimeAuthProfileStoreCredentialsRevision()
+    ) {
+      return result;
+    }
+    const checkedAtMs = Date.now();
+    this.embeddingProbeCache.set(owner.key, {
+      result,
+      adapters: [...owner.adapters],
+      checkedAtMs,
+      expireAtMs: checkedAtMs + EMBEDDING_PROBE_CACHE_TTL_MS,
+      credentialsRevision,
+    });
+    return result;
+  }
+
+  getCachedEmbeddingAvailability(key: string): MemoryEmbeddingProbeResult | null {
+    const cached = this.embeddingProbeCache.get(key);
+    if (!cached) {
+      return null;
+    }
+    // Status managers are transient; their cached probes outlive auth listeners.
+    if (
+      Date.now() >= cached.expireAtMs ||
+      cached.credentialsRevision !== getRuntimeAuthProfileStoreCredentialsRevision()
+    ) {
+      this.embeddingProbeCache.delete(key);
+      return null;
+    }
+    return {
+      ...cached.result,
+      checked: true,
+      cached: true,
+      checkedAtMs: cached.checkedAtMs,
+      cacheExpiresAtMs: cached.expireAtMs,
+    };
   }
 
   getProbeOwners(manager: T): readonly MemoryEmbeddingProviderAdapter[] {

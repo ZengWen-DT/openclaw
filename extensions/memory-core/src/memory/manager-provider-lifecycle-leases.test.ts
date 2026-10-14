@@ -1,6 +1,8 @@
 // Memory Core tests cover manager provider lifecycle lease behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
+import { replaceRuntimeAuthProfileStoreSnapshotsAsync } from "openclaw/plugin-sdk/agent-runtime";
+import { resolveAgentDir } from "openclaw/plugin-sdk/agent-scope-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { hashText } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { describe, expect, it, vi } from "vitest";
@@ -94,59 +96,75 @@ describe("memory index", () => {
     ).toBe("fts-only");
   });
 
-  it("waits for admitted provider users before retirement", async () => {
-    const cfg = createCfg({ provider: "openai" });
-    const manager = await getPersistentManager(cfg);
-    await manager.sync({ reason: "test" });
-    const fields = manager as unknown as {
-      provider: {
-        embed: (text: string) => Promise<number[]>;
-      } | null;
-      retireCurrentProvider: () => Promise<void>;
-    };
-    if (!fields.provider) {
-      throw new Error("Expected a test embedding provider");
-    }
-    let releaseFirstQuery: () => void = () => {};
-    let markFirstQueryStarted: () => void = () => {};
-    const firstQueryGate = new Promise<void>((resolve) => {
-      releaseFirstQuery = resolve;
-    });
-    const firstQueryStarted = new Promise<void>((resolve) => {
-      markFirstQueryStarted = resolve;
-    });
-    fields.provider.embed = async () => {
-      markFirstQueryStarted();
-      await firstQueryGate;
-      return [1, 0, 0, 0];
-    };
+  it.each(["search", "probe"] as const)(
+    "drains an admitted %s before auth refresh",
+    async (operation) => {
+      const cfg = createCfg({ provider: "openai" });
+      const manager = await getPersistentManager(cfg);
+      await manager.sync({ reason: "test" });
+      const fields = manager as unknown as {
+        provider: {
+          embed: (text: string) => Promise<number[]>;
+        } | null;
+      };
+      if (!fields.provider) {
+        throw new Error("Expected a test embedding provider");
+      }
+      let releaseFirstQuery: () => void = () => {};
+      let markFirstQueryStarted: () => void = () => {};
+      const firstQueryGate = new Promise<void>((resolve) => {
+        releaseFirstQuery = resolve;
+      });
+      const firstQueryStarted = new Promise<void>((resolve) => {
+        markFirstQueryStarted = resolve;
+      });
+      fields.provider.embed = async () => {
+        markFirstQueryStarted();
+        await firstQueryGate;
+        return [1, 0, 0, 0];
+      };
 
-    const queryPromise = manager.search("alpha");
-    await firstQueryStarted;
-    const retirementPromise = fields.retireCurrentProvider();
-    let retirementSettled = false;
-    void retirementPromise.then(
-      () => {
-        retirementSettled = true;
-      },
-      () => {
-        retirementSettled = true;
-      },
-    );
-    try {
-      await Promise.resolve();
-      expect(retirementSettled).toBe(false);
-      expect(providerFixture.providerCloseCalls).toBe(0);
-    } finally {
-      releaseFirstQuery();
-    }
+      const queryPromise =
+        operation === "search" ? manager.search("alpha") : manager.probeEmbeddingAvailability();
+      await firstQueryStarted;
+      await replaceRuntimeAuthProfileStoreSnapshotsAsync([
+        {
+          agentDir: resolveAgentDir(cfg, "main"),
+          store: {
+            version: 1,
+            profiles: {
+              "openai:fixture": { type: "token", provider: "openai", token: "fixture-new-bearer" },
+            },
+          },
+        },
+      ]);
+      const retirementPromise = manager.probeEmbeddingAvailability();
+      let retirementSettled = false;
+      void retirementPromise.then(
+        () => {
+          retirementSettled = true;
+        },
+        () => {
+          retirementSettled = true;
+        },
+      );
+      try {
+        await Promise.resolve();
+        expect(retirementSettled).toBe(false);
+        expect(providerFixture.providerCloseCalls).toBe(0);
+      } finally {
+        releaseFirstQuery();
+      }
 
-    await expect(queryPromise).resolves.toEqual(
-      expect.arrayContaining([expect.objectContaining({ path: "memory/2026-01-12.md" })]),
-    );
-    await retirementPromise;
-    expect(providerFixture.providerCloseCalls).toBe(1);
-  });
+      await expect(queryPromise).resolves.toEqual(
+        operation === "search"
+          ? expect.arrayContaining([expect.objectContaining({ path: "memory/2026-01-12.md" })])
+          : { ok: true },
+      );
+      await expect(retirementPromise).resolves.toEqual({ ok: true });
+      expect(providerFixture.providerCloseCalls).toBe(1);
+    },
+  );
 
   it("uses the leased provider runtime after retirement starts", async () => {
     const manager = await getPersistentManager(createCfg({ provider: "openai" }));

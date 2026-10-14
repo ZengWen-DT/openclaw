@@ -8,6 +8,7 @@ import {
   type ResolvedMemorySearchConfig,
 } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import type {
+  MemoryEmbeddingProbeResult,
   MemoryProviderStatus,
   MemorySearchManager,
   MemorySyncParams,
@@ -54,11 +55,16 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
   private readonly managerRegistry: MemoryManagerRegistry<MemoryIndexManager>;
   protected readonly createProvider: MemoryManagerProviderFactory = (adapter, create) =>
     this.managerRegistry.createProvider(this, adapter, create);
-  protected canPublishEmbeddingProbe(): boolean {
-    return this.managerRegistry.canPublishProbe(this);
+  protected cacheProbeResult(
+    result: MemoryEmbeddingProbeResult,
+    credentialsRevision?: number,
+  ): MemoryEmbeddingProbeResult {
+    return this.providerAuthInvalidated
+      ? result
+      : this.managerRegistry.cacheProbeResult(this, result, credentialsRevision);
   }
-  protected getEmbeddingProbeOwners() {
-    return this.managerRegistry.getProbeOwners(this);
+  getCachedEmbeddingAvailability(): MemoryEmbeddingProbeResult | null {
+    return this.managerRegistry.getCachedEmbeddingAvailability(this.cacheKey);
   }
   protected get embeddingProbeCache() {
     return this.managerRegistry.embeddingProbeCache;
@@ -292,6 +298,7 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
       this.sessionsFullRetryDirty = true;
     }
     this.batch = this.resolveBatchConfig();
+    this.observeProviderAuthChanges();
     if (!transient) {
       this.runInBackgroundContext(() => {
         this.ensureWatcher();
@@ -687,6 +694,7 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
     this.closing = true;
     this.sessionSyncQueue.clear();
     await this.awaitManagerIdle();
+    this.stopObservingProviderAuthChanges();
     this.closed = true;
     const pendingProviderInit = this.providerInitPromise;
     const pendingFallbackInit = this.fallbackProviderInitPromise;

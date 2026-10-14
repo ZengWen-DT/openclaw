@@ -5,7 +5,10 @@ import {
   toErrorObject,
 } from "openclaw/plugin-sdk/error-runtime";
 import { listRegisteredMemoryEmbeddingProviderAdapters } from "openclaw/plugin-sdk/memory-core-host-embedding-registry";
-import type { MemoryEmbeddingProviderAdapter } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
+import {
+  getRuntimeAuthProfileStoreCredentialsRevision,
+  type MemoryEmbeddingProviderRuntime,
+} from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 import {
   createSubsystemLogger,
   resolveUserPath,
@@ -23,6 +26,7 @@ import { resolveEmbeddingProviderAdapterTransport, type EmbeddingProvider } from
 import { MemoryManagerReloadError } from "./lifecycle.js";
 import { runMemoryIndexState } from "./manager-cpu-worker-runtime.js";
 import { MemoryManagerEmbeddingOps } from "./manager-embedding-ops.js";
+import { observeMemoryProviderAuthChanges } from "./manager-provider-auth.js";
 import {
   resolveFallbackCurrentProviderId,
   resolveMemoryFallbackProviderRequest,
@@ -39,7 +43,7 @@ import {
 } from "./manager-reindex-state.js";
 import type { MemoryRetrievalIndexState } from "./manager-retrieval-read.js";
 
-const EMBEDDING_PROBE_CACHE_TTL_MS = 30_000;
+const PRIMARY_RECOVERY_RETRY_MS = 30_000;
 const log = createSubsystemLogger("memory");
 
 export type MemoryEmbeddingProviderRequirement = {
@@ -96,8 +100,11 @@ export function resolveMemoryEmbeddingProviderRequirement(params: {
 }
 
 export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps {
-  protected abstract getEmbeddingProbeOwners(): readonly MemoryEmbeddingProviderAdapter[];
-  protected abstract canPublishEmbeddingProbe(): boolean;
+  protected abstract cacheProbeResult(
+    result: MemoryEmbeddingProbeResult,
+    credentialsRevision?: number,
+  ): MemoryEmbeddingProbeResult;
+  abstract getCachedEmbeddingAvailability(): MemoryEmbeddingProbeResult | null;
   protected abstract readonly embeddingProbeCache: Map<string, MemoryEmbeddingProbeCacheEntry>;
   protected abstract readonly cacheKey: string;
   protected abstract readonly purpose: MemoryIndexManagerPurpose;
@@ -110,6 +117,8 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
   protected indexIdentityDirty = false;
   private primaryRecoveryPromise: Promise<void> | null = null;
   private primaryRecoveryRetryAt = 0;
+  protected providerAuthInvalidated = false;
+  private unregisterProviderAuthListener: (() => void) | undefined;
   protected abstract indexIdentityState: MemoryIndexIdentityState;
   protected abstract syncAdmitted(
     params?: MemorySyncParams,
@@ -117,9 +126,40 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
   ): Promise<void>;
   protected abstract syncPublishedIndexInBackground(params: { reason: string }): Promise<void>;
 
+  protected observeProviderAuthChanges(): void {
+    this.unregisterProviderAuthListener = observeMemoryProviderAuthChanges({
+      cfg: this.cfg,
+      agentId: this.agentId,
+      settings: this.settings,
+      invalidate: () => {
+        // Keep admitted operations on their leased provider. The next operation
+        // retires it through the existing owner before resolving fresh credentials.
+        this.providerAuthInvalidated = true;
+        this.embeddingProbeCache.delete(this.cacheKey);
+      },
+    });
+  }
+
+  protected stopObservingProviderAuthChanges(): void {
+    this.unregisterProviderAuthListener?.();
+    this.unregisterProviderAuthListener = undefined;
+  }
+
+  protected override async probeEmbeddingProvider(
+    provider: EmbeddingProvider,
+    runtime: MemoryEmbeddingProviderRuntime | undefined,
+  ): Promise<void> {
+    const releaseProvider = this.acquireProviderUse(provider);
+    try {
+      await super.probeEmbeddingProvider(provider, runtime);
+    } finally {
+      releaseProvider();
+    }
+  }
+
   protected markEmbeddingBootstrapFailure(
     err: unknown,
-    options?: { retainProvider?: boolean; provider?: string },
+    options?: { retainProvider?: boolean; provider?: string; credentialsRevision?: number },
   ): MemoryEmbeddingBootstrapDebug {
     if (err instanceof MemoryManagerReloadError) {
       throw err;
@@ -157,7 +197,7 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
     this.providerKey = this.computeProviderKey();
     this.batch = this.resolveBatchConfig();
     this.vector.semanticAvailable = false;
-    this.cacheProbeResult({ ok: false, error: reason });
+    this.cacheProbeResult({ ok: false, error: reason }, options?.credentialsRevision);
     return debug;
   }
 
@@ -290,14 +330,16 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
     if (!provider) {
       return false;
     }
+    const credentialsRevision = getRuntimeAuthProfileStoreCredentialsRevision();
     try {
       await this.probeEmbeddingProvider(provider, this.providerRuntime);
-      this.cacheProbeResult({ ok: true });
+      this.cacheProbeResult({ ok: true }, credentialsRevision);
       return true;
     } catch (err) {
       this.markEmbeddingBootstrapFailure(err, {
         retainProvider: true,
         provider: provider.id,
+        credentialsRevision,
       });
       return false;
     }
@@ -325,7 +367,7 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
     }
     // A fallback-owned index stays on that provider. Recovery only restores a
     // primary that can read the published index, never implicitly reindexes it.
-    this.primaryRecoveryRetryAt = Date.now() + EMBEDDING_PROBE_CACHE_TTL_MS;
+    this.primaryRecoveryRetryAt = Date.now() + PRIMARY_RECOVERY_RETRY_MS;
     const recovery = (async () => {
       let candidate: EmbeddingProvider | null = null;
       try {
@@ -389,8 +431,11 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
         this.embeddingBootstrapFailure !== undefined &&
         !this.provider &&
         this.getCachedEmbeddingAvailability() === null;
-      if (!bootstrapRetryDue) {
+      if (!bootstrapRetryDue && !this.providerAuthInvalidated) {
         await this.fallbackProviderInitPromise?.catch(() => undefined);
+        if (this.providerAuthInvalidated) {
+          await this.ensureProviderInitialized();
+        }
         return;
       }
       this.resetProviderInitializationForRetry();
@@ -410,6 +455,7 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
         if (this.closed) {
           return;
         }
+        this.providerAuthInvalidated = false;
         const providerResult = await this.createConfiguredEmbeddingProvider();
         this.applyProviderResult(providerResult);
       })();
@@ -425,6 +471,11 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
       if (this.providerInitialized) {
         this.providerInitPromise = null;
       }
+    }
+    // A credential publication during construction must not install a stale
+    // client for the waiting caller. Rejoin initialization only on that event.
+    if (this.providerAuthInvalidated && !this.closed) {
+      await this.ensureProviderInitialized();
     }
   }
 
@@ -648,45 +699,13 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
     return await this.ensureVectorReady();
   }
 
-  protected cacheProbeResult(result: MemoryEmbeddingProbeResult): MemoryEmbeddingProbeResult {
-    if (!this.canPublishEmbeddingProbe()) {
-      return result;
-    }
-    const checkedAtMs = Date.now();
-    this.embeddingProbeCache.set(this.cacheKey, {
-      result,
-      adapters: this.getEmbeddingProbeOwners(),
-      checkedAtMs,
-      expireAtMs: checkedAtMs + EMBEDDING_PROBE_CACHE_TTL_MS,
-    });
-    return result;
-  }
-
-  getCachedEmbeddingAvailability(): MemoryEmbeddingProbeResult | null {
-    const cached = this.embeddingProbeCache.get(this.cacheKey);
-    if (!cached) {
-      return null;
-    }
-    const nowMs = Date.now();
-    if (nowMs >= cached.expireAtMs) {
-      this.embeddingProbeCache.delete(this.cacheKey);
-      return null;
-    }
-    return {
-      ...cached.result,
-      checked: true,
-      cached: true,
-      checkedAtMs: cached.checkedAtMs,
-      cacheExpiresAtMs: cached.expireAtMs,
-    };
-  }
-
   async probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult> {
     return await this.withManagerOperation(async () => {
       const cached = this.getCachedEmbeddingAvailability();
       if (cached) {
         return cached;
       }
+      const credentialsRevision = getRuntimeAuthProfileStoreCredentialsRevision();
       await this.ensureProviderInitialized();
       // Diagnostics must describe the provider search actually uses. A published index that
       // belongs to the configured fallback is adopted on the search path, so adopt it here
@@ -694,18 +713,21 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps 
       await this.adoptPublishedFallbackProviderIfMatched();
       // FTS-only mode: embeddings not available but search still works
       if (!this.provider) {
-        return this.cacheProbeResult({
-          ok: false,
-          error:
-            this.providerUnavailableReason ?? "No embedding provider available (FTS-only mode)",
-        });
+        return this.cacheProbeResult(
+          {
+            ok: false,
+            error:
+              this.providerUnavailableReason ?? "No embedding provider available (FTS-only mode)",
+          },
+          credentialsRevision,
+        );
       }
       try {
         await this.probeEmbeddingProvider(this.provider, this.providerRuntime);
-        return this.cacheProbeResult({ ok: true });
+        return this.cacheProbeResult({ ok: true }, credentialsRevision);
       } catch (err) {
         const message = formatErrorMessage(err);
-        return this.cacheProbeResult({ ok: false, error: message });
+        return this.cacheProbeResult({ ok: false, error: message }, credentialsRevision);
       }
     });
   }

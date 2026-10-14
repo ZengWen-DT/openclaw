@@ -2,7 +2,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import {
+  clearRuntimeAuthProfileStoreSnapshots,
+  replaceRuntimeAuthProfileStoreSnapshotsAsync,
+} from "openclaw/plugin-sdk/agent-runtime";
+import { resolveAgentDir } from "openclaw/plugin-sdk/agent-scope-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { getRuntimeAuthProfileStoreCredentialsRevision } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 import { resolveSessionTranscriptsDirForAgent } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { hashText } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { describe, expect, it, vi } from "vitest";
@@ -79,7 +85,7 @@ describe("memory index", () => {
     },
   );
 
-  it("caches embedding probe readiness across transient status managers", async () => {
+  it("reuses readiness across transient status managers when credentials are unchanged", async () => {
     const cfg = createCfg({});
     const first = requireManager(
       await getMemorySearchManager({ cfg, agentId: "main", purpose: "status" }),
@@ -88,6 +94,7 @@ describe("memory index", () => {
 
     await expect(first.probeEmbeddingAvailability()).resolves.toEqual({ ok: true });
     expect(providerFixture.embedQueryCalls).toBe(1);
+    const credentialsRevision = getRuntimeAuthProfileStoreCredentialsRevision();
     await first.close();
 
     const second = requireManager(
@@ -95,6 +102,7 @@ describe("memory index", () => {
     );
     trackManager(second);
 
+    expect(getRuntimeAuthProfileStoreCredentialsRevision()).toBe(credentialsRevision);
     const cachedBeforeProbe = second.getCachedEmbeddingAvailability?.();
     expect(cachedBeforeProbe?.ok).toBe(true);
     expect(cachedBeforeProbe?.checked).toBe(true);
@@ -119,6 +127,65 @@ describe("memory index", () => {
     const cached = second.getCachedEmbeddingAvailability?.();
     expect((cached?.cacheExpiresAtMs ?? 0) - (cached?.checkedAtMs ?? 0)).toBe(30_000);
   });
+
+  it.each(["closed", "closing"] as const)(
+    "discards readiness from a %s status manager after credential publication",
+    async (phase) => {
+      const cfg = createCfg({ provider: "openai" });
+      const first = await getFreshManager(cfg, "status");
+      const probeStarted = createDeferred<void>();
+      const probeGate = createDeferred<void>();
+      providerFixture.beforeEmbedQuery = async () => {
+        probeStarted.resolve();
+        await probeGate.promise;
+        throw new Error("expired fixture bearer");
+      };
+      const probe = first.probeEmbeddingAvailability();
+      let closing: Promise<void> | undefined;
+      try {
+        await probeStarted.promise;
+        if (phase === "closed") {
+          probeGate.resolve();
+          await expect(probe).resolves.toEqual({ ok: false, error: "expired fixture bearer" });
+          expect(first.getCachedEmbeddingAvailability()?.ok).toBe(false);
+          await first.close();
+        } else {
+          closing = first.close();
+        }
+
+        await replaceRuntimeAuthProfileStoreSnapshotsAsync([
+          {
+            agentDir: resolveAgentDir(cfg, "main"),
+            store: {
+              version: 1,
+              profiles: {
+                "openai:fixture": {
+                  type: "token",
+                  provider: "openai",
+                  token: "fixture-current-bearer",
+                },
+              },
+            },
+          },
+        ]);
+        providerFixture.beforeEmbedQuery = null;
+        probeGate.resolve();
+        await expect(probe).resolves.toEqual({ ok: false, error: "expired fixture bearer" });
+        await closing;
+
+        const second = await getFreshManager(cfg, "status");
+        expect(second.getCachedEmbeddingAvailability()).toBeNull();
+        await expect(second.probeEmbeddingAvailability()).resolves.toEqual({ ok: true });
+        expect(second.getCachedEmbeddingAvailability()?.ok).toBe(true);
+      } finally {
+        probeGate.resolve();
+        await probe;
+        await closing;
+        await first.close();
+        clearRuntimeAuthProfileStoreSnapshots();
+      }
+    },
+  );
 
   it("clears cached embedding probe readiness when local embeddings degrade", async () => {
     const cfg = createCfg({});
