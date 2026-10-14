@@ -216,15 +216,16 @@ function prepareAttachment(
     attachment.kind === "video" && onOpenImage && safeAttachmentUrl
       ? (src: string) => {
           const requestVersion = onRequestOpenImage?.();
-          const videoItem = (video: AttachmentItem["attachment"]) =>
+          const videoItem = (video: AttachmentItem["attachment"], messageId: string | undefined) =>
             videoLightboxItem(
               video,
-              (onRequestUpdate) => resolveAttachmentSource(video, { ...options, onRequestUpdate }),
+              (onRequestUpdate) =>
+                resolveAttachmentSource(video, { ...options, messageId, onRequestUpdate }),
               options.onRequestUpdate,
             );
           const membership = options.galleryVideos?.(item);
           const overlayItem = {
-            ...videoItem(attachment),
+            ...videoItem(attachment, options.messageId),
             src,
             originalSrc: safeAttachmentUrl,
             ...(membership && membership.index >= 0 && membership.items.length > 1
@@ -232,9 +233,9 @@ function prepareAttachment(
                   gallery: {
                     index: membership.index,
                     items: membership.items.map(
-                      ({ attachment: video }) =>
+                      ({ attachment: video, messageId }) =>
                         async () =>
-                          videoItem(video),
+                          videoItem(video, messageId),
                     ),
                   },
                 }
@@ -270,6 +271,7 @@ function prepareAttachment(
                   resolveSource: (sidebarUpdate, runtime): AttachmentSidebarState => {
                     const next = resolveAttachmentSource(attachment, {
                       ...runtime,
+                      messageId: options.messageId,
                       onRequestUpdate: sidebarUpdate,
                     });
                     if (next.status === "available") {

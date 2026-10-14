@@ -64,10 +64,49 @@ it.each([
   expect(prepared.imageRenderOptions.messageId).toBeUndefined();
 });
 
+it("keeps each turn video's own saved identity without promoting imported siblings", () => {
+  const message = (id: string, importedFrom?: string) => ({
+    role: "assistant",
+    content: "Saved video",
+    __openclaw: {
+      id,
+      ...(importedFrom ? { importedFrom } : {}),
+      media: [
+        { url: `media://inbound/${id}.mp4`, contentType: "video/mp4", fileName: `${id}.mp4` },
+      ],
+    },
+  });
+  const first = message("first-message");
+  const prepared = prepareGroupedMessage(prepareChatMessageRender(first), "first-key", {
+    isStreaming: false,
+    showReasoning: false,
+    sessionKey: "video-session",
+    getTurnVideoMessages: () => [
+      { key: "first-key", message: first },
+      { key: "next-key", message: message("next-message") },
+      { key: "imported-key", message: message("imported-message", "legacy") },
+    ],
+  });
+  const selected = prepared.cardAttachments[0];
+  if (selected?.type !== "attachment") {
+    throw new Error("Expected the saved video attachment");
+  }
+  const gallery = prepared.imageRenderOptions.galleryVideos(selected);
+  expect(gallery.index).toBe(0);
+  expect(gallery.items.map((item) => item.messageId)).toEqual([
+    "first-message",
+    "next-message",
+    undefined,
+  ]);
+});
+
 it("keeps metadata and tickets separate for the same file on different saved messages", async () => {
   const source = `media://inbound/${crypto.randomUUID()}.txt`;
   const fetchMock = vi.fn(async (input: string | URL | Request) => {
-    const url = new URL(String(input), "https://control.example");
+    const url = new URL(
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+      "https://control.example",
+    );
     return Response.json({
       available: true,
       mediaTicket: `ticket-${url.searchParams.get("messageId")}`,

@@ -26,7 +26,11 @@ import {
   type ChatMessageRenderPreparation,
   prepareChatMessageRender,
 } from "./chat-message-markdown-view.tsx";
-import { type AttachmentItem, projectMessageMedia } from "./chat-message-media.ts";
+import {
+  type AttachmentItem,
+  type GalleryVideoItem,
+  projectMessageMedia,
+} from "./chat-message-media.ts";
 import { isSentPastedTextAttachment } from "./chat-pasted-text.ts";
 import { isSentCommentAttachment } from "./chat-sent-comments.ts";
 import type { SidebarContent } from "./chat-sidebar-content-types.ts";
@@ -116,27 +120,30 @@ export function prepareGroupedMessage(
     (item) => item.type !== "attachment" || !videoPreviews.includes(item),
   );
   const hasUserFiles = normalizedRole === "user" && hasUserFileAttachments(cardAttachments);
+  const mediaIdentity = messageMediaIdentity(message, opts.sessionKey);
   const imageRenderOptions = {
     galleryImages: images,
     galleryVideos: (selected: AttachmentItem) => {
       const local = messageVideoSlots({ orderedContent, supplementalAttachments });
       const slot = local.indexOf(selected);
+      const localItems = local.map((item) => ({ ...item, messageId: mediaIdentity.messageId }));
       const turn = opts.getTurnVideoMessages?.(messageKey);
       if (!turn || slot < 0) {
-        return { index: slot, items: local };
+        return { index: slot, items: localItems };
       }
-      const items: AttachmentItem[] = [];
+      const items: GalleryVideoItem[] = [];
       let index = -1;
       for (const entry of turn) {
         if (entry.key === messageKey) {
           index = items.length + slot;
-          items.push(...local);
+          items.push(...localItems);
         } else {
           const prepared = prepareChatMessageRender(entry.message);
+          const { messageId } = messageMediaIdentity(prepared.message, opts.sessionKey);
           items.push(
             ...messageVideoSlots(
               projectMessageMedia(prepared.message, prepared.normalizedMessage.content),
-            ),
+            ).map((item) => ({ ...item, messageId })),
           );
         }
       }
@@ -145,7 +152,7 @@ export function prepareGroupedMessage(
     sessionKey: opts.sessionKey,
     agentId: opts.agentId,
     policyKey: opts.mediaPolicyKey,
-    ...messageMediaIdentity(message, opts.sessionKey),
+    ...mediaIdentity,
     connectionEpoch: opts.connectionEpoch,
     resourceBasePath: opts.resourceBasePath,
     authToken: opts.assistantAttachmentAuthToken,

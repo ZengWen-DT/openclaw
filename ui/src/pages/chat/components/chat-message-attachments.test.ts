@@ -900,88 +900,105 @@ describe("attachment sidebar source ownership", () => {
     container.remove();
   });
 
-  it("resolves an open local sidebar attachment with the current runtime credentials", async () => {
-    const source = "/tmp/openclaw/clip.mp3";
-    const container = document.body.appendChild(document.createElement("div"));
-    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      const token = new Headers(init?.headers).get("Authorization")?.replace("Bearer ", "") ?? "";
-      return new Response(
-        JSON.stringify({
-          available: true,
-          mediaTicket: `ticket-${token}`,
-          mediaTicketExpiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    let sidebarContent: AttachmentSidebarContent | undefined;
-    const transcriptUpdate = () => rerender();
-    const rerender = () =>
-      render(
-        renderAssistantAttachments(
-          [
-            {
-              type: "attachment",
-              attachment: {
-                kind: "audio",
-                label: "clip.mp3",
-                mimeType: "audio/mpeg",
-                url: source,
+  it.each(["/tmp/openclaw/clip.mp3", "media://inbound/saved-clip.mp3"])(
+    "resolves an open sidebar attachment with its saved message and current credentials: %s",
+    async (source) => {
+      const container = document.body.appendChild(document.createElement("div"));
+      const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const token = new Headers(init?.headers).get("Authorization")?.replace("Bearer ", "") ?? "";
+        return new Response(
+          JSON.stringify({
+            available: true,
+            mediaTicket: `ticket-${token}`,
+            mediaTicketExpiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      let sidebarContent: AttachmentSidebarContent | undefined;
+      const transcriptUpdate = () => rerender();
+      const rerender = () =>
+        render(
+          renderAssistantAttachments(
+            [
+              {
+                type: "attachment",
+                attachment: {
+                  kind: "audio",
+                  label: "clip.mp3",
+                  mimeType: "audio/mpeg",
+                  url: source,
+                },
               },
+            ],
+            {
+              authToken: "token-A",
+              sessionKey: "saved-attachment-session",
+              messageId: "saved-attachment-message",
+              onRequestUpdate: transcriptUpdate,
             },
-          ],
-          {
-            authToken: "token-A",
-            onRequestUpdate: transcriptUpdate,
-          },
-          (content) => {
-            if (content.kind === "attachment") {
-              sidebarContent = content;
-            }
-          },
+            (content) => {
+              if (content.kind === "attachment") {
+                sidebarContent = content;
+              }
+            },
+          ),
+          container,
+        );
+      subscribers.add(transcriptUpdate);
+
+      rerender();
+      const expand = await vi.waitFor(() =>
+        expectDefined(
+          container.querySelector<HTMLButtonElement>(".chat-assistant-attachment-card__expand"),
+          "available attachment expand action",
         ),
-        container,
       );
-    subscribers.add(transcriptUpdate);
+      expand.click();
 
-    rerender();
-    const expand = await vi.waitFor(() =>
-      expectDefined(
-        container.querySelector<HTMLButtonElement>(".chat-assistant-attachment-card__expand"),
-        "available attachment expand action",
-      ),
-    );
-    expand.click();
-
-    const sidebarUpdate = vi.fn();
-    subscribers.add(sidebarUpdate);
-    const resolveSource = sidebarContent?.resolveSource;
-    expect(resolveSource).toBeDefined();
-    expect(
-      resolveSource?.(sidebarUpdate, {
-        authToken: "token-B",
-      }),
-    ).toEqual({ status: "pending" });
-    await vi.waitFor(() =>
+      const sidebarUpdate = vi.fn();
+      subscribers.add(sidebarUpdate);
+      const resolveSource = sidebarContent?.resolveSource;
+      expect(resolveSource).toBeDefined();
       expect(
         resolveSource?.(sidebarUpdate, {
           authToken: "token-B",
+          sessionKey: "saved-attachment-session",
         }),
-      ).toEqual(
-        expect.objectContaining({
-          authToken: "token-B",
-          src: expect.stringContaining("mediaTicket=ticket-token-B"),
-        }),
-      ),
-    );
-    expect(fetchMock).toHaveBeenLastCalledWith(
-      expect.any(String),
-      expect.objectContaining({ headers: expect.any(Headers) }),
-    );
-    expect(new Headers(fetchMock.mock.calls.at(-1)?.[1]?.headers).get("Authorization")).toBe(
-      "Bearer token-B",
-    );
-    container.remove();
-  });
+      ).toEqual({ status: "pending" });
+      await vi.waitFor(() =>
+        expect(
+          resolveSource?.(sidebarUpdate, {
+            authToken: "token-B",
+            sessionKey: "saved-attachment-session",
+          }),
+        ).toEqual(
+          expect.objectContaining({
+            authToken: "token-B",
+            src: expect.stringContaining("mediaTicket=ticket-token-B"),
+          }),
+        ),
+      );
+      expect(fetchMock).toHaveBeenLastCalledWith(
+        expect.any(String),
+        expect.objectContaining({ headers: expect.any(Headers) }),
+      );
+      expect(new Headers(fetchMock.mock.calls.at(-1)?.[1]?.headers).get("Authorization")).toBe(
+        "Bearer token-B",
+      );
+      const sidebarInput = fetchMock.mock.calls.at(-1)![0];
+      const sidebarUrl = new URL(
+        typeof sidebarInput === "string"
+          ? sidebarInput
+          : sidebarInput instanceof URL
+            ? sidebarInput.href
+            : sidebarInput.url,
+        "https://control.example",
+      );
+      expect(sidebarUrl.searchParams.get("messageId")).toBe("saved-attachment-message");
+      expect(sidebarUrl.searchParams.get("source")).toBe(source);
+      container.remove();
+    },
+  );
 });

@@ -32,7 +32,7 @@ export type ArtifactDownloadResolver = (
 
 export type ImageRenderOptions = {
   galleryImages?: readonly ImageBlock[];
-  galleryVideos?: (item: AttachmentItem) => { index: number; items: readonly AttachmentItem[] };
+  galleryVideos?: (item: AttachmentItem) => { index: number; items: readonly GalleryVideoItem[] };
   sessionKey?: string;
   agentId?: string;
   policyKey?: string;
@@ -70,6 +70,7 @@ export function assistantMediaPolicyKey(
 }
 
 export type AttachmentItem = Extract<MessageContentItem, { type: "attachment" }>;
+export type GalleryVideoItem = AttachmentItem & { messageId?: string };
 type AttachmentFailureItem = Extract<MessageContentItem, { type: "attachment_error" }>;
 export type AssistantAttachmentItem = AttachmentItem | AttachmentFailureItem;
 export type ProjectedMessageContent =

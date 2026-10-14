@@ -3,7 +3,12 @@ import { render, nothing } from "lit";
 import { afterEach, expect, it, vi } from "vitest";
 import type { ImageLightboxItem } from "../../../components/image-lightbox.types.ts";
 import { renderAssistantAttachments } from "./chat-message-attachments.ts";
-import { releaseChatMediaResourceSubscriber, type AttachmentItem } from "./chat-message-media.ts";
+import {
+  releaseChatMediaResourceSubscriber,
+  type AttachmentItem,
+  type GalleryVideoItem,
+  type ImageRenderOptions,
+} from "./chat-message-media.ts";
 
 let pause: ReturnType<typeof vi.spyOn>;
 let container: HTMLDivElement | undefined;
@@ -26,7 +31,8 @@ afterEach(() => {
 async function open(
   attachment: AttachmentItem,
   resolveArtifactDownload?: () => Promise<{ url: string; expiresAt: string }>,
-  gallery = [attachment],
+  gallery: readonly GalleryVideoItem[] = [attachment],
+  options: ImageRenderOptions = {},
 ) {
   pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
@@ -35,6 +41,7 @@ async function open(
   const rerender = () =>
     render(
       renderAssistantAttachments([attachment], {
+        ...options,
         onRequestUpdate: update,
         resolveArtifactDownload,
         galleryVideos: () => ({ index: 0, items: gallery }),
@@ -55,6 +62,65 @@ async function open(
   expect(opened?.connectVideo).toBeTypeOf("function");
   return opened!;
 }
+
+it("keeps a sibling video's saved message on metadata, content, and ticket renewal", async () => {
+  vi.useFakeTimers();
+  const first: AttachmentItem = {
+    type: "attachment",
+    attachment: { kind: "video", url: "https://example.com/first.mp4", label: "First" },
+  };
+  const next: AttachmentItem = {
+    type: "attachment",
+    attachment: {
+      kind: "video",
+      url: `media://inbound/${crypto.randomUUID()}.mp4`,
+      mimeType: "video/mp4",
+      label: "Next",
+    },
+  };
+  const requests: URL[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        "https://control.example",
+      );
+      requests.push(url);
+      return Response.json({
+        available: true,
+        mediaTicket: `ticket-${requests.length}`,
+        mediaTicketExpiresAt: new Date(
+          Date.now() + (requests.length === 1 ? 31_000 : 300_000),
+        ).toISOString(),
+      });
+    }),
+  );
+  const opened = await open(
+    first,
+    undefined,
+    [
+      { ...first, messageId: "first-message" },
+      { ...next, messageId: "next-message" },
+    ],
+    { sessionKey: "video-session", messageId: "first-message" },
+  );
+  const item = await opened.gallery!.items[1]!();
+  const media = document.createElement("video");
+  disconnect = item!.connectVideo!(media, vi.fn());
+  await vi.advanceTimersByTimeAsync(0);
+  expect(new URL(media.src).searchParams.get("messageId")).toBe("next-message");
+  expect(media.src).toContain("mediaTicket=ticket-1");
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(requests).toHaveLength(2);
+  expect(requests.every((url) => url.searchParams.get("messageId") === "next-message")).toBe(true);
+  expect(requests.every((url) => url.searchParams.get("source") === next.attachment.url)).toBe(
+    true,
+  );
+  media.dispatchEvent(new Event("seeking"));
+  expect(new URL(media.src).searchParams.get("messageId")).toBe("next-message");
+  expect(media.src).toContain("mediaTicket=ticket-2");
+});
 
 it("renews a selected video's ticket without interrupting playback and releases renewal on close", async () => {
   vi.useFakeTimers();
