@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
+import { isPrimarySessionTranscriptFileName } from "../config/sessions/artifacts.js";
 import {
   loadExactSessionEntry,
   upsertSessionEntryCore,
@@ -12,16 +13,20 @@ import { assertSessionStoreMigrationComplete } from "../config/sessions/startup-
 import { recordDeferredPluginMigrations } from "../infra/deferred-plugin-migrations.js";
 import {
   readDeferredPluginSessionImportReceipt,
+  readStaleDeferredPluginSessionImport,
   rebuildDeferredPluginSessionSourceIndex,
 } from "../infra/deferred-plugin-session-sources.js";
 import * as sessionVerification from "../infra/deferred-plugin-session-verification.js";
 import * as migrationArtifacts from "../infra/session-sqlite-migration-artifact.js";
+import * as migrationRun from "../infra/session-sqlite-migration-manifest.js";
 import { readOnlySqliteValidationSnapshot } from "../infra/session-sqlite-migration-readers.js";
 import { migrateLegacyAcpSessionMetadata } from "../infra/state-migrations.session-store.js";
 import { EMPTY_LEGACY_SESSION_SURFACES } from "../plugins/legacy-session-surfaces.types.js";
 import { withExistingOpenClawStateDatabaseReadOnly } from "../state/openclaw-state-db-readonly.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { prepareRetainedSessionImport } from "./doctor-session-sqlite-retained.js";
+import { createDoctorSessionSqliteTargetReport } from "./doctor-session-sqlite-types.js";
 import {
   seedDeferredPluginSessionSource,
   seedStaleDeferredPluginSessionImport,
@@ -303,3 +308,129 @@ it.each(["receipt", "physical", "foreign"] as const)(
     });
   },
 );
+
+it("bounds stale-receipt manifest reads across missing transcripts and fresh verification passes", async () => {
+  const commandReads: number[][] = [];
+  for (const count of [2, 32]) {
+    await withOpenClawTestState({ label: "stale-receipt-manifest-reads" }, async (state) => {
+      const { cfg, storePath, scope } = await seedDeferredPluginSessionSource(state, "default");
+      const entries = JSON.parse(fs.readFileSync(storePath, "utf8"));
+      for (const entry of Object.values(entries) as Array<{ updatedAt: number }>) {
+        entry.updatedAt = Date.now();
+      }
+      for (let index = 2; index < count; index++) {
+        const sessionId = `legacy-volume-${index}`;
+        const sessionFile = `${sessionId}.jsonl`;
+        entries[`agent:main:volume-${index}`] = { sessionId, sessionFile, updatedAt: Date.now() };
+        fs.writeFileSync(
+          path.join(path.dirname(storePath), sessionFile),
+          `${JSON.stringify({ type: "session", version: 3, id: sessionId })}\n`,
+        );
+      }
+      fs.writeFileSync(storePath, JSON.stringify(entries));
+      const options = { cfg, env: state.env, allAgents: true, mode: "import" as const };
+      expect((await runDoctorSessionSqlite(options)).totals.importedEntries).toBe(count);
+      const sqlitePath = resolveSqliteTargetFromSessionStorePath(storePath, scope).path;
+      const params = { cfg, env: state.env, target: { agentId: "main", storePath }, sqlitePath };
+      const receipt = readDeferredPluginSessionImportReceipt(params)!;
+      await recordDeferredPluginMigrations({
+        env: state.env,
+        pending: [],
+        resolvedPluginIds: ["fixture-plugin"],
+      });
+      const archived = await runDoctorSessionSqlite(options);
+      expect(archived.totals.archivedTranscriptFiles).toBe(count);
+      const manifestPath = archived.migrationRun!.manifestPath;
+      const manifestBytes = fs.readFileSync(manifestPath);
+      const manifest = migrationRun.readSessionSqliteMigrationManifest(manifestPath)!;
+      const moves = manifest.targets.flatMap((target) => target.plannedMoves);
+      const indexMove = moves.find((move) => move.sourcePath === storePath)!;
+      fs.renameSync(indexMove.archivePath, storePath);
+      // Model an older import receipt bound to a replaced database, preserving its real sources.
+      runOpenClawStateWriteTransaction(
+        ({ db }) => {
+          db.prepare(
+            "UPDATE migration_sources SET removed_source = 0, report_json = ? WHERE source_key = ?",
+          ).run(
+            JSON.stringify({ ...JSON.parse(receipt.reportJson), databaseIdentity: "123:456" }),
+            receipt.sourceKey,
+          );
+        },
+        { env: state.env },
+      );
+      expect(readDeferredPluginSessionImportReceipt(params)?.removedSource).toBe(false);
+      const stale = readStaleDeferredPluginSessionImport(params)!;
+      const missing = stale.sources.filter((source) =>
+        isPrimarySessionTranscriptFileName(path.basename(source.path)),
+      );
+      expect(missing).toHaveLength(count);
+      for (const source of missing) {
+        expect(fs.existsSync(source.path)).toBe(false);
+        const move = moves.find((candidate) => candidate.sourcePath === source.path)!;
+        expect(fs.existsSync(move.archivePath)).toBe(true);
+        expect(move.artifact!.identity.sha256).toBe(source.identity.sha256);
+      }
+      const verify = async () => {
+        const report = createDoctorSessionSqliteTargetReport({ ...params.target, sqlitePath });
+        const retained = await prepareRetainedSessionImport({ ...params, mode: "import" }, report);
+        expect(retained?.staleImport?.sources).toEqual(stale.sources);
+        expect(report.issues).toContainEqual(
+          expect.objectContaining({ code: "retained_plugin_receipt_superseded" }),
+        );
+        return report.issues.filter(
+          (issue) =>
+            issue.code === "historical_transcript_deferred" &&
+            issue.message.startsWith("Retained history source unavailable:"),
+        );
+      };
+      const manifestPaths = migrationRun.listSessionSqliteMigrationManifestPaths(state.env);
+      const reads = vi.spyOn(fs, "readFileSync");
+      const readCounts = () =>
+        manifestPaths.map(
+          (manifestFile) => reads.mock.calls.filter(([file]) => file === manifestFile).length,
+        );
+      try {
+        for (let pass = 0; pass < 2; pass++) {
+          reads.mockClear();
+          expect(await verify()).toEqual([]);
+          expect(readCounts()).toEqual(manifestPaths.map(() => 1));
+        }
+        // Later phases must reread manifests and rehash archives, even after a successful pass.
+        const source = missing[0]!;
+        const archive = moves.find((move) => move.sourcePath === source.path)!.archivePath;
+        for (const target of manifest.targets) {
+          target.plannedMoves = target.plannedMoves.filter(
+            (move) => move.sourcePath !== source.path,
+          );
+          target.completedMoves = target.completedMoves.filter(
+            (move) => move.sourcePath !== source.path,
+          );
+        }
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+        expect(await verify()).toEqual([
+          expect.objectContaining({ message: expect.stringContaining(source.path) }),
+        ]);
+        fs.writeFileSync(manifestPath, manifestBytes);
+        const archiveBytes = fs.readFileSync(archive);
+        fs.appendFileSync(archive, "\n");
+        expect(await verify()).toEqual([
+          expect.objectContaining({ message: expect.stringContaining(source.path) }),
+        ]);
+        fs.writeFileSync(archive, archiveBytes);
+        expect(await verify()).toEqual([]);
+        reads.mockClear();
+        const report = await runDoctorSessionSqlite(options);
+        expect(report.targets.flatMap((target) => target.issues)).toContainEqual(
+          expect.objectContaining({ code: "retained_plugin_receipt_superseded" }),
+        );
+        expect(report.totals.importedEntries).toBe(0);
+        commandReads.push(readCounts());
+      } finally {
+        reads.mockRestore();
+      }
+    });
+  }
+  // Discovery, reconciliation, and pruning have their own phases; none scale with source count.
+  expect(commandReads[0]?.every((count) => count > 0)).toBe(true);
+  expect(commandReads[1]).toEqual(commandReads[0]);
+});
