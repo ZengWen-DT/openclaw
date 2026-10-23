@@ -1,125 +1,74 @@
-/**
- * Tests config runtime exports and snapshot/cache behavior exposed through the SDK.
- */
-import { afterEach, describe, expect, it } from "vitest";
-import {
-  clearRuntimeConfigSnapshot,
-  setRuntimeConfigSnapshot,
-} from "../config/runtime-snapshot.js";
+import { afterEach, expect, it, vi } from "vitest";
+import * as snapshots from "../config/runtime-snapshot.js";
+import * as normalization from "../plugins/config-normalization-shared.js";
 import { normalizePluginsConfig as readNormalizedPluginsConfig } from "../plugins/config-state.js";
 import type { OpenClawConfig } from "./config-contracts.js";
-import {
-  resolveLivePluginConfigObject,
-  resolvePluginConfigObject,
-  normalizePluginsConfig,
-} from "./plugin-config-runtime.js";
+import * as runtime from "./plugin-config-runtime.js";
 
-afterEach(() => clearRuntimeConfigSnapshot());
+afterEach(() => snapshots.clearRuntimeConfigSnapshot());
+const configFor = (entries: NonNullable<OpenClawConfig["plugins"]>["entries"]): OpenClawConfig => ({
+  plugins: { entries },
+});
+
+it("reuses captured plugin policy across reads and keeps revisions independent", () => {
+  using normalize = vi.spyOn(normalization, "normalizePluginsConfigWithResolverCore");
+  const config = configFor({ " CODEX ": { config: { revision: 1 } } });
+  snapshots.setRuntimeConfigSnapshot(config);
+  const captured = snapshots.getRuntimeConfigSnapshot({ capture: true })!;
+  const payload = captured.plugins!.entries![" CODEX "]!.config;
+  normalize.mockClear();
+  for (let i = 0; i < 10; i++) {
+    expect(runtime.resolvePluginConfigObject(captured, "codex")).toBe(payload);
+  }
+  expect(normalize).not.toHaveBeenCalled();
+
+  config.plugins!.entries![" CODEX "]!.config = { revision: 2 };
+  snapshots.setRuntimeConfigSnapshot(config);
+  const next = snapshots.getRuntimeConfigSnapshot({ capture: true })!;
+  snapshots.clearRuntimeConfigSnapshot();
+  normalize.mockClear();
+  expect(runtime.resolvePluginConfigObject(next, "codex")).toEqual({ revision: 2 });
+  expect(runtime.resolvePluginConfigObject(captured, "codex")).toBe(payload);
+  expect(payload).toEqual({ revision: 1 });
+  expect(normalize).not.toHaveBeenCalled();
+});
 
 it("keeps public normalized policy mutable without changing the published host policy", () => {
-  const pluginConfig = { mode: "strict" };
-  const config: OpenClawConfig = {
-    plugins: {
-      allow: ["google"],
-      entries: { "google-gemini-cli": { enabled: true, config: pluginConfig } },
-    },
-  };
-  setRuntimeConfigSnapshot(config);
-  const policy = normalizePluginsConfig(config.plugins);
+  const pluginConfig = { enabled: false, mode: "strict" };
+  const config = configFor({ "google-gemini-cli": { enabled: true, config: pluginConfig } });
+  config.plugins!.allow = ["google"];
+  snapshots.setRuntimeConfigSnapshot(config);
+  const policy = runtime.normalizePluginsConfig(config.plugins);
   policy.allow.push("other");
   policy.entries.google!.enabled = false;
 
   expect(readNormalizedPluginsConfig(config.plugins).allow).toEqual(["google"]);
   expect(readNormalizedPluginsConfig(config.plugins).entries.google?.enabled).toBe(true);
-  expect(normalizePluginsConfig(config.plugins).entries.google?.enabled).toBe(true);
-  expect(resolvePluginConfigObject(config, "google")).toBe(pluginConfig);
+  expect(runtime.normalizePluginsConfig(config.plugins).entries.google?.enabled).toBe(true);
+  expect(runtime.resolvePluginConfigObject(config, "google")).toBe(pluginConfig);
   expect(Object.isFrozen(pluginConfig)).toBe(false);
 });
 
-describe("resolvePluginConfigObject", () => {
-  it("returns the plugin config object for a configured plugin entry", () => {
-    const config = {
-      plugins: {
-        entries: {
-          "demo-plugin": {
-            enabled: true,
-            config: {
-              enabled: false,
-              mode: "strict",
-            },
-          },
-        },
-      },
-    } as unknown as OpenClawConfig;
-
-    expect(resolvePluginConfigObject(config, "demo-plugin")).toEqual({
-      enabled: false,
-      mode: "strict",
-    });
+it("resolves normalized object configs and rejects missing or invalid configs", () => {
+  const config = configFor({
+    " CODEX ": { enabled: true, config: { supervision: { enabled: true } } },
+    // @ts-expect-error Exercise malformed persisted config at the runtime boundary.
+    "demo-plugin": { enabled: true, config: "bad-shape" },
+    // @ts-expect-error Arrays are also invalid persisted plugin config objects.
+    "array-plugin": { enabled: true, config: ["bad-shape"] },
   });
-
-  it("reads config through normalized plugin entry ids", () => {
-    const config = {
-      plugins: {
-        entries: {
-          " CODEX ": {
-            enabled: true,
-            config: { supervision: { enabled: true } },
-          },
-        },
-      },
-    } as unknown as OpenClawConfig;
-
-    expect(resolvePluginConfigObject(config, "codex")).toEqual({
-      supervision: { enabled: true },
-    });
-  });
-
-  it("returns undefined for missing or non-object plugin configs", () => {
-    const config = {
-      plugins: {
-        entries: {
-          "demo-plugin": {
-            enabled: true,
-            config: "bad-shape",
-          },
-          "array-plugin": {
-            enabled: true,
-            config: ["bad-shape"],
-          },
-        },
-      },
-    } as unknown as OpenClawConfig;
-
-    expect(resolvePluginConfigObject(config, "missing-plugin")).toBeUndefined();
-    expect(resolvePluginConfigObject(config, "demo-plugin")).toBeUndefined();
-    expect(resolvePluginConfigObject(config, "array-plugin")).toBeUndefined();
-    expect(resolvePluginConfigObject(undefined, "demo-plugin")).toBeUndefined();
-  });
+  expect(
+    ["codex", "missing-plugin", "demo-plugin", "array-plugin"].map((id) =>
+      runtime.resolvePluginConfigObject(config, id),
+    ),
+  ).toEqual([{ supervision: { enabled: true } }, undefined, undefined, undefined]);
+  expect(runtime.resolvePluginConfigObject(undefined, "demo-plugin")).toBeUndefined();
 });
 
-describe("resolveLivePluginConfigObject", () => {
-  it("falls back to startup config only when no runtime loader exists", () => {
-    expect(
-      resolveLivePluginConfigObject(undefined, "demo-plugin", {
-        enabled: true,
-      }),
-    ).toEqual({
-      enabled: true,
-    });
-  });
-
-  it("fails closed when the runtime loader exists but the plugin entry is missing", () => {
-    const config = {
-      plugins: {
-        entries: {},
-      },
-    } as unknown as OpenClawConfig;
-
-    expect(
-      resolveLivePluginConfigObject(() => config, "demo-plugin", {
-        enabled: true,
-      }),
-    ).toBeUndefined();
-  });
+it.each([false, true])("uses startup config only without a loader (loader=%s)", (hasLoader) => {
+  const startup = { enabled: true };
+  const loader = hasLoader ? () => configFor({}) : undefined;
+  expect(runtime.resolveLivePluginConfigObject(loader, "demo-plugin", startup)).toEqual(
+    hasLoader ? undefined : startup,
+  );
 });

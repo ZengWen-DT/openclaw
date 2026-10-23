@@ -1,5 +1,6 @@
 import {
   bucketRelativeTimeMs,
+  formatByteSize,
   formatCompactTokenCount as formatTokenUnits,
   type RelativeTimeUnit,
 } from "@openclaw/normalization-core";
@@ -10,6 +11,15 @@ import { i18n, t } from "../i18n/index.ts";
 import { formatUiError } from "./format-error.ts";
 
 export { formatByteSize } from "@openclaw/normalization-core";
+
+export function formatResourceBytes(bytes: number): string {
+  return formatByteSize(bytes, {
+    style: "legacy-binary",
+    maxUnit: "tera",
+    separator: " ",
+    fractionDigits: (value, unit) => (unit === "tera" || value < 10 ? 1 : 0),
+  });
+}
 
 export function formatCountdown(deadlineMs: number, nowMs: number, padMinutes = false): string {
   const totalSeconds = Math.max(0, Math.ceil((deadlineMs - nowMs) / 1_000));
@@ -23,7 +33,6 @@ type FormatTimeAgoOptions = {
 };
 
 type FormatRelativeTimestampOptions = {
-  dateFallback?: boolean;
   fallback?: string;
   suffix?: boolean;
 };
@@ -31,7 +40,7 @@ type FormatRelativeTimestampOptions = {
 let localeFormatters:
   | {
       locale: string;
-      units: Partial<Record<DurationPart["unit"], Intl.NumberFormat>>;
+      units: Partial<Record<`${DurationPart["unit"]}:${"narrow" | "long"}`, Intl.NumberFormat>>;
       relative?: Intl.RelativeTimeFormat;
     }
   | undefined;
@@ -46,12 +55,17 @@ function getLocaleFormatters() {
   return localeFormatters;
 }
 
-export function formatUnit({ value, unit }: DurationPart): string {
+export function formatUnit({
+  value,
+  unit,
+  unitDisplay = "narrow",
+}: DurationPart & { unitDisplay?: "narrow" | "long" }): string {
   const formatters = getLocaleFormatters();
-  return (formatters.units[unit] ??= new Intl.NumberFormat(formatters.locale, {
+  const key = `${unit}:${unitDisplay}` as const;
+  return (formatters.units[key] ??= new Intl.NumberFormat(formatters.locale, {
     style: "unit",
     unit,
-    unitDisplay: "narrow",
+    unitDisplay,
     maximumFractionDigits: 0,
   })).format(value);
 }
@@ -97,17 +111,6 @@ export function formatRelativeTimestamp(
       return formatUnit({ value, unit });
     }
     return isPast ? t("common.justNow") : formatRelative(value, unit);
-  }
-
-  if (options.dateFallback && unit === "day" && value > 7) {
-    try {
-      return new Intl.DateTimeFormat(i18n.getLocale(), {
-        month: "short",
-        day: "numeric",
-      }).format(new Date(timestampMs));
-    } catch {
-      // Finite timestamps can still be outside JavaScript's date range.
-    }
   }
 
   const signedValue = isPast ? -value : value;
@@ -174,38 +177,28 @@ export function createMsFormatter(
   };
 }
 
-export function formatDateMs(
-  ms?: number | null,
-  options?: Intl.DateTimeFormatOptions,
-  fallback = t("common.na"),
-): string {
-  const timestampMs = asDateTimestampMs(ms);
-  return timestampMs === undefined
-    ? fallback
-    : new Date(timestampMs).toLocaleDateString(i18n.getLocale(), options);
+function calendarFormatter(
+  method: "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString",
+  defaultOptions?: () => Intl.DateTimeFormatOptions,
+) {
+  return (
+    ms?: number | null,
+    options?: Intl.DateTimeFormatOptions,
+    fallback = t("common.na"),
+  ): string => {
+    const timestampMs = asDateTimestampMs(ms);
+    return timestampMs === undefined
+      ? fallback
+      : new Date(timestampMs)[method](
+          i18n.getLocale(),
+          defaultOptions && options == null ? defaultOptions() : options,
+        );
+  };
 }
 
-export function formatTimeMs(
-  ms?: number | null,
-  options?: Intl.DateTimeFormatOptions,
-  fallback = t("common.na"),
-): string {
-  const timestampMs = asDateTimestampMs(ms);
-  return timestampMs === undefined
-    ? fallback
-    : new Date(timestampMs).toLocaleTimeString(i18n.getLocale(), options ?? { timeStyle: "short" });
-}
-
-export function formatDateTimeMs(
-  ms?: number | null,
-  options?: Intl.DateTimeFormatOptions,
-  fallback = t("common.na"),
-): string {
-  const timestampMs = asDateTimestampMs(ms);
-  return timestampMs === undefined
-    ? fallback
-    : new Date(timestampMs).toLocaleString(i18n.getLocale(), options);
-}
+export const formatDateMs = calendarFormatter("toLocaleDateString");
+export const formatTimeMs = calendarFormatter("toLocaleTimeString", () => ({ timeStyle: "short" }));
+export const formatDateTimeMs = calendarFormatter("toLocaleString");
 
 export function formatList(values?: Array<string | null | undefined>): string {
   if (!values || values.length === 0) {

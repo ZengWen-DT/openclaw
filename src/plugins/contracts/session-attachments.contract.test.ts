@@ -243,7 +243,7 @@ describe("plugin session attachments", () => {
         config: {
           session: { store: storePath },
           agents: {
-            list: [{ id: "main", default: true, workspace: workspaceDir }],
+            entries: { main: { workspace: workspaceDir } },
           },
         },
       });
@@ -507,7 +507,7 @@ describe("plugin session attachments", () => {
       });
       setActivePluginRegistry(registry.registry);
 
-      const attachment = capturedApi?.sendSessionAttachment({
+      const attachment = capturedApi?.session.workflow.sendSessionAttachment({
         sessionKey: MAIN_SESSION_KEY,
         files: [{ path: filePath }],
       });
@@ -575,7 +575,7 @@ describe("plugin session attachments", () => {
       setActivePluginRegistry(registry.registry);
 
       await expect(
-        capturedApi?.sendSessionAttachment({
+        capturedApi?.session.workflow.sendSessionAttachment({
           sessionKey: MAIN_SESSION_KEY,
           files: [{ path: filePath }],
         }),

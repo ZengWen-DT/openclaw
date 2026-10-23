@@ -1,11 +1,3 @@
-/**
- * View-model for tool-call rows.
- *
- * Classifies a tool call into a small set of presentation kinds (command,
- * read, edit, write, search, fetch, generic) across the arg spellings used by
- * the OpenClaw session tools and foreign harnesses (Claude/Codex style).
- */
-
 import { asNullableRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { readNonBlankString } from "@openclaw/normalization-core/string-coerce";
 import { unwrapToolCallForDisplay } from "../../../../src/agents/tool-display-call.js";
@@ -19,9 +11,13 @@ import {
   type DiffLine,
   type DiffStat,
 } from "./tool-call-diff.ts";
+import {
+  COMMAND_TOOL_NAMES,
+  PATCH_TOOL_NAMES,
+  resolveToolCallInput,
+  type ToolCallKind,
+} from "./tool-call-input.ts";
 import { parsePatchView, type PatchFileOperation } from "./tool-call-patch.ts";
-
-type ToolCallKind = "command" | "read" | "edit" | "write" | "search" | "fetch" | "generic";
 
 type ToolCallViewSource = {
   name: string;
@@ -41,47 +37,11 @@ export type ToolCallView = {
   target?: string;
   /** Dimmed secondary detail (directory, query scope, URL host…). */
   targetDetail?: string;
-  /** Inline diff rows for edit/write calls. */
   diff?: DiffLine[];
   stat?: DiffStat;
   /** Producer-recorded operations for patch rows. */
   fileOperations?: PatchFileOperation[];
 };
-
-const COMMAND_TOOL_NAMES = new Set(["bash", "exec", "shell", "run_command", "run_terminal_cmd"]);
-const TEXT_EDITOR_TOOL_NAMES = new Set(["str_replace_editor", "str_replace_based_edit_tool"]);
-const PATCH_TOOL_NAMES = new Set(["apply_patch", "applypatch", "patch"]);
-const TOOL_KINDS: ReadonlyArray<readonly [ToolCallKind, ReadonlySet<string>]> = [
-  ["command", COMMAND_TOOL_NAMES],
-  ["read", new Set(["read", "read_file", "readfile", "notebookread", "notebook_read"])],
-  [
-    "edit",
-    new Set([
-      "edit",
-      "edit_file",
-      "multiedit",
-      "multi_edit",
-      "notebookedit",
-      "notebook_edit",
-      ...PATCH_TOOL_NAMES,
-    ]),
-  ],
-  ["write", new Set(["write", "write_file", "create_file"])],
-  ["search", new Set(["grep", "find", "glob", "ls", "list", "codebase_search"])],
-  ["fetch", new Set(["web_fetch", "webfetch", "fetch"])],
-];
-
-function resolvePathArg(args: Record<string, unknown> | null): string | undefined {
-  return (
-    readNonBlankString(args?.path) ??
-    readNonBlankString(args?.file_path) ??
-    readNonBlankString(args?.filePath) ??
-    readNonBlankString(args?.file) ??
-    readNonBlankString(args?.filepath) ??
-    readNonBlankString(args?.filename) ??
-    readNonBlankString(args?.notebook_path)
-  );
-}
 
 function splitPathForDisplay(path: string): { base: string; dir?: string } {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -92,15 +52,16 @@ function splitPathForDisplay(path: string): { base: string; dir?: string } {
   return { base: normalized.slice(slash + 1), dir: normalized.slice(0, slash) };
 }
 
-type EditPair = { oldText: string; newText: string };
-
 type ResolvedEditDiff = { diff: DiffLine[]; stat?: DiffStat };
 
 const MAX_LOCAL_DIFF_PAIRS = 8;
 const MAX_LOCAL_DIFF_INPUT_CHARS = 120_000;
 
-function readEditPairs(args: Record<string, unknown>): { pairs: EditPair[]; truncated: boolean } {
-  const pairs: EditPair[] = [];
+function resolveEditDiff(args: Record<string, unknown> | null): ResolvedEditDiff | null {
+  if (!args) {
+    return null;
+  }
+  const pairs: { oldText: string; newText: string }[] = [];
   let inputChars = 0;
   let truncated = false;
   const edits = Array.isArray(args.edits) ? args.edits : [args];
@@ -125,7 +86,18 @@ function readEditPairs(args: Record<string, unknown>): { pairs: EditPair[]; trun
       pairs.push({ oldText, newText });
     }
   }
-  return { pairs, truncated };
+  if (pairs.length === 0) {
+    return truncated ? { diff: [{ kind: "skip", text: "" }] } : null;
+  }
+  const sections = pairs.map((pair) => computeLineDiff(pair.oldText, pair.newText));
+  const result = joinDiffSections(sections, { truncated });
+  if (result.lines.length === 0) {
+    return null;
+  }
+  return {
+    diff: result.lines,
+    ...(result.kind === "complete" ? { stat: result.stat } : {}),
+  };
 }
 
 function readDetailsDiff(details: unknown): ResolvedEditDiff | null {
@@ -141,25 +113,6 @@ function readDetailsDiff(details: unknown): ResolvedEditDiff | null {
   return {
     diff: lines.lines,
     ...(lines.kind === "complete" ? { stat: lines.stat } : {}),
-  };
-}
-
-function resolveEditDiff(args: Record<string, unknown> | null): ResolvedEditDiff | null {
-  if (!args) {
-    return null;
-  }
-  const { pairs, truncated } = readEditPairs(args);
-  if (pairs.length === 0) {
-    return truncated ? { diff: [{ kind: "skip", text: "" }] } : null;
-  }
-  const sections = pairs.map((pair) => computeLineDiff(pair.oldText, pair.newText));
-  const result = joinDiffSections(sections, { truncated });
-  if (result.lines.length === 0) {
-    return null;
-  }
-  return {
-    diff: result.lines,
-    ...(result.kind === "complete" ? { stat: result.stat } : {}),
   };
 }
 
@@ -206,37 +159,6 @@ function resolvePatchView(args: Record<string, unknown> | null): ToolCallView | 
   };
 }
 
-function resolveToolCallKind(
-  key: string,
-  args: Record<string, unknown> | null,
-  editorCommand: string | undefined,
-): ToolCallKind {
-  if (TEXT_EDITOR_TOOL_NAMES.has(key)) {
-    switch (editorCommand) {
-      case "view":
-        return "read";
-      case "str_replace":
-      case "insert":
-      case "undo_edit":
-        return "edit";
-      case "create":
-        return "write";
-      default:
-        return "generic";
-    }
-  }
-  for (const [kind, names] of TOOL_KINDS) {
-    if (names.has(key)) {
-      return kind;
-    }
-  }
-  // Arg-shape fallback for harness-specific command tools.
-  if (args && typeof args.command === "string" && Object.keys(args).length <= 3) {
-    return "command";
-  }
-  return "generic";
-}
-
 // Cache entries remember which details object they were built from: live tool
 // rows first render with args only and gain result `details` (e.g. the edit
 // diff) later on the same args identity, which must invalidate the cache.
@@ -263,33 +185,24 @@ export function resolveToolCallView(source: ToolCallViewSource): ToolCallView {
   return view;
 }
 
-/**
- * Strip the `sh -lc '<command>'` wrapper harnesses add around agent commands
- * so rows show the command the model actually wrote. Display-only.
- */
-function unwrapShellWrapperCommand(command: string): string {
-  const match = command.match(
-    /^\s*(?:\/(?:usr\/)?bin\/)?(?:ba|z|da)?sh\s+-l?c\s+(['"])([\s\S]+)\1\s*$/,
-  );
-  return match?.[2] ?? command;
-}
-
 function buildToolCallView(
   source: ToolCallViewSource,
   args: Record<string, unknown> | null,
   key: string,
 ): ToolCallView {
-  const editorCommand = TEXT_EDITOR_TOOL_NAMES.has(key)
-    ? readNonBlankString(args?.command)?.trim().toLowerCase()
-    : undefined;
-  const kind = resolveToolCallKind(key, args, editorCommand);
+  const input = resolveToolCallInput(key, args);
+  const { kind, editorCommand } = input;
 
   if (kind === "command") {
-    const command = args ? readNonBlankString(args.command) : undefined;
+    const command = readNonBlankString(args?.command);
+    // Display the inner command from a harness's sh -lc wrapper.
+    const shellWrapper = command?.match(
+      /^\s*(?:\/(?:usr\/)?bin\/)?(?:ba|z|da)?sh\s+-l?c\s+(['"])([\s\S]+)\1\s*$/,
+    );
     return {
       kind,
       title: COMMAND_TOOL_NAMES.has(key) ? resolveExecTitle(args) : undefined,
-      command: command ? unwrapShellWrapperCommand(command) : command,
+      command: shellWrapper?.[2] ?? command,
       code: resolveExecCode(args),
     };
   }
@@ -299,7 +212,7 @@ function buildToolCallView(
   }
 
   if (kind === "read" || kind === "edit" || kind === "write") {
-    const path = resolvePathArg(args);
+    const path = input.path;
     if (!path) {
       return { kind: "generic" };
     }
@@ -326,11 +239,9 @@ function buildToolCallView(
     if (details?.changed === false) {
       return view;
     }
-    const content = args
-      ? editorCommand === "create"
-        ? readNonBlankString(args.file_text)
-        : readNonBlankString(args.content)
-      : undefined;
+    const content = readNonBlankString(
+      args?.[editorCommand === "create" ? "file_text" : "content"],
+    );
     if (!content) {
       return view;
     }
@@ -346,12 +257,11 @@ function buildToolCallView(
   }
 
   if (kind === "search") {
-    const pattern = args
-      ? (readNonBlankString(args.pattern) ??
-        readNonBlankString(args.query) ??
-        readNonBlankString(args.glob))
-      : undefined;
-    const path = resolvePathArg(args);
+    const pattern =
+      readNonBlankString(args?.pattern) ??
+      readNonBlankString(args?.query) ??
+      readNonBlankString(args?.glob);
+    const path = input.path;
     if (!pattern && !path) {
       return { kind: "generic" };
     }
@@ -359,7 +269,7 @@ function buildToolCallView(
   }
 
   if (kind === "fetch") {
-    const url = args ? readNonBlankString(args.url) : undefined;
+    const url = readNonBlankString(args?.url);
     if (!url) {
       return { kind: "generic" };
     }

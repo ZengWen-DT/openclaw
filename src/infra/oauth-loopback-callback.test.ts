@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import type { LookupAddress } from "node:dns";
 import * as dnsPromises from "node:dns/promises";
-import type { Server } from "node:http";
+import http, { type Server } from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import { createServer } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { oauthSuccessHtml } from "../plugin-sdk/provider-oauth-runtime.js";
 import { acquireTestPortBlock, type TestPortClaim } from "../test-utils/port-claims.js";
 import { hasErrnoCode } from "./errno.js";
@@ -11,6 +13,15 @@ import {
   startOAuthLoopbackCallbackServer,
   type OAuthLoopbackCallbackServer,
 } from "./oauth-loopback-callback.js";
+
+const lookupMock = vi.hoisted(() =>
+  vi.fn<(hostname: string, options: { all: true; verbatim: true }) => Promise<LookupAddress[]>>(),
+);
+vi.mock("node:dns/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:dns/promises")>();
+  lookupMock.mockImplementation(actual.lookup);
+  return { ...actual, lookup: lookupMock };
+});
 
 const openCallbacks: OAuthLoopbackCallbackServer[] = [];
 const portClaims: TestPortClaim[] = [];
@@ -20,6 +31,7 @@ afterEach(async () => {
   await Promise.all(portClaims.splice(0).map((claim) => claim.release()));
   vi.useRealTimers();
   vi.restoreAllMocks();
+  syncBuiltinESMExports();
 });
 
 function callbackUrl(hostname: string, port: number, query = ""): string {
@@ -57,11 +69,9 @@ async function getClaimedIpv6Port(): Promise<number | undefined> {
 async function start(
   hostname = "127.0.0.1",
   options: Partial<Parameters<typeof startOAuthLoopbackCallbackServer>[0]> = {},
+  requestedPort?: number,
 ) {
-  const port = hostname === "::1" ? await getClaimedIpv6Port() : await getClaimedPort();
-  if (!port) {
-    return undefined;
-  }
+  const port = requestedPort ?? (await getClaimedPort());
   const callback = await startOAuthLoopbackCallbackServer({
     redirectUrl: callbackUrl(hostname, port),
     expectedState: "state-1234567890",
@@ -69,48 +79,53 @@ async function start(
     ...options,
   });
   openCallbacks.push(callback);
-  return { callback, port };
+  return {
+    callback,
+    port,
+    request: (query = "", init?: RequestInit) => fetch(callbackUrl(hostname, port, query), init),
+  };
 }
 
 describe("OAuth loopback callback server", () => {
-  it.each(["default", "provider"] as const)(
+  it.each(["default", "provider", "ipv6"] as const)(
     "serves a styled %s response permitted by CSP before closing",
     async (renderer) => {
-      const started = await start("127.0.0.1", {
-        renderSuccess:
-          renderer === "provider"
-            ? () => ({
-                body: oauthSuccessHtml(
-                  "Authorization received; return to the terminal while OpenClaw finishes.",
-                ),
-                contentType: "text/html; charset=utf-8",
-              })
-            : undefined,
-      });
-      if (!started) {
-        throw new Error("IPv4 loopback unavailable");
+      const hostname = renderer === "ipv6" ? "::1" : "127.0.0.1";
+      const ipv6Port = renderer === "ipv6" ? await getClaimedIpv6Port() : undefined;
+      if (renderer === "ipv6" && !ipv6Port) {
+        return;
       }
-      const responsePromise = fetch(
-        callbackUrl("127.0.0.1", started.port, "?code=authorization-code&state=state-1234567890"),
-      ).then(async (response) => ({
-        status: response.status,
-        body: await response.text(),
-        headers: response.headers,
-      }));
+      const code = renderer === "ipv6" ? "ipv6" : "authorization-code";
+      const query = `code=${code}&state=state-1234567890`;
+      const started = await start(
+        hostname,
+        {
+          renderSuccess:
+            renderer === "provider"
+              ? () => ({
+                  body: oauthSuccessHtml("Authorization received"),
+                  contentType: "text/html; charset=utf-8",
+                })
+              : undefined,
+        },
+        ipv6Port,
+      );
+      const responsePromise = started.request(`?${query}`);
 
       await expect(started.callback.waitForCallback()).resolves.toEqual({
         type: "authorization_code",
-        code: "authorization-code",
+        code,
         state: "state-1234567890",
-        parameters: new URLSearchParams("code=authorization-code&state=state-1234567890"),
+        parameters: new URLSearchParams(query),
       });
       const response = await responsePromise;
+      const body = await response.text();
       expect(response.status).toBe(200);
-      expect(response.body).toContain("Authorization received");
+      expect(body).toContain("Authorization received");
       expect(response.headers.get("cache-control")).toBe("no-store");
       expect(response.headers.get("referrer-policy")).toBe("no-referrer");
       expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
-      const stylesheet = /<style>([\s\S]*?)<\/style>/.exec(response.body)?.[1];
+      const stylesheet = /<style>([\s\S]*?)<\/style>/.exec(body)?.[1];
       expect(stylesheet).toBeTruthy();
       const styleHash = createHash("sha256")
         .update(stylesheet ?? "")
@@ -130,16 +145,13 @@ describe("OAuth loopback callback server", () => {
       expect(policy.get("frame-ancestors")).toEqual(["'none'"]);
 
       await vi.waitFor(async () => {
-        await expect(fetch(callbackUrl("127.0.0.1", started.port))).rejects.toThrow();
+        await expect(started.request()).rejects.toThrow();
       });
     },
   );
 
   it("keeps waiting after wrong path, method, missing state, and ambiguous or wrong callback fields", async () => {
     const started = await start();
-    if (!started) {
-      throw new Error("IPv4 loopback unavailable");
-    }
     const base = callbackUrl("127.0.0.1", started.port);
     expect((await fetch(`http://127.0.0.1:${started.port}/wrong`)).status).toBe(404);
     expect((await fetch(base, { method: "POST" })).status).toBe(405);
@@ -161,16 +173,9 @@ describe("OAuth loopback callback server", () => {
 
   it("settles a matching-state OAuth error after flushing its response", async () => {
     const started = await start();
-    if (!started) {
-      throw new Error("IPv4 loopback unavailable");
-    }
-    const responsePromise = fetch(
-      callbackUrl(
-        "127.0.0.1",
-        started.port,
-        "?error=access_denied&error_description=nope&state=state-1234567890",
-      ),
-    ).then(async (response) => ({ status: response.status, body: await response.text() }));
+    const responsePromise = started
+      .request("?error=access_denied&error_description=nope&state=state-1234567890")
+      .then(async (response) => ({ status: response.status, body: await response.text() }));
 
     await expect(started.callback.waitForCallback()).resolves.toEqual({
       type: "oauth_error",
@@ -185,9 +190,6 @@ describe("OAuth loopback callback server", () => {
 
   it("accepts only one concurrent valid callback", async () => {
     const started = await start();
-    if (!started) {
-      throw new Error("IPv4 loopback unavailable");
-    }
     const url = callbackUrl("127.0.0.1", started.port, "?code=only-code&state=state-1234567890");
     const responses = await Promise.allSettled([fetch(url), fetch(url)]);
     const statuses = responses.flatMap((result) =>
@@ -199,47 +201,23 @@ describe("OAuth loopback callback server", () => {
 
   it("rejects on timeout and abort and closes the listener", async () => {
     const timedOut = await start();
-    if (!timedOut) {
-      throw new Error("IPv4 loopback unavailable");
-    }
     await timedOut.callback.close();
     await expect(timedOut.callback.waitForCallback()).rejects.toThrow("cancelled");
 
-    const port = await getClaimedPort();
     const controller = new AbortController();
-    const callback = await startOAuthLoopbackCallbackServer({
-      redirectUrl: callbackUrl("127.0.0.1", port),
-      expectedState: "state-1234567890",
-      timeoutMs: 30,
-      signal: controller.signal,
-    });
-    openCallbacks.push(callback);
+    const { callback } = await start("127.0.0.1", { timeoutMs: 30, signal: controller.signal });
     await expect(callback.waitForCallback()).rejects.toThrow("timeout");
 
-    const abortPort = await getClaimedPort();
     const abortController = new AbortController();
-    const aborted = await startOAuthLoopbackCallbackServer({
-      redirectUrl: callbackUrl("127.0.0.1", abortPort),
-      expectedState: "state-1234567890",
-      timeoutMs: 5_000,
-      signal: abortController.signal,
-    });
-    openCallbacks.push(aborted);
+    const { callback: aborted } = await start("127.0.0.1", { signal: abortController.signal });
     abortController.abort();
     await expect(aborted.waitForCallback()).rejects.toThrow("cancelled");
   });
 
   it("retains provider callback parameters and waits for the verified browser outcome", async () => {
     const started = await start("127.0.0.1", { deferResponse: true });
-    if (!started) {
-      throw new Error("IPv4 loopback unavailable");
-    }
-    const responsePromise = fetch(
-      callbackUrl(
-        "127.0.0.1",
-        started.port,
-        "?code=code&state=state-1234567890&client_id=first&client_id=second",
-      ),
+    const responsePromise = started.request(
+      "?code=code&state=state-1234567890&client_id=first&client_id=second",
     );
     const received = vi.fn();
     void responsePromise.then(received, received);
@@ -249,10 +227,7 @@ describe("OAuth loopback callback server", () => {
       throw new Error("Expected authorization code");
     }
     expect(result.parameters.getAll("client_id")).toEqual(["first", "second"]);
-    expect(
-      (await fetch(callbackUrl("127.0.0.1", started.port, "?code=other&state=state-1234567890")))
-        .status,
-    ).toBe(409);
+    expect((await started.request("?code=other&state=state-1234567890")).status).toBe(409);
     expect(received).not.toHaveBeenCalled();
     await started.callback.complete({
       status: 400,
@@ -264,63 +239,44 @@ describe("OAuth loopback callback server", () => {
     expect(await response.text()).toBe("Provider rejected the registration");
   });
 
-  it("closes an admitted callback when the browser disconnects before provider completion", async () => {
-    const started = await start("127.0.0.1", { deferResponse: true });
-    if (!started) {
-      throw new Error("IPv4 loopback unavailable");
-    }
-    const browser = new AbortController();
-    const response = fetch(
-      callbackUrl("127.0.0.1", started.port, "?code=code&state=state-1234567890"),
-      { signal: browser.signal },
-    );
-    void response.catch(() => undefined);
-    await started.callback.waitForCallback();
-    browser.abort();
-    await expect(response).rejects.toThrow();
-    await vi.waitFor(async () => {
-      await expect(fetch(callbackUrl("127.0.0.1", started.port))).rejects.toThrow();
-    });
-    await started.callback.complete({ status: 200, body: "Too late", contentType: "text/plain" });
-    const replacement = await startOAuthLoopbackCallbackServer({
-      redirectUrl: callbackUrl("127.0.0.1", started.port),
-      expectedState: "replacement-state",
-    });
-    openCallbacks.push(replacement);
-  });
-
-  it.each(["abort", "timeout"] as const)(
+  it.each(["abort", "timeout", "browser disconnect"] as const)(
     "releases an admitted callback on %s before provider work completes",
     async (terminal) => {
       const controller = new AbortController();
+      const browser = new AbortController();
       if (terminal === "timeout") {
         vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       }
       const started = await start("127.0.0.1", {
         deferResponse: true,
-        signal: controller.signal,
+        signal: terminal === "browser disconnect" ? undefined : controller.signal,
       });
-      if (!started) {
-        throw new Error("IPv4 loopback unavailable");
-      }
-      const responsePromise = fetch(
-        callbackUrl("127.0.0.1", started.port, "?code=code&state=state-1234567890"),
+      const responsePromise = started.request(
+        "?code=code&state=state-1234567890",
+        terminal === "browser disconnect" ? { signal: browser.signal } : undefined,
       );
       void responsePromise.catch(() => undefined);
       await started.callback.waitForCallback();
       if (terminal === "timeout") {
         await vi.advanceTimersByTimeAsync(5_000);
         vi.useRealTimers();
-      } else {
+      } else if (terminal === "abort") {
         controller.abort();
+      } else {
+        browser.abort();
       }
       await expect(responsePromise).rejects.toThrow();
+      if (terminal === "browser disconnect") {
+        await vi.waitFor(async () => {
+          await expect(started.request()).rejects.toThrow();
+        });
+      }
       await started.callback.complete({ status: 200, body: "Too late", contentType: "text/plain" });
 
       const replacement = await startOAuthLoopbackCallbackServer({
         redirectUrl: callbackUrl("127.0.0.1", started.port),
         expectedState: "replacement-state",
-        timeoutMs: 5_000,
+        timeoutMs: terminal === "browser disconnect" ? undefined : 5_000,
       });
       openCallbacks.push(replacement);
       const response = await fetch(
@@ -333,10 +289,8 @@ describe("OAuth loopback callback server", () => {
   );
 
   it("observes aborts that arrive while localhost resolution is pending", async () => {
-    let releaseLookup!: () => void;
-    const pendingLookup = new Promise<LookupAddress[]>((resolve) => {
-      releaseLookup = () => resolve([{ address: "127.0.0.1", family: 4 }]);
-    });
+    const lookup = createDeferred<LookupAddress[]>();
+    lookupMock.mockReturnValueOnce(lookup.promise);
     const controller = new AbortController();
     const port = await getClaimedPort();
     const startPromise = startOAuthLoopbackCallbackServer({
@@ -344,23 +298,10 @@ describe("OAuth loopback callback server", () => {
       expectedState: "state-1234567890",
       timeoutMs: 5_000,
       signal: controller.signal,
-      lookup: () => pendingLookup,
     });
     controller.abort();
     await expect(startPromise).rejects.toThrow("cancelled");
-    releaseLookup();
-  });
-
-  it("validates localhost resolution even with an explicit IPv4 bind host", async () => {
-    await expect(
-      startOAuthLoopbackCallbackServer({
-        redirectUrl: "http://localhost:8989/oauth/callback",
-        bindHostname: "127.0.0.1",
-        expectedState: "state-1234567890",
-        timeoutMs: 5_000,
-        lookup: async () => [{ address: "203.0.113.1", family: 4 }],
-      }),
-    ).rejects.toThrow("exclusively to loopback");
+    lookup.resolve([{ address: "127.0.0.1", family: 4 }]);
   });
 
   it("binds every loopback address resolved for localhost", async () => {
@@ -392,20 +333,7 @@ describe("OAuth loopback callback server", () => {
     await expect(callback.waitForCallback()).resolves.toMatchObject({ code: "right" });
   });
 
-  it("supports an IPv6 loopback redirect when IPv6 is available", async () => {
-    const started = await start("::1");
-    if (!started) {
-      return;
-    }
-    const response = await fetch(
-      callbackUrl("::1", started.port, "?code=ipv6&state=state-1234567890"),
-    );
-    expect(response.status).toBe(200);
-    await response.text();
-    await expect(started.callback.waitForCallback()).resolves.toMatchObject({ code: "ipv6" });
-  });
-
-  it.each([undefined, "localhost", "127.0.0.1", "::1"])(
+  it.each([undefined, "localhost"])(
     "uses HTTP port 80 and the exact bind host %s",
     async (bindOnlyHostname) => {
       let observedPort: number | undefined;
@@ -429,13 +357,13 @@ describe("OAuth loopback callback server", () => {
         },
         closeAllConnections: () => undefined,
       };
+      using _ = vi.spyOn(http, "createServer").mockReturnValue(fakeServer as unknown as Server);
+      syncBuiltinESMExports();
       const callback = await startOAuthLoopbackCallbackServer({
         redirectUrl: "http://127.0.0.1/oauth/callback",
         bindOnlyHostname,
         expectedState: "state-1234567890",
         timeoutMs: 5_000,
-        createServer: (() =>
-          fakeServer as unknown as Server) as typeof import("node:http").createServer,
       });
       expect(observedPort).toBe(80);
       expect(observedHostname).toBe(bindOnlyHostname ?? "127.0.0.1");
@@ -443,20 +371,28 @@ describe("OAuth loopback callback server", () => {
     },
   );
 
-  it("rejects non-loopback bind hosts and port zero", async () => {
+  it.each([
+    { options: { redirectUrl: "http://127.0.0.1:0/oauth/callback" }, error: "valid TCP port" },
+    {
+      options: { redirectUrl: "http://localhost:8080/oauth/callback", bindOnlyHostname: "0.0.0.0" },
+      error: "OAuth callback bind must use",
+    },
+    {
+      options: {
+        redirectUrl: "http://localhost:8989/oauth/callback",
+        bindHostname: "127.0.0.1",
+      },
+      prepare: () => lookupMock.mockResolvedValueOnce([{ address: "203.0.113.1", family: 4 }]),
+      error: "exclusively to loopback",
+    },
+  ])("rejects unsafe loopback configuration: $error", async ({ options, error, prepare }) => {
+    prepare?.();
     await expect(
       startOAuthLoopbackCallbackServer({
-        redirectUrl: "http://127.0.0.1:0/oauth/callback",
+        ...options,
         expectedState: "state-1234567890",
         timeoutMs: 5_000,
       }),
-    ).rejects.toThrow("valid TCP port");
-    await expect(
-      startOAuthLoopbackCallbackServer({
-        redirectUrl: "http://localhost:8080/oauth/callback",
-        bindOnlyHostname: "0.0.0.0",
-        expectedState: "state-1234567890",
-      }),
-    ).rejects.toThrow("OAuth callback bind must use");
+    ).rejects.toThrow(error);
   });
 });

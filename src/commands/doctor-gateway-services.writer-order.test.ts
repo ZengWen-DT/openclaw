@@ -14,7 +14,7 @@ import {
   readSecretStoreValue,
   writeSecretStoreEntry,
 } from "../secrets/store/secret-store.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { VERSION } from "../version.js";
 import { withDoctorConfigPreflightHome } from "./doctor-config-preflight.test-support.js";
@@ -36,10 +36,9 @@ vi.mock("./doctor-gateway-services.js", async (importOriginal) => ({
   maybeResolveDuelingSystemdGatewayScopes: vi.fn(),
 }));
 vi.mock("./doctor-foreign-launchd-jobs.js", () => ({ noteMacForeignLaunchdJobs: vi.fn() }));
-vi.mock("./doctor-platform-notes.js", () => ({
-  noteMacLaunchAgentOverrides: vi.fn(),
-  noteMacStaleOpenClawUpdateLaunchdJobs: vi.fn(),
-  noteMacLaunchctlGatewayEnvOverrides: vi.fn(),
+vi.mock("./doctor-platform-notes.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./doctor-platform-notes.js")>()),
+  noteMacGatewayPlatformWarnings: vi.fn(),
 }));
 vi.mock("../infra/container-environment.js", () => ({ isContainerEnvironment: () => false }));
 vi.mock("../daemon/service.js", () => ({
@@ -104,9 +103,9 @@ describe("Doctor gateway config writer ordering", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
-    closeOpenClawStateDatabaseForTest();
+    await closeOpenClawStateDatabaseAsync();
   });
 
   it.each([false, true])(
@@ -121,7 +120,7 @@ describe("Doctor gateway config writer ordering", () => {
         });
         const scope = { kind: "team" as const };
         if (existing) {
-          writeSecretStoreEntry({
+          await writeSecretStoreEntry({
             scope,
             name: "EXISTING_GATEWAY_TOKEN",
             value: token,
@@ -129,7 +128,7 @@ describe("Doctor gateway config writer ordering", () => {
             updatedBy: "fixture",
           });
         }
-        const entriesBefore = listSecretStoreEntries({ scope });
+        const entriesBefore = await listSecretStoreEntries({ scope });
         const originalBytes = await fs.readFile(configPath, "utf8");
         const ctx = await prepareWriterContext(configPath);
         const programArguments = [process.execPath, path.join(home, "openclaw.mjs"), "gateway"];
@@ -143,9 +142,9 @@ describe("Doctor gateway config writer ordering", () => {
         expect(bytes.includes(token)).toBe(false);
         const ref = JSON.parse(bytes).gateway.auth.token;
         expect(ref).toMatchObject({ source: "store", provider: "team" });
-        const stored = readSecretStoreValue({ scope, name: ref.id });
+        const stored = await readSecretStoreValue({ scope, name: ref.id });
         expect(stored.ok && stored.value === token).toBe(true);
-        const entriesAfter = listSecretStoreEntries({ scope });
+        const entriesAfter = await listSecretStoreEntries({ scope });
         if (existing) {
           expect(ref.id).toBe("EXISTING_GATEWAY_TOKEN");
           expect(entriesAfter).toEqual(entriesBefore);
@@ -158,7 +157,7 @@ describe("Doctor gateway config writer ordering", () => {
     },
   );
 
-  it.each(["success", "validation-refusal", "service-failure", "post-commit-failure"])(
+  it.each(["validation-refusal", "service-failure", "post-commit-failure"])(
     "uses Doctor's persisted baseline through service repair (%s)",
     async (outcome) => {
       await withGatewayServiceHome(
@@ -242,8 +241,18 @@ describe("Doctor gateway config writer ordering", () => {
             expect(ctx.cfgForPersistence).toBe(persistedBeforeService);
             expect(ctx.cfg.gateway?.auth?.token).toBeUndefined();
             expect(service.install).not.toHaveBeenCalled();
-            expect(ctx.runtime.error).toHaveBeenCalledWith(
+            expect(ctx.updateWarnings).toContainEqual(
               expect.stringContaining("Failed to persist gateway.auth.token before service repair"),
+            );
+            expect(ctx.healthFindings).toContainEqual(
+              expect.objectContaining({
+                category: "fix-now",
+                severity: "error",
+                message: expect.stringContaining(
+                  "Failed to persist gateway.auth.token before service repair",
+                ),
+                fixHint: expect.stringContaining("gateway status --deep"),
+              }),
             );
             expect(await fs.readFile(configPath, "utf8")).toBe(initialBytes);
             expect(await fs.readFile(`${configPath}.bak`, "utf8")).toBe(initialBackup);
@@ -263,8 +272,16 @@ describe("Doctor gateway config writer ordering", () => {
             );
             expect(ctx.cfg).toEqual(ctx.cfgForPersistence);
             if (outcome === "service-failure") {
-              expect(ctx.runtime.error).toHaveBeenCalledWith(
-                "Gateway service update failed: Error: fixture service install failed",
+              expect(ctx.updateWarnings).toContain(
+                "core/doctor/gateway-service: Gateway service update failed: Error: fixture service install failed",
+              );
+              expect(ctx.healthFindings).toContainEqual(
+                expect.objectContaining({
+                  category: "fix-now",
+                  severity: "error",
+                  message: "Gateway service update failed: Error: fixture service install failed",
+                  fixHint: expect.stringContaining("doctor --fix"),
+                }),
               );
             }
           }
@@ -396,8 +413,15 @@ describe("Doctor gateway config writer ordering", () => {
       expect(service.install).not.toHaveBeenCalled();
       expect(service.stage).not.toHaveBeenCalled();
       expect(service.restart).not.toHaveBeenCalled();
-      expect(ctx.runtime.error).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to persist gateway.auth.token before service repair"),
+      expect(ctx.healthFindings).toContainEqual(
+        expect.objectContaining({
+          category: "fix-now",
+          severity: "error",
+          message: expect.stringContaining(
+            "Failed to persist gateway.auth.token before service repair",
+          ),
+          fixHint: expect.stringContaining("gateway status --deep"),
+        }),
       );
       const snapshot = await readConfigFileSnapshot();
       expect(snapshot.valid).toBe(true);

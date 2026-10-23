@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 372878,
-  "reason": "Native sidebar bridge landing: measured production startup JS 372,878 B after rebasing onto main, +1,107 B (0.298%) over the prior baseline within the approved sub-1% ceiling rule. Matched-toolchain main measured 372,406 B versus 372,597 B before final action-module extraction (+191 B); retain the existing 512 B growth and 64 B build-variance allowances.",
-  "updatedAt": "2026-10-02"
+  "startupJsGzipBytes": 311358,
+  "reason": "Panel header imports and Labs/Usage copy: matched 721d124 build 311566 to 311358 B startup, 1333529 to 1324362 B Chat and 816308 to 814674 B New Session; seven startup JS requests.",
+  "updatedAt": "2026-10-23"
 }

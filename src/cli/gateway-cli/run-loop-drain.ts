@@ -4,9 +4,11 @@ import {
 } from "../../gateway/restart-trace.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import type { GatewayActiveWorkSnapshot } from "../../infra/gateway-active-work.js";
+import { formatGatewayDrainCounts } from "../../infra/gateway-drain.js";
 import type { SubsystemLogger } from "../../logging/subsystem.js";
-import type { GatewayRunSignalAction, GatewayRunSignalRequest } from "./run-loop-request.js";
-import { formatDrainCounts, formatShutdownReason } from "./run-loop-shutdown-format.js";
+import { beginGatewayShutdownCleanup } from "../../process/gateway-work-admission.js";
+import type { GatewayRunSignalRequest } from "./run-loop-request.js";
+import { formatShutdownReason } from "./run-loop-shutdown-format.js";
 
 const RESTART_DRAIN_STILL_PENDING_WARN_MS = 30_000;
 
@@ -28,19 +30,55 @@ export async function drainGatewayActiveWork({
   logger: Pick<SubsystemLogger, "info" | "warn">;
 }) {
   const { restartIntent } = request;
-  const reportDrainSnapshot = createGatewayDrainReporter(
-    request.action,
-    drainTimeoutMs,
-    runtime,
-    logger,
-    recordCounts,
-  );
+  let drainTimedOut = false;
+  const action = request.action;
+  const drainBudget =
+    drainTimeoutMs === undefined ? "without a timeout" : `with timeout ${drainTimeoutMs}ms`;
+  let lastPendingWarningAt: number | undefined;
+  const reportDrainSnapshot = (snapshot: GatewayActiveWorkSnapshot) => {
+    recordCounts(
+      `${formatGatewayDrainCounts(snapshot) || "no active work"}; pending owners: ${
+        snapshot.blockers.map(({ message }) => message).join("; ") || "none"
+      }`,
+    );
+    const now = Date.now();
+    if (lastPendingWarningAt === undefined) {
+      lastPendingWarningAt = now;
+      if (!snapshot.idle) {
+        logger.info(
+          `draining active work before ${action} ${drainBudget}: ${formatGatewayDrainCounts(snapshot)}`,
+        );
+        const requestTimeoutMs = Math.max(
+          0,
+          ...runtime
+            .listActiveSessionRunIds()
+            .map(
+              (sessionId) =>
+                runtime.getDiagnosticSessionActivitySnapshot({ sessionId })
+                  ?.activeModelCallRequestTimeoutMs ?? 0,
+            ),
+        );
+        if (requestTimeoutMs > 0) {
+          logger.info(
+            `largest observed model request timeout is ${requestTimeoutMs}ms; shutdown drain budget remains ${drainBudget}`,
+          );
+        }
+      }
+    } else if (
+      !snapshot.idle &&
+      now - lastPendingWarningAt >= RESTART_DRAIN_STILL_PENDING_WARN_MS
+    ) {
+      lastPendingWarningAt = now;
+      logger.warn(
+        `still draining active work before ${action}: ${formatGatewayDrainCounts(snapshot)}`,
+      );
+    }
+  };
   // On restart, wait for the canonical process activity inventory before
   // tearing down the server so active work can settle.
   if (request.action !== "stop") {
     let activeWorkAtDrainStart = 0;
     let activeRunsAtDrainStart = 0;
-    let drainTimedOut = false;
     await measureGatewayRestartTrace(
       "restart.drain",
       async () => {
@@ -58,6 +96,11 @@ export async function drainGatewayActiveWork({
         }
 
         reportDrainSnapshot(initialSnapshot);
+        if (request.interruptAfterDrain) {
+          logger.info("external restart owner already drained; interrupting remaining work");
+          runtime.abortActiveCronTaskRuns();
+          return;
+        }
         const remainingDrainTimeoutMs =
           restartDrainDeadlineAt === undefined
             ? undefined
@@ -72,11 +115,11 @@ export async function drainGatewayActiveWork({
           return;
         }
         drainTimedOut = true;
-        const warning = `restart drain budget ${drainTimeoutMs}ms exhausted; cutting short ${formatDrainCounts(drain.snapshot)}`;
+        const warning = `restart drain budget ${drainTimeoutMs}ms exhausted; cutting short ${formatGatewayDrainCounts(drain.snapshot)}`;
         recordWarning(warning);
         logger.warn(warning);
         // Connection work can retain cron cleanup; cancel before close joins it.
-        runtime.abortActiveCronTaskRuns("Gateway restarting.");
+        runtime.abortActiveCronTaskRuns();
       },
       () => [
         ["activeWork", activeWorkAtDrainStart],
@@ -96,11 +139,12 @@ export async function drainGatewayActiveWork({
         }),
       );
       if (!activeWorkDrain.drained) {
+        drainTimedOut = true;
         logger.warn(
-          `gateway active-work drain timeout reached; proceeding with shutdown: ${formatDrainCounts(activeWorkDrain.snapshot)}`,
+          `gateway active-work drain timeout reached; proceeding with shutdown: ${formatGatewayDrainCounts(activeWorkDrain.snapshot)}`,
         );
-        runtime.abortEmbeddedAgentRun(undefined, { mode: "all" });
-        runtime.abortActiveCronTaskRuns("Gateway stopping.");
+        // The server shutdown owner records task custody before canceling runs.
+        runtime.abortActiveCronTaskRuns();
       }
     } catch (err) {
       logger.warn(
@@ -109,52 +153,6 @@ export async function drainGatewayActiveWork({
     }
     logger.info("active-work drain settled; beginning server close");
   }
-}
-
-function createGatewayDrainReporter(
-  action: GatewayRunSignalAction,
-  drainTimeoutMs: number | undefined,
-  runtime: Pick<
-    typeof import("./lifecycle.runtime.js"),
-    "listActiveEmbeddedRunSessionIds" | "getDiagnosticSessionActivitySnapshot"
-  >,
-  logger: Pick<SubsystemLogger, "info" | "warn">,
-  recordCounts: (counts: string) => void,
-) {
-  const drainBudget =
-    drainTimeoutMs === undefined ? "without a timeout" : `with timeout ${drainTimeoutMs}ms`;
-  let lastPendingWarningAt: number | undefined;
-  return (snapshot: GatewayActiveWorkSnapshot) => {
-    recordCounts(formatDrainCounts(snapshot) || "no active work");
-    const now = Date.now();
-    if (lastPendingWarningAt === undefined) {
-      lastPendingWarningAt = now;
-      if (!snapshot.idle) {
-        logger.info(
-          `draining active work before ${action} ${drainBudget}: ${formatDrainCounts(snapshot)}`,
-        );
-        const requestTimeoutMs = Math.max(
-          0,
-          ...runtime
-            .listActiveEmbeddedRunSessionIds()
-            .map(
-              (sessionId) =>
-                runtime.getDiagnosticSessionActivitySnapshot({ sessionId })
-                  ?.activeModelCallRequestTimeoutMs ?? 0,
-            ),
-        );
-        if (requestTimeoutMs > 0) {
-          logger.info(
-            `largest observed model request timeout is ${requestTimeoutMs}ms; shutdown drain budget remains ${drainBudget}`,
-          );
-        }
-      }
-    } else if (
-      !snapshot.idle &&
-      now - lastPendingWarningAt >= RESTART_DRAIN_STILL_PENDING_WARN_MS
-    ) {
-      lastPendingWarningAt = now;
-      logger.warn(`still draining active work before ${action}: ${formatDrainCounts(snapshot)}`);
-    }
-  };
+  beginGatewayShutdownCleanup();
+  return drainTimedOut;
 }

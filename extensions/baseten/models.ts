@@ -37,6 +37,7 @@ const CHAT_TEMPLATE_THINKING_MODEL_IDS = new Set([
 const BASE_COMPAT: ModelCompatConfig = {
   supportsStore: false,
   supportsDeveloperRole: false,
+  supportsReasoningEffort: false,
   supportsUsageInStreaming: true,
   supportsStrictMode: true,
   supportsTools: true,
@@ -55,7 +56,7 @@ export function usesBasetenChatTemplateThinking(modelId: string): boolean {
 export function buildBasetenModelCompat(modelId: string): ModelCompatConfig {
   return {
     ...BASE_COMPAT,
-    ...structuredClone(BASETEN_MODEL_COMPAT.get(modelId)),
+    ...BASETEN_MODEL_COMPAT.get(modelId),
   };
 }
 
@@ -76,20 +77,6 @@ function readPerTokenPrice(value: unknown): number | undefined {
     : undefined;
 }
 
-function applyLiveReasoningEffortCompat(
-  fallbackCompat: ModelCompatConfig,
-  supportsReasoningEffort: boolean,
-): ModelCompatConfig {
-  if (supportsReasoningEffort) {
-    return { ...fallbackCompat, supportsReasoningEffort: true };
-  }
-  const compat = { ...fallbackCompat };
-  delete compat.supportsReasoningEffort;
-  delete compat.supportedReasoningEfforts;
-  delete compat.reasoningEffortMap;
-  return compat;
-}
-
 function projectLiveModel(
   row: Record<string, unknown>,
   fallback: ModelDefinitionConfig | undefined,
@@ -108,11 +95,24 @@ function projectLiveModel(
   const inputPrice = readPerTokenPrice(pricing.prompt);
   const outputPrice = readPerTokenPrice(pricing.completion);
   const cacheReadPrice = readPerTokenPrice(pricing.input_cache_read);
-  const supportsReasoningEffort = features.has("reasoning_effort");
+  // These current DeepSeek rows omit feature flags documented by Baseten's serving API.
+  const hasDocumentedSparseFeatures =
+    ["deepseek-ai/DeepSeek-V4.1-Flash", "deepseek-ai/DeepSeek-V4-Pro-0813"].includes(id) &&
+    ["tools", "reasoning", "json_mode", "structured_outputs"].every((feature) =>
+      features.has(feature),
+    );
   const fallbackCompat = fallback?.compat ?? buildBasetenModelCompat(id);
-  const compat = hasLiveFeatures
-    ? applyLiveReasoningEffortCompat(fallbackCompat, supportsReasoningEffort)
-    : fallbackCompat;
+  const supportsReasoningEffort =
+    features.has("reasoning_effort") ||
+    (hasDocumentedSparseFeatures && fallbackCompat.supportsReasoningEffort === true);
+  let compat = fallbackCompat;
+  if (hasLiveFeatures) {
+    compat = { ...fallbackCompat, supportsReasoningEffort };
+    if (!supportsReasoningEffort) {
+      delete compat.supportedReasoningEfforts;
+      delete compat.reasoningEffortMap;
+    }
+  }
 
   return {
     id,
@@ -121,7 +121,7 @@ function projectLiveModel(
       ? features.has("reasoning") || supportsReasoningEffort
       : (fallback?.reasoning ?? false),
     input: hasLiveFeatures
-      ? features.has("vision")
+      ? features.has("vision") || (hasDocumentedSparseFeatures && fallback?.input.includes("image"))
         ? ["text", "image"]
         : ["text"]
       : (fallback?.input ?? ["text"]),

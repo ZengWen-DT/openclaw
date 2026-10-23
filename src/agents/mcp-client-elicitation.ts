@@ -1,10 +1,18 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ProtocolError,
+  ProtocolErrorCode,
+  type Client,
+  type ClientContext,
+} from "@modelcontextprotocol/client";
+import { ElicitResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
+import { assertionSucceeds } from "../shared/assertion.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { getSessionMcpRequestSignal } from "./agent-bundle-mcp-request-context.js";
+
+export const MCP_ELICITATION_TIMEOUT_MS = 600_000;
 
 export type McpElicitationHandler = (request: {
   method: "elicitation/create" | "openai/elicitation/create";
@@ -38,38 +46,57 @@ export function captureMcpClientElicitation() {
 
 /** The SDK transport callback does not inherit the calling tool's async scope. */
 export function bindMcpClientElicitation(client: Client) {
-  const active = new Set<{ handler?: McpElicitationHandler; signal: AbortSignal }>();
+  const active = new Set<{
+    handler?: McpElicitationHandler;
+    signal: AbortSignal;
+    holdForHumanInput?: () => () => void;
+  }>();
   for (const method of ["elicitation/create", "openai/elicitation/create"] as const) {
-    const schema = z.object({
-      method: z.literal(method),
-      params: z.record(z.string(), z.unknown()),
-    });
-    client.setRequestHandler(schema, async (request, extra) => {
+    const handle = async (params: Record<string, unknown>, extra: ClientContext) => {
       // MCP 2025-11-25 does not carry a portable parent-call id. Never route a
       // server question to a different collaborator when requests overlap.
       const call = active.size === 1 ? active.values().next().value : undefined;
       if (!call?.handler) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
+        throw new ProtocolError(
+          ProtocolErrorCode.InvalidRequest,
           "MCP elicitation has no unambiguous active requester",
         );
       }
-      const signal = AbortSignal.any([call.signal, extra.signal]);
+      const signal = AbortSignal.any([call.signal, extra.mcpReq.signal]);
       signal.throwIfAborted();
-      const result = await call.handler({
-        method,
-        requestId: extra.requestId,
-        params: request.params,
-        signal,
-      });
-      signal.throwIfAborted();
-      if (!active.has(call)) {
-        throw new McpError(ErrorCode.InvalidRequest, "MCP elicitation requester expired");
+      const release = call.holdForHumanInput?.();
+      try {
+        const result = await call.handler({
+          method,
+          requestId: extra.mcpReq.id,
+          params,
+          signal,
+        });
+        signal.throwIfAborted();
+        if (!active.has(call)) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidRequest,
+            "MCP elicitation requester expired",
+          );
+        }
+        return result;
+      } finally {
+        release?.();
       }
-      return result;
-    });
+    };
+    if (method === "elicitation/create") {
+      client.setRequestHandler(method, async (request, extra) =>
+        ElicitResultSchema.parse(await handle(request.params, extra)),
+      );
+    } else {
+      client.setRequestHandler(method, { params: z.record(z.string(), z.unknown()) }, handle);
+    }
   }
-  return async <T>(signal: AbortSignal, run: () => Promise<T>): Promise<T> => {
+  return async <T>(
+    signal: AbortSignal,
+    run: () => Promise<T>,
+    holdForHumanInput?: () => () => void,
+  ): Promise<T> => {
     const handler = handlers.getStore();
     const restoreCaller = AsyncLocalStorage.snapshot();
     const call = {
@@ -77,6 +104,7 @@ export function bindMcpClientElicitation(client: Client) {
         ? (request: Parameters<McpElicitationHandler>[0]) => restoreCaller(handler, request)
         : undefined,
       signal,
+      holdForHumanInput,
     };
     active.add(call);
     try {
@@ -122,7 +150,7 @@ export function createMcpClientElicitationHandler(params: {
     const rich = request.method === "openai/elicitation/create";
     const value = snapshotStructuredInput(request.params, { richForm: rich });
     if (!isStructuredInputRecord(value)) {
-      throw new McpError(ErrorCode.InvalidParams, "Malformed MCP elicitation request");
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Malformed MCP elicitation request");
     }
     const resource =
       rich && params.prepareResourceContext && value.mode !== "url"
@@ -157,24 +185,17 @@ export function createMcpClientElicitationHandler(params: {
               },
             });
       if (input.kind === "unsupported") {
-        throw new McpError(ErrorCode.InvalidParams, input.message);
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, input.message);
       }
       const result = await runStructuredInput({
         input,
         sessionKey: params.sessionKey,
         agentId: params.agentId,
-        timeoutMs: 120_000,
+        timeoutMs: MCP_ELICITATION_TIMEOUT_MS,
         delivery: {},
         gatewayCall: params.gatewayCall,
         signal: request.signal,
-        isActive: () => {
-          try {
-            params.assertCurrent();
-            return true;
-          } catch {
-            return false;
-          }
-        },
+        isActive: () => assertionSucceeds(() => params.assertCurrent()),
       });
       params.assertCurrent();
       return result.status === "answered"

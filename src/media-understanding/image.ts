@@ -1,15 +1,21 @@
-import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { randomUUID } from "node:crypto";
+import { prepareHeadersForSimpleCompletion } from "@openclaw/ai/transports";
+import {
+  asPositiveFiniteNumber,
+  clampPositiveTimerTimeoutMs,
+} from "@openclaw/normalization-core/number-coercion";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeMediaProviderId } from "../../packages/media-understanding-common/src/provider-id.js";
+import { raceWithTimeout } from "../../packages/retry/src/index.js";
 import { isMinimaxVlmModel, minimaxUnderstandImage } from "../agents/minimax-vlm.js";
 import { requireApiKey, resolveApiKeyForProviderCore } from "../agents/model-auth.js";
 import { resolveProviderRequestCapabilities } from "../agents/provider-attribution.js";
 import {
   getModelProviderRequestRouteFacts,
   getModelProviderRequestTransport,
-  type ModelProviderRequestTransportOverrides,
 } from "../agents/provider-request-config.js";
+import type { ModelProviderRequestTransportOverrides } from "../agents/provider-request-config.types.js";
 import {
   unwrapModelHeaderSentinelsForProviderEgress,
   unwrapSecretSentinelsForProviderEgress,
@@ -20,55 +26,19 @@ import {
   hasImageReasoningOnlyResponse,
 } from "../agents/tools/image-tool.helpers.js";
 import { isSecretRef } from "../config/types.secrets.js";
+import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { complete } from "../llm/stream.js";
 import type { AssistantMessage, Context, Model, ProviderStreamOptions } from "../llm/types.js";
 import { runPluginStreamConsumer } from "../plugins/plugin-instance-scope.js";
 import { runWithAsyncWorkResources } from "../shared/async-work-resources.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
-import { getResolvedImageRuntimeContext, resolveImageRuntime } from "./image-model-runtime.js";
+import { resolveImageRuntime } from "./image-model-runtime.js";
 import type {
   ImageDescriptionRequest,
   ImageDescriptionResult,
   ImagesDescriptionRequest,
   ImagesDescriptionResult,
 } from "./types.js";
-
-function resolveImageToolMaxTokens(modelMaxTokens: number | undefined, requestedMaxTokens = 4096) {
-  if (
-    typeof modelMaxTokens !== "number" ||
-    !Number.isFinite(modelMaxTokens) ||
-    modelMaxTokens <= 0
-  ) {
-    return requestedMaxTokens;
-  }
-  return Math.min(requestedMaxTokens, modelMaxTokens);
-}
-
-function isNativeResponsesReasoningPayload(model: Model): boolean {
-  if (
-    model.api !== "openai-responses" &&
-    model.api !== "azure-openai-responses" &&
-    model.api !== "openai-chatgpt-responses"
-  ) {
-    return false;
-  }
-  return resolveProviderRequestCapabilities({
-    provider: model.provider,
-    api: model.api,
-    baseUrl: model.baseUrl,
-    capability: "image",
-    transport: "media-understanding",
-    providerMetadataOwners: getModelProviderRequestRouteFacts(model)?.providerMetadataOwners,
-  }).usesKnownNativeOpenAIRoute;
-}
-
-function removeReasoningInclude(value: unknown): unknown {
-  if (!Array.isArray(value)) {
-    return value;
-  }
-  const next = value.filter((entry) => entry !== "reasoning.encrypted_content");
-  return next.length > 0 ? next : undefined;
-}
 
 function disableReasoningForImageRetryPayload(payload: unknown, model: Model): unknown {
   // Empty-text image responses can be caused by reasoning-only payloads; retry
@@ -80,75 +50,31 @@ function disableReasoningForImageRetryPayload(payload: unknown, model: Model): u
   delete next.reasoning;
   delete next.reasoning_effort;
 
-  const include = removeReasoningInclude(next.include);
-  if (include === undefined) {
+  const include = Array.isArray(next.include)
+    ? next.include.filter((entry) => entry !== "reasoning.encrypted_content")
+    : next.include;
+  if (include === undefined || (Array.isArray(include) && include.length === 0)) {
     delete next.include;
   } else {
     next.include = include;
   }
 
-  if (isNativeResponsesReasoningPayload(model)) {
+  if (
+    (model.api === "openai-responses" ||
+      model.api === "azure-openai-responses" ||
+      model.api === "openai-chatgpt-responses") &&
+    resolveProviderRequestCapabilities({
+      provider: model.provider,
+      api: model.api,
+      baseUrl: model.baseUrl,
+      capability: "image",
+      transport: "media-understanding",
+      providerMetadataOwners: getModelProviderRequestRouteFacts(model)?.providerMetadataOwners,
+    }).usesKnownNativeOpenAIRoute
+  ) {
     next.reasoning = { effort: "none" };
   }
   return next;
-}
-
-function isImageModelNoTextError(err: unknown): boolean {
-  return err instanceof Error && /^Image model returned no text\b/.test(err.message);
-}
-
-function composeImageDescriptionPayloadHandlers(
-  first: ProviderStreamOptions["onPayload"] | undefined,
-  second: ProviderStreamOptions["onPayload"] | undefined,
-): ProviderStreamOptions["onPayload"] | undefined {
-  if (!first) {
-    return second;
-  }
-  if (!second) {
-    return first;
-  }
-  return (payload, payloadModel) => {
-    const runSecond = (firstResult: unknown) => {
-      const nextPayload = firstResult === undefined ? payload : firstResult;
-      const secondResult = second(nextPayload, payloadModel);
-      const coerceResult = (resolvedSecond: unknown) =>
-        resolvedSecond === undefined ? firstResult : resolvedSecond;
-      return isPromiseLike(secondResult)
-        ? Promise.resolve(secondResult).then(coerceResult)
-        : coerceResult(secondResult);
-    };
-    const firstResult = first(payload, payloadModel);
-    if (isPromiseLike(firstResult)) {
-      return Promise.resolve(firstResult).then(runSecond);
-    }
-    return runSecond(firstResult);
-  };
-}
-
-function buildImageContext(
-  prompt: string,
-  images: Array<{ buffer: Buffer; mime?: string }>,
-  opts?: { promptInUserContent?: boolean },
-): Context {
-  const imageContent = images.map((image) => ({
-    type: "image" as const,
-    data: image.buffer.toString("base64"),
-    mimeType: image.mime ?? "image/jpeg",
-  }));
-  const content = opts?.promptInUserContent
-    ? [{ type: "text" as const, text: prompt }, ...imageContent]
-    : imageContent;
-
-  return {
-    ...(opts?.promptInUserContent ? {} : { systemPrompt: prompt }),
-    messages: [
-      {
-        role: "user",
-        content,
-        timestamp: Date.now(),
-      },
-    ],
-  };
 }
 
 function shouldPlaceImagePromptInUserContent(model: Model): boolean {
@@ -172,16 +98,6 @@ function shouldPlaceImagePromptInUserContent(model: Model): boolean {
     capabilities.endpointClass === "modelstudio-native" ||
     (model.provider.toLowerCase() === "openrouter" && capabilities.endpointClass === "default")
   );
-}
-
-function buildImageRequestHeaders(model: Model): Record<string, string> | undefined {
-  if (model.provider !== "github-copilot") {
-    return undefined;
-  }
-  return {
-    "x-initiator": "user",
-    "Copilot-Vision-Request": "true",
-  };
 }
 
 async function describeImagesWithMinimax(params: {
@@ -226,10 +142,6 @@ async function describeImagesWithMinimax(params: {
     text: responses.join("\n\n").trim(),
     model: params.modelId,
   };
-}
-
-function isUnknownModelError(err: unknown): boolean {
-  return err instanceof Error && /^Unknown model:/i.test(err.message);
 }
 
 function resolveConfiguredProviderBaseUrl(
@@ -293,40 +205,6 @@ function hasConfiguredProviderApiKey(
   return (typeof apiKey === "string" && apiKey.trim().length > 0) || isSecretRef(apiKey);
 }
 
-function resolveMinimaxVlmAuthProvider(
-  cfg: ImageDescriptionRequest["cfg"],
-  provider: string,
-): string {
-  if (!isMinimaxCnAlias(provider) || hasConfiguredProviderApiKey(cfg, provider)) {
-    return provider;
-  }
-  return normalizeMediaProviderId(provider);
-}
-
-async function resolveMinimaxVlmFallbackRuntime(params: {
-  cfg: ImageDescriptionRequest["cfg"];
-  agentDir: string;
-  workspaceDir?: string;
-  provider: string;
-  profile?: string;
-  preferredProfile?: string;
-}): Promise<{ runtimeValue: string; modelBaseUrl?: string }> {
-  const authProvider = resolveMinimaxVlmAuthProvider(params.cfg, params.provider);
-  const auth = await resolveApiKeyForProviderCore({
-    provider: authProvider,
-    cfg: params.cfg,
-    secretSentinels: true,
-    profileId: params.profile,
-    preferredProfile: params.preferredProfile,
-    agentDir: params.agentDir,
-    ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
-  });
-  return {
-    runtimeValue: requireApiKey(auth, authProvider),
-    modelBaseUrl: resolveConfiguredProviderBaseUrl(params.cfg, params.provider),
-  };
-}
-
 function buildImageDescriptionTimeoutError(params: {
   phase: "setup" | "request";
   timeoutMs: number;
@@ -337,10 +215,7 @@ function buildImageDescriptionTimeoutError(params: {
       `image description setup timed out after ${params.timeoutMs}ms before provider request started`,
     );
   }
-  const setupDurationMs =
-    typeof params.setupDurationMs === "number" && Number.isFinite(params.setupDurationMs)
-      ? Math.max(0, Math.floor(params.setupDurationMs))
-      : 0;
+  const setupDurationMs = params.setupDurationMs ?? 0;
   return new Error(
     setupDurationMs > 0
       ? `image description request timed out after ${params.timeoutMs}ms (setup took ${setupDurationMs}ms before provider request started)`
@@ -356,57 +231,33 @@ async function withImageDescriptionTimeout<T>(params: {
   createTimeoutError: (timeoutMs: number) => Error;
 }): Promise<T> {
   params.signal?.throwIfAborted();
-  if (params.timeoutMs === undefined && !params.signal) {
-    return await params.task;
+  const abortError = (signal: AbortSignal) =>
+    signal.reason instanceof Error
+      ? signal.reason
+      : new Error("image description aborted", { cause: signal.reason });
+  if (params.timeoutMs === undefined) {
+    return await racePromiseWithAbortSignal(params.task, params.signal, abortError);
   }
-  let timeout: NodeJS.Timeout | undefined;
-  let removeAbortListener: (() => void) | undefined;
-  const races: Promise<T>[] = [params.task];
-  if (params.timeoutMs !== undefined) {
-    races.push(
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => {
-          params.controller.abort();
-          reject(params.createTimeoutError(params.timeoutMs!));
-        }, params.timeoutMs);
-      }),
-    );
-  }
-  if (params.signal) {
-    races.push(
-      new Promise<never>((_, reject) => {
-        const onAbort = () => {
-          try {
-            params.signal?.throwIfAborted();
-          } catch (error) {
-            reject(
-              error instanceof Error
-                ? error
-                : new Error("image description aborted", { cause: error }),
-            );
-          }
-        };
-        params.signal?.addEventListener("abort", onAbort, { once: true });
-        removeAbortListener = () => params.signal?.removeEventListener("abort", onAbort);
-        if (params.signal?.aborted) {
-          onAbort();
-        }
-      }),
-    );
-  }
-  try {
-    return await Promise.race(races);
-  } finally {
-    removeAbortListener?.();
-    if (timeout) {
-      clearTimeout(timeout);
-    }
-  }
+  const timeoutMs = params.timeoutMs;
+  return await raceWithTimeout(
+    params.task,
+    timeoutMs,
+    () => {
+      params.controller.abort();
+      throw params.createTimeoutError(timeoutMs);
+    },
+    {
+      signal: params.signal,
+      onAbort: (signal) => {
+        throw abortError(signal);
+      },
+    },
+  );
 }
 
-async function describeImagesWithModelInternal(
+export async function describeImagesWithModelPayloadTransformCore(
   params: ImagesDescriptionRequest,
-  options: { onPayload?: ProviderStreamOptions["onPayload"] } = {},
+  onPayload: ProviderStreamOptions["onPayload"],
 ): Promise<ImagesDescriptionResult> {
   return await runWithAsyncWorkResources(async (onAcquired) => {
     let assertResourcesOpen: (() => void) | undefined;
@@ -422,8 +273,7 @@ async function describeImagesWithModelInternal(
       params.cfg,
       params.provider,
     );
-    let runtimeValue: string;
-    let model: Model | undefined;
+    let resolved: Awaited<ReturnType<typeof resolveImageRuntime>>;
     const resolutionTask = trackAsyncWork(() =>
       resolveImageRuntime({ ...params, signal: requestSignal }, (resources) => {
         onAcquired({ release: async () => await resources[Symbol.asyncDispose]() });
@@ -432,7 +282,7 @@ async function describeImagesWithModelInternal(
     );
 
     try {
-      const resolved = await withImageDescriptionTimeout({
+      resolved = await withImageDescriptionTimeout({
         controller,
         signal: params.signal,
         timeoutMs: configuredTimeoutMs,
@@ -440,11 +290,12 @@ async function describeImagesWithModelInternal(
           buildImageDescriptionTimeoutError({ phase: "setup", timeoutMs }),
         task: resolutionTask,
       });
-      runtimeValue = resolved.runtimeValue;
-      model = resolved.model;
     } catch (err) {
       params.signal?.throwIfAborted();
-      if (!isMinimaxVlmModel(params.provider, params.model) || !isUnknownModelError(err)) {
+      if (
+        !isMinimaxVlmModel(params.provider, params.model) ||
+        !(err instanceof Error && /^Unknown model:/i.test(err.message))
+      ) {
         throw err;
       }
       const fallback = await withImageDescriptionTimeout({
@@ -453,7 +304,28 @@ async function describeImagesWithModelInternal(
         timeoutMs: configuredTimeoutMs,
         createTimeoutError: (timeoutMs) =>
           buildImageDescriptionTimeoutError({ phase: "setup", timeoutMs }),
-        task: trackAsyncWork(() => resolveMinimaxVlmFallbackRuntime(params)),
+        task: trackAsyncWork(async () => {
+          const authConfig = params.cfg;
+          const requestedProvider = params.provider;
+          const authProvider =
+            !isMinimaxCnAlias(requestedProvider) ||
+            hasConfiguredProviderApiKey(authConfig, requestedProvider)
+              ? requestedProvider
+              : normalizeMediaProviderId(requestedProvider);
+          const auth = await resolveApiKeyForProviderCore({
+            provider: authProvider,
+            cfg: params.cfg,
+            secretSentinels: true,
+            profileId: params.profile,
+            preferredProfile: params.preferredProfile,
+            agentDir: params.agentDir,
+            ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
+          });
+          return {
+            runtimeValue: requireApiKey(auth, authProvider),
+            modelBaseUrl: resolveConfiguredProviderBaseUrl(params.cfg, params.provider),
+          };
+        }),
       });
       return await describeImagesWithMinimax({
         assertResourcesOpen,
@@ -469,6 +341,7 @@ async function describeImagesWithModelInternal(
       });
     }
 
+    const { runtimeValue, model, cfg, agentDir, workspaceDir } = resolved;
     const apiKey = runtimeValue;
     params.signal?.throwIfAborted();
     assertResourcesOpen?.();
@@ -489,7 +362,6 @@ async function describeImagesWithModelInternal(
       });
     }
 
-    const resolvedRuntimeContext = getResolvedImageRuntimeContext(model);
     // Prepared auth may carry sentinel-protected request headers. Resolve them only at this
     // final direct-completion boundary so provider SDKs never receive sentinel placeholders.
     const requestModel = unwrapModelHeaderSentinelsForProviderEgress(
@@ -498,33 +370,65 @@ async function describeImagesWithModelInternal(
     );
     const providerStreamFn = registerProviderStreamForModel({
       model: requestModel,
-      cfg: resolvedRuntimeContext?.cfg ?? params.cfg,
-      agentDir: resolvedRuntimeContext?.agentDir ?? params.agentDir,
+      cfg,
+      agentDir,
       wrapProviderStream: true,
-      ...(resolvedRuntimeContext?.workspaceDir
-        ? { workspaceDir: resolvedRuntimeContext.workspaceDir }
-        : params.workspaceDir
-          ? { workspaceDir: params.workspaceDir }
-          : {}),
+      ...(workspaceDir ? { workspaceDir } : {}),
     });
 
-    const context = buildImageContext(prompt, params.images, {
-      promptInUserContent: shouldPlaceImagePromptInUserContent(model),
-    });
+    const promptInUserContent = shouldPlaceImagePromptInUserContent(model);
+    const context: Context = {
+      ...(promptInUserContent ? {} : { systemPrompt: prompt }),
+      messages: [
+        {
+          role: "user",
+          content: [
+            ...(promptInUserContent ? [{ type: "text" as const, text: prompt }] : []),
+            ...params.images.map((image) => ({
+              type: "image" as const,
+              data: image.buffer.toString("base64"),
+              mimeType: image.mime ?? "image/jpeg",
+            })),
+          ],
+          timestamp: Date.now(),
+        },
+      ],
+    };
 
-    const maxTokens = resolveImageToolMaxTokens(model.maxTokens, params.maxTokens);
-    const completeImage = async (onPayload?: ProviderStreamOptions["onPayload"]) => {
+    const maxTokens = Math.min(
+      params.maxTokens ?? 4096,
+      asPositiveFiniteNumber(model.maxTokens) ?? Number.POSITIVE_INFINITY,
+    );
+    // One image request carries one routing identity across the reasoning-only retry: re-rolling
+    // it per attempt would split a single image request across two provider conversations. The
+    // identity stays a routing header because a stream sessionId would also give unrelated
+    // providers prompt-cache affinity and retained WebSocket sessions.
+    const imageRequestHeaders = prepareHeadersForSimpleCompletion(requestModel, {
+      sessionId: randomUUID(),
+      ...(requestModel.provider === "github-copilot"
+        ? { headers: { "x-initiator": "user", "Copilot-Vision-Request": "true" } }
+        : {}),
+    });
+    const completeImage = async (retry = false) => {
       params.signal?.throwIfAborted();
       assertResourcesOpen?.();
-      const payloadHandler = composeImageDescriptionPayloadHandlers(onPayload, options.onPayload);
+      const payloadHandler: ProviderStreamOptions["onPayload"] = retry
+        ? (payload, payloadModel) => {
+            const stripped = disableReasoningForImageRetryPayload(payload, payloadModel);
+            const result = onPayload?.(stripped === undefined ? payload : stripped, payloadModel);
+            const fallback = (value: unknown) => (value === undefined ? stripped : value);
+            return isPromiseLike(result)
+              ? Promise.resolve(result).then(fallback)
+              : fallback(result);
+          }
+        : onPayload;
       const timeoutMs = configuredTimeoutMs;
-      const headers = buildImageRequestHeaders(requestModel);
       const streamOptions = {
         apiKey,
         maxTokens,
         signal: requestSignal,
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-        ...(headers ? { headers } : {}),
+        ...(imageRequestHeaders ? { headers: imageRequestHeaders } : {}),
         ...(payloadHandler ? { onPayload: payloadHandler } : {}),
       };
       const task: Promise<AssistantMessage> = trackAsyncWork(() => {
@@ -558,13 +462,16 @@ async function describeImagesWithModelInternal(
       });
       return { text, model: model.id };
     } catch (err) {
-      if (!isImageModelNoTextError(err) || !hasImageReasoningOnlyResponse(message)) {
+      if (
+        !(err instanceof Error && /^Image model returned no text\b/.test(err.message)) ||
+        !hasImageReasoningOnlyResponse(message)
+      ) {
         throw err;
       }
     }
 
     params.signal?.throwIfAborted();
-    const retryMessage = await completeImage(disableReasoningForImageRetryPayload);
+    const retryMessage = await completeImage(true);
     const text = coerceImageAssistantText({
       message: retryMessage,
       provider: model.provider,
@@ -598,14 +505,7 @@ function toImagesDescriptionRequest(params: ImageDescriptionRequest): ImagesDesc
 export async function describeImagesWithModelCore(
   params: ImagesDescriptionRequest,
 ): Promise<ImagesDescriptionResult> {
-  return await describeImagesWithModelInternal(params);
-}
-
-export async function describeImagesWithModelPayloadTransformCore(
-  params: ImagesDescriptionRequest,
-  onPayload: ProviderStreamOptions["onPayload"],
-): Promise<ImagesDescriptionResult> {
-  return await describeImagesWithModelInternal(params, { onPayload });
+  return await describeImagesWithModelPayloadTransformCore(params, undefined);
 }
 
 export async function describeImageWithModelCore(

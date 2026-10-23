@@ -2,11 +2,7 @@ import path from "node:path";
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
-import {
-  hasAgentRosterProperty,
-  listAgentEntries,
-  tryResolveLegacyCompatibilityAgentId,
-} from "../agents/agent-scope-config.js";
+import { listAgentEntries } from "../agents/agent-scope-config.js";
 import { tryResolveDefaultAgentId } from "../agents/agent-scope.js";
 import { resolveExecDefaults } from "../agents/exec-defaults.js";
 import { resolveSandboxConfigForAgent } from "../agents/sandbox/config.js";
@@ -37,20 +33,17 @@ import {
 } from "../infra/exec-safe-bin-runtime-policy.js";
 import { listRiskyConfiguredSafeBins } from "../infra/exec-safe-bin-semantics.js";
 import { resolvePluginControlPlaneWorkspace } from "../plugins/control-plane-workspace.js";
-import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import { collectAgentRosterFindings } from "./audit-agent-roster.js";
 import { collectDeepCodeSafetyFindings } from "./audit-deep-code-safety.js";
 import { collectDeepProbeFindings } from "./audit-deep-probe-findings.js";
-import {
-  formatPermissionDetail,
-  formatPermissionRemediation,
-  inspectPathPermissions,
-} from "./audit-fs.js";
+import { createPermissionAuditor } from "./audit-fs.js";
 import { collectGatewayConfigFindings } from "./audit-gateway-config.js";
 import {
   readBoundedMcporterRegistry,
   type McporterRegistryReadOutcome,
   type McporterRegistryRejectReason,
 } from "./audit-mcporter-registry.js";
+import { listConfiguredOpenInboundPolicyPaths } from "./audit-open-inbound.js";
 import type {
   SecurityAuditFinding,
   SecurityAuditReport,
@@ -92,7 +85,6 @@ type SecurityAuditOptions = {
   platform?: NodeJS.Platform;
   deep?: boolean;
   includeFilesystem?: boolean;
-  includeChannelSecurity?: boolean;
   /** Override where to check state (default: resolveStateDir()). */
   stateDir?: string;
   /** Override config path check (default: resolveConfigPath()). */
@@ -127,7 +119,6 @@ type AuditExecutionContext = Omit<SecurityAuditOptions, "config"> & {
   env: NodeJS.ProcessEnv;
   platform: NodeJS.Platform;
   includeFilesystem: boolean;
-  includeChannelSecurity: boolean;
   deep: boolean;
   deepTimeoutMs: number;
   stateDir: string;
@@ -136,34 +127,6 @@ type AuditExecutionContext = Omit<SecurityAuditOptions, "config"> & {
   configSnapshot: ConfigFileSnapshot | null;
   codeSafetySummaryCache: import("./audit.deep.runtime.js").CodeSafetySummaryCache;
 };
-
-const loadReadOnlyChannelPlugins = createLazyRuntimeModule(
-  () => import("../channels/plugins/read-only.js"),
-);
-
-const loadAuditNonDeepModule = createLazyRuntimeModule(() => import("./audit.nondeep.runtime.js"));
-
-const loadAuditChannelModule = createLazyRuntimeModule(
-  () => import("./audit-channel.collect.runtime.js"),
-);
-
-const loadPluginMetadataRegistryLoaderModule = createLazyRuntimeModule(
-  () => import("../plugins/runtime/metadata-registry-loader.js"),
-);
-
-const loadPluginAutoEnableModule = createLazyRuntimeModule(
-  () => import("../config/plugin-auto-enable.js"),
-);
-
-const loadChannelPluginIdsModule = createLazyRuntimeModule(
-  () => import("../plugins/channel-plugin-ids.js"),
-);
-
-const loadPluginRuntimeModule = createLazyRuntimeModule(() => import("../plugins/runtime.js"));
-
-const loadAuditGatewayProbeModule = createLazyRuntimeModule(
-  () => import("./audit-gateway-probe.js"),
-);
 
 function countBySeverity(findings: SecurityAuditFinding[]): SecurityAuditSummary {
   let critical = 0;
@@ -185,7 +148,6 @@ function emitSecurityAuditReportEvent(params: {
   summary: SecurityAuditSummary;
   deep: boolean;
   includeFilesystem: boolean;
-  includeChannelSecurity: boolean;
   suppressedCount: number;
 }) {
   const hasCritical = params.summary.critical > 0;
@@ -217,7 +179,7 @@ function emitSecurityAuditReportEvent(params: {
       suppressed_count: params.suppressedCount,
       deep: params.deep,
       include_filesystem: params.includeFilesystem,
-      include_channel_security: params.includeChannelSecurity,
+      include_channel_security: true,
     },
   });
 }
@@ -314,13 +276,6 @@ function applySecurityAuditSuppressions(
   return { findings: active, suppressedFindings };
 }
 
-function normalizeAllowFromList(list: Array<string | number> | undefined | null): string[] {
-  if (!Array.isArray(list)) {
-    return [];
-  }
-  return normalizeStringEntries(list);
-}
-
 async function collectFilesystemFindings(params: {
   stateDir: string;
   configPath: string;
@@ -329,14 +284,9 @@ async function collectFilesystemFindings(params: {
   execIcacls?: ExecFn;
 }): Promise<SecurityAuditFinding[]> {
   const findings: SecurityAuditFinding[] = [];
+  const auditPermissions = createPermissionAuditor(findings, params);
 
-  const stateDirPerms = await inspectPathPermissions(params.stateDir, {
-    env: params.env,
-    platform: params.platform,
-    exec: params.execIcacls,
-  });
-  if (stateDirPerms.ok) {
-    let permissionFinding: SecurityAuditFinding | undefined;
+  await auditPermissions(params.stateDir, true, (stateDirPerms) => {
     if (stateDirPerms.isSymlink) {
       findings.push({
         checkId: "fs.state_dir.symlink",
@@ -346,48 +296,31 @@ async function collectFilesystemFindings(params: {
       });
     }
     if (stateDirPerms.worldWritable) {
-      permissionFinding = {
+      return {
         checkId: "fs.state_dir.perms_world_writable",
         severity: "critical",
         title: "State dir is world-writable",
-        detail: `${formatPermissionDetail(params.stateDir, stateDirPerms)}; other users can write into your OpenClaw state.`,
+        detail: "other users can write into your OpenClaw state.",
       };
     } else if (stateDirPerms.groupWritable) {
-      permissionFinding = {
+      return {
         checkId: "fs.state_dir.perms_group_writable",
         severity: "warn",
         title: "State dir is group-writable",
-        detail: `${formatPermissionDetail(params.stateDir, stateDirPerms)}; group users can write into your OpenClaw state.`,
+        detail: "group users can write into your OpenClaw state.",
       };
     } else if (stateDirPerms.groupReadable || stateDirPerms.worldReadable) {
-      permissionFinding = {
+      return {
         checkId: "fs.state_dir.perms_readable",
         severity: "warn",
         title: "State dir is readable by others",
-        detail: `${formatPermissionDetail(params.stateDir, stateDirPerms)}; consider restricting to 700.`,
+        detail: "consider restricting to 700.",
       };
     }
-    if (permissionFinding) {
-      findings.push({
-        ...permissionFinding,
-        remediation: formatPermissionRemediation({
-          targetPath: params.stateDir,
-          perms: stateDirPerms,
-          isDir: true,
-          posixMode: 0o700,
-          env: params.env,
-        }),
-      });
-    }
-  }
-
-  const configPerms = await inspectPathPermissions(params.configPath, {
-    env: params.env,
-    platform: params.platform,
-    exec: params.execIcacls,
+    return undefined;
   });
-  if (configPerms.ok) {
-    let permissionFinding: SecurityAuditFinding | undefined;
+
+  await auditPermissions(params.configPath, false, (configPerms) => {
     const skipReadablePermWarnings = configPerms.isSymlink;
     if (configPerms.isSymlink) {
       findings.push({
@@ -398,40 +331,29 @@ async function collectFilesystemFindings(params: {
       });
     }
     if (configPerms.worldWritable || configPerms.groupWritable) {
-      permissionFinding = {
+      return {
         checkId: "fs.config.perms_writable",
         severity: "critical",
         title: "Config file is writable by others",
-        detail: `${formatPermissionDetail(params.configPath, configPerms)}; another user could change gateway/auth/tool policies.`,
+        detail: "another user could change gateway/auth/tool policies.",
       };
     } else if (!skipReadablePermWarnings && configPerms.worldReadable) {
-      permissionFinding = {
+      return {
         checkId: "fs.config.perms_world_readable",
         severity: "critical",
         title: "Config file is world-readable",
-        detail: `${formatPermissionDetail(params.configPath, configPerms)}; config can contain tokens and private settings.`,
+        detail: "config can contain tokens and private settings.",
       };
     } else if (!skipReadablePermWarnings && configPerms.groupReadable) {
-      permissionFinding = {
+      return {
         checkId: "fs.config.perms_group_readable",
         severity: "warn",
         title: "Config file is group-readable",
-        detail: `${formatPermissionDetail(params.configPath, configPerms)}; config can contain tokens and private settings.`,
+        detail: "config can contain tokens and private settings.",
       };
     }
-    if (permissionFinding) {
-      findings.push({
-        ...permissionFinding,
-        remediation: formatPermissionRemediation({
-          targetPath: params.configPath,
-          perms: configPerms,
-          isDir: false,
-          posixMode: 0o600,
-          env: params.env,
-        }),
-      });
-    }
-  }
+    return undefined;
+  });
 
   return findings;
 }
@@ -442,10 +364,10 @@ async function collectPluginSecurityAuditFindings(
   if (!context.loadPluginSecurityCollectors) {
     return [];
   }
-  const { getActivePluginRegistry } = await loadPluginRuntimeModule();
+  const { getActivePluginRegistry } = await import("../plugins/runtime.js");
   let collectors = getActivePluginRegistry()?.securityAuditCollectors ?? [];
   if (collectors.length === 0) {
-    const { applyPluginAutoEnable } = await loadPluginAutoEnableModule();
+    const { applyPluginAutoEnable } = await import("../config/plugin-auto-enable.js");
     const autoEnabled = applyPluginAutoEnable({
       config: context.sourceConfig,
       env: context.env,
@@ -459,10 +381,11 @@ async function collectPluginSecurityAuditFindings(
           .map(([id]) => id),
       ]),
     );
-    if (context.includeChannelSecurity && context.plugins !== undefined) {
-      const { resolveConfiguredChannelPluginIds } = await loadChannelPluginIdsModule();
+    if (context.plugins !== undefined) {
+      const { resolveConfiguredChannelPluginIdsAsync } =
+        await import("../plugins/channel-plugin-ids.js");
       const auditedChannelPluginIds = new Set(context.plugins.map((plugin) => plugin.id));
-      for (const pluginId of resolveConfiguredChannelPluginIds({
+      for (const pluginId of await resolveConfiguredChannelPluginIdsAsync({
         config: autoEnabled.config,
         activationSourceConfig: context.sourceConfig,
         workspaceDir: context.workspaceDir,
@@ -477,7 +400,7 @@ async function collectPluginSecurityAuditFindings(
       return [];
     }
     const snapshot = (
-      await loadPluginMetadataRegistryLoaderModule()
+      await import("../plugins/runtime/metadata-registry-loader.js")
     ).loadPluginMetadataRegistrySnapshot({
       config: autoEnabled.config,
       activationSourceConfig: context.sourceConfig,
@@ -521,7 +444,7 @@ function collectElevatedFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
     return findings;
   }
   for (const [provider, list] of Object.entries(allowFrom)) {
-    const normalized = normalizeAllowFromList(list);
+    const normalized = normalizeStringEntries(Array.isArray(list) ? list : []);
     if (normalized.includes("*")) {
       findings.push({
         checkId: `tools.elevated.allowFrom.${provider}.wildcard`,
@@ -542,7 +465,10 @@ function collectElevatedFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   return findings;
 }
 
-function collectExecRuntimeFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
+function collectExecRuntimeFindings(
+  cfg: OpenClawConfig,
+  openExecSurfacePaths: string[],
+): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
   const globalExecHost = cfg.tools?.exec?.host;
   const globalStrictInlineEval = cfg.tools?.exec?.strictInlineEval === true;
@@ -614,7 +540,6 @@ function collectExecRuntimeFindings(cfg: OpenClawConfig): SecurityAuditFinding[]
   );
   const fullExecScopes = effectiveExecScopes.filter((entry) => entry.security === "full");
   const execEnabledScopes = effectiveExecScopes.filter((entry) => entry.security !== "deny");
-  const openExecSurfacePaths = collectOpenExecSurfacePaths(cfg);
 
   if (fullExecScopes.length > 0) {
     findings.push({
@@ -825,37 +750,6 @@ function collectExecRuntimeFindings(cfg: OpenClawConfig): SecurityAuditFinding[]
   return findings;
 }
 
-function collectAgentRosterFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
-  const agents = listAgentEntries(cfg);
-  // A missing roster is the supported pre-roster compatibility state and is
-  // materialized by config loading. An explicitly authored empty roster is invalid.
-  if (agents.length === 0 && !hasAgentRosterProperty(cfg)) {
-    return [];
-  }
-  const defaultCount = agents.filter((agent) => agent?.default === true).length;
-  const explicitOwnership = cfg.agents?.ownership === "explicit";
-  // Mirror runtime default resolution: explicit fleets are ownerless by design,
-  // otherwise the roster is valid exactly when the canonical resolver finds an
-  // owner (sole agent, one legacy marker, or a retained migration owner).
-  const resolvable = explicitOwnership
-    ? defaultCount === 0
-    : tryResolveLegacyCompatibilityAgentId(cfg) !== undefined;
-  if (resolvable) {
-    return [];
-  }
-  return [
-    {
-      checkId: "config.agent_roster.invalid_default_count",
-      severity: "warn",
-      title: "Agent roster has an invalid default selection",
-      detail: explicitOwnership
-        ? `Expected no agents.entries default=true entries with agents.ownership=explicit, found ${defaultCount}.`
-        : `Expected a resolvable default agent (sole entry, one default=true marker, or agents.ownership=explicit); found ${defaultCount} default markers across ${agents.length} configured agents.`,
-      remediation: "Run `openclaw doctor --fix` to repair the authored agent roster.",
-    },
-  ];
-}
-
 function formatNamesPreview(names: readonly string[]): string {
   const visible = names.slice(0, 6);
   const suffix = names.length > visible.length ? `, +${names.length - visible.length} more` : "";
@@ -1034,37 +928,6 @@ async function collectAgentSkillMcpBoundaryFindings(params: {
   return findings;
 }
 
-function collectOpenExecSurfacePaths(cfg: OpenClawConfig): string[] {
-  const channels = asNullableRecord(cfg.channels);
-  if (!channels) {
-    return [];
-  }
-  const hits = new Set<string>();
-  const seen = new WeakSet<object>();
-  const visit = (value: unknown, scope: string) => {
-    const record = asNullableRecord(value);
-    if (!record || seen.has(record)) {
-      return;
-    }
-    seen.add(record);
-    if (record.groupPolicy === "open") {
-      hits.add(`${scope}.groupPolicy`);
-    }
-    if (record.dmPolicy === "open") {
-      hits.add(`${scope}.dmPolicy`);
-    }
-    for (const [key, nested] of Object.entries(record)) {
-      if (asNullableRecord(nested)) {
-        visit(nested, `${scope}.${key}`);
-      }
-    }
-  };
-  for (const [channelId, channelValue] of Object.entries(channels)) {
-    visit(channelValue, `channels.${channelId}`);
-  }
-  return Array.from(hits).toSorted();
-}
-
 function collectAutoAllowSkillsHits(approvals: ExecApprovalsFile): string[] {
   const hits: string[] = [];
   if (approvals.defaults?.autoAllowSkills === true) {
@@ -1105,7 +968,6 @@ async function createAuditExecutionContext(
   const env = opts.env ?? process.env;
   const platform = opts.platform ?? process.platform;
   const includeFilesystem = opts.includeFilesystem !== false;
-  const includeChannelSecurity = opts.includeChannelSecurity !== false;
   const deep = opts.deep === true;
   const deepTimeoutMs = Math.max(250, opts.deepTimeoutMs ?? 5000);
   const stateDir = opts.stateDir ?? resolveStateDir(env);
@@ -1115,7 +977,7 @@ async function createAuditExecutionContext(
     workspaceDir: opts.workspaceDir,
     env,
   }).workspaceDir;
-  const { readConfigSnapshotForAudit } = await loadAuditNonDeepModule();
+  const { readConfigSnapshotForAudit } = await import("./audit.nondeep.runtime.js");
   const configSnapshot = includeFilesystem
     ? opts.configSnapshot !== undefined
       ? opts.configSnapshot
@@ -1127,7 +989,6 @@ async function createAuditExecutionContext(
     env,
     platform,
     includeFilesystem,
-    includeChannelSecurity,
     deep,
     deepTimeoutMs,
     stateDir,
@@ -1152,9 +1013,22 @@ export async function runSecurityAuditCore(
   const context = await createAuditExecutionContext(opts);
   const { cfg, env, platform, stateDir, configPath } = context;
   copyConfigResolutionFacts(context.sourceConfig, cfg);
-  const auditNonDeep = await loadAuditNonDeepModule();
+  const auditNonDeep = await import("./audit.nondeep.runtime.js");
+  const channelMetadata = cfg.channels
+    ? (await import("../plugins/plugin-registry.js"))
+        .loadPluginRegistrySnapshot({
+          config: cfg,
+          env,
+          stateDir,
+          workspaceDir: context.workspaceDir,
+        })
+        .plugins.flatMap((plugin) => (plugin.packageChannel ? [plugin.packageChannel] : []))
+    : [];
+  const openInboundPolicies = listConfiguredOpenInboundPolicyPaths(cfg, channelMetadata);
 
-  findings.push(...auditNonDeep.collectAttackSurfaceSummaryFindings(cfg));
+  findings.push(
+    ...(await auditNonDeep.collectAttackSurfaceSummaryFindings(cfg, openInboundPolicies)),
+  );
   findings.push(...collectAgentRosterFindings(context.sourceConfig));
   findings.push(...auditNonDeep.collectSyncedFolderFindings({ stateDir, configPath }));
 
@@ -1166,7 +1040,7 @@ export async function runSecurityAuditCore(
   );
   findings.push(...(await collectPluginSecurityAuditFindings(context)));
   findings.push(...collectElevatedFindings(cfg));
-  findings.push(...collectExecRuntimeFindings(cfg));
+  findings.push(...collectExecRuntimeFindings(cfg, openInboundPolicies));
   findings.push(...(await collectAgentSkillMcpBoundaryFindings({ cfg, stateDir })));
   const hooksGatewayAuthCfg = shouldMaterializeHooksGatewayAuthRefs(cfg)
     ? await materializeAuditGatewayAuthRefs({
@@ -1192,9 +1066,9 @@ export async function runSecurityAuditCore(
   findings.push(...auditNonDeep.collectMinimalProfileOverrideFindings(cfg));
   findings.push(...auditNonDeep.collectSecretsInConfigFindings(context.sourceConfig));
   findings.push(...auditNonDeep.collectSmallModelRiskFindings({ cfg, env }));
-  findings.push(...auditNonDeep.collectExposureMatrixFindings(cfg));
-  findings.push(...auditNonDeep.collectLikelyMultiUserSetupFindings(cfg));
-  findings.push(...auditNonDeep.collectCrossAgentSessionAccessFindings(cfg));
+  findings.push(...auditNonDeep.collectExposureMatrixFindings(cfg, openInboundPolicies));
+  findings.push(...auditNonDeep.collectLikelyMultiUserSetupFindings(cfg, openInboundPolicies));
+  findings.push(...auditNonDeep.collectCrossAgentSessionAccessFindings(cfg, openInboundPolicies));
 
   if (context.includeFilesystem) {
     findings.push(...(await collectFilesystemFindings(context)));
@@ -1228,40 +1102,42 @@ export async function runSecurityAuditCore(
     );
   }
 
-  let shouldAuditChannelSecurity = false;
-  if (context.includeChannelSecurity) {
-    if (context.plugins !== undefined) {
-      shouldAuditChannelSecurity = true;
-    } else {
-      const { hasConfiguredChannelsForReadOnlyScope, resolveConfiguredChannelPluginIds } =
-        await loadChannelPluginIdsModule();
-      shouldAuditChannelSecurity =
-        hasConfiguredChannelsForReadOnlyScope({
+  let shouldAuditChannelSecurity: boolean;
+  if (context.plugins !== undefined) {
+    shouldAuditChannelSecurity = true;
+  } else {
+    const { hasConfiguredChannelsForReadOnlyScopeAsync, resolveConfiguredChannelPluginIdsAsync } =
+      await import("../plugins/channel-plugin-ids.js");
+    shouldAuditChannelSecurity =
+      (await hasConfiguredChannelsForReadOnlyScopeAsync({
+        config: cfg,
+        activationSourceConfig: context.sourceConfig,
+        workspaceDir: context.workspaceDir,
+        env,
+      })) ||
+      (
+        await resolveConfiguredChannelPluginIdsAsync({
           config: cfg,
           activationSourceConfig: context.sourceConfig,
           workspaceDir: context.workspaceDir,
           env,
-        }) ||
-        resolveConfiguredChannelPluginIds({
-          config: cfg,
-          activationSourceConfig: context.sourceConfig,
-          workspaceDir: context.workspaceDir,
-          env,
-        }).length > 0;
-    }
+        })
+      ).length > 0;
   }
   if (shouldAuditChannelSecurity) {
     const channelPlugins =
       context.plugins ??
-      (await loadReadOnlyChannelPlugins()).listReadOnlyChannelPluginsForConfig(cfg, {
+      (await (
+        await import("../channels/plugins/read-only.js")
+      ).listReadOnlyChannelPluginsForConfigAsync(cfg, {
         activationSourceConfig: context.sourceConfig,
         workspaceDir: context.workspaceDir,
         env,
         stateDir,
         includePersistedAuthState: true,
         includeSetupFallbackPlugins: true,
-      });
-    const { collectChannelSecurityFindings } = await loadAuditChannelModule();
+      }));
+    const { collectChannelSecurityFindings } = await import("./audit-channel.collect.runtime.js");
     findings.push(
       ...(await collectChannelSecurityFindings({
         cfg,
@@ -1273,7 +1149,7 @@ export async function runSecurityAuditCore(
 
   const deepProbeResult = context.deep
     ? await (
-        await loadAuditGatewayProbeModule()
+        await import("./audit-gateway-probe.js")
       ).probeSecurityAuditGateway({
         cfg,
         env,
@@ -1303,7 +1179,6 @@ export async function runSecurityAuditCore(
     summary,
     deep: context.deep,
     includeFilesystem: context.includeFilesystem,
-    includeChannelSecurity: context.includeChannelSecurity,
     suppressedCount: filtered.suppressedFindings.length,
   });
   return {

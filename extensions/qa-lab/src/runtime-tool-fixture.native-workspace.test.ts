@@ -1,78 +1,77 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupRuntimeToolFixtureTempRoots,
   makeEnv,
+  runRuntimeToolFixtureWithDeps,
+  runtimeToolFixtureDeps,
+  type RuntimeToolFixtureDeps,
   transcriptToolCall,
   transcriptToolResult,
   writeQaSessionTranscript,
 } from "../test/runtime-tool-fixture-helpers.js";
-import { getQaNativeWorkspaceBehavior } from "./native-workspace-behavior.js";
-import { runRuntimeToolFixture } from "./runtime-tool-fixture.js";
+import {
+  getQaNativeWorkspaceBehavior,
+  type QaNativeWorkspaceBehavior,
+} from "./native-workspace-behavior.js";
+import { readQaScenarioFile } from "./scenario-catalog.js";
+import { createSession } from "./suite-runtime-agent-session.js";
 
-const OPENCLAW_TOOL_BY_BEHAVIOR = {
-  bash: "exec",
-  edit: "edit",
-  exec: "exec",
-  "fs-read": "read",
-  "fs-write": "write",
-  grep: "exec",
-} as const;
+function nativeArguments(behavior: QaNativeWorkspaceBehavior, phase: "happy" | "failure") {
+  const args = phase === "happy" ? behavior.happyArgs : behavior.failureArgs;
+  const target = phase === "happy" ? behavior.happyMutation : behavior.failureSentinel;
+  return behavior.nativeToolName === "bash"
+    ? { command: `/bin/zsh -lc ${JSON.stringify(args.cmd)}` }
+    : { changes: [{ path: target?.path, kind: { type: "update" } }] };
+}
+
+function nativeReceipt(behavior: QaNativeWorkspaceBehavior, phase: "happy" | "failure") {
+  return [
+    transcriptToolCall(behavior.nativeToolName, phase, nativeArguments(behavior, phase)),
+    transcriptToolResult(
+      behavior.nativeToolName,
+      phase,
+      phase === "happy"
+        ? (behavior.happyOutputMarker ?? "native workspace change completed")
+        : (behavior.failureOutputMarker ?? "path escapes workspace root"),
+      phase === "failure" ? true : undefined,
+    ),
+  ];
+}
 
 afterEach(() => {
+  vi.restoreAllMocks();
   resetPluginStateStoreForTests({ closeDatabase: false });
 });
 afterAll(cleanupRuntimeToolFixtureTempRoots);
 
 describe("Codex-native workspace runtime tool fixtures", () => {
-  it.each(["bash", "edit", "exec", "fs-read", "fs-write", "grep"] as const)(
+  it.each(["edit", "fs-write"] as const)(
     "requires correlated native receipts and observable %s outcomes",
     async (behaviorId) => {
       const env = await makeEnv();
       env.gateway.runtimeEnv.OPENCLAW_QA_FORCE_RUNTIME = "codex";
       const behavior = getQaNativeWorkspaceBehavior(behaviorId);
-      const happyArguments =
-        behavior.nativeToolName === "bash"
-          ? { command: `/bin/zsh -lc ${JSON.stringify(behavior.happyArgs.cmd)}` }
-          : {
-              changes: [
-                {
-                  path: behavior.happyMutation?.path,
-                  kind: { type: "update" },
-                },
-              ],
-            };
-      const failureArguments =
-        behavior.nativeToolName === "bash"
-          ? { command: `/bin/zsh -lc ${JSON.stringify(behavior.failureArgs.cmd)}` }
-          : {
-              changes: [
-                {
-                  path: behavior.failureSentinel?.path,
-                  kind: { type: "update" },
-                },
-              ],
-            };
-      const runtimeToolName = OPENCLAW_TOOL_BY_BEHAVIOR[behaviorId];
-      if (behaviorId === "fs-write" && behavior.happyMutation) {
-        await fs.writeFile(
-          path.join(env.gateway.workspaceDir, behavior.happyMutation.path),
-          behavior.happyMutation.contents,
-          "utf8",
-        );
+      const mutation = expectDefined(behavior.happyMutation, "native workspace mutation");
+      const sentinel = expectDefined(behavior.failureSentinel, "outside-workspace sentinel");
+      const runtimeToolName = behaviorId === "edit" ? "edit" : "write";
+      const readWorkspaceFile = (file: string) =>
+        fs.readFile(path.resolve(env.gateway.workspaceDir, file), "utf8");
+      const writeWorkspaceFile = (file: { path: string; contents: string }) =>
+        fs.writeFile(path.resolve(env.gateway.workspaceDir, file.path), file.contents, "utf8");
+      if (behaviorId === "fs-write") {
+        await writeWorkspaceFile(mutation);
       }
 
       let generatedSessionIndex = 0;
-      const promptEvidence: Array<{
-        transcriptToolName?: string;
-        requireSuccessfulTranscriptToolResult?: boolean;
-      }> = [];
-      const details = await runRuntimeToolFixture(
+      const promptEvidence: [string | undefined, boolean | undefined][] = [];
+      const details = await runRuntimeToolFixtureWithDeps(
         env,
         {
-          toolName: OPENCLAW_TOOL_BY_BEHAVIOR[behaviorId],
+          toolName: runtimeToolName,
           nativeWorkspaceBehavior: behaviorId,
           toolCoverage: {
             bucket: "codex-native-workspace",
@@ -81,155 +80,100 @@ describe("Codex-native workspace runtime tool fixtures", () => {
           },
         },
         {
-          createSession: vi.fn(async (_env, label, key) => {
+          ...runtimeToolFixtureDeps({
+            runAgentPrompt: async (_env, params) => {
+              promptEvidence.push([
+                params.transcriptToolName,
+                params.requireSuccessfulTranscriptToolResult,
+              ]);
+              const phase = params.sessionKey.endsWith(":happy") ? "happy" : "failure";
+              await writeQaSessionTranscript(
+                env,
+                params.sessionKey,
+                nativeReceipt(behavior, phase),
+              );
+              if (behaviorId === "fs-write" && phase === "failure") {
+                await expect(readWorkspaceFile(sentinel.path)).resolves.toBe(sentinel.contents);
+              }
+              if (phase === "happy") {
+                if (behaviorId === "fs-write") {
+                  await expect(readWorkspaceFile(mutation.path)).rejects.toThrow();
+                }
+                await writeWorkspaceFile(mutation);
+              }
+              return {};
+            },
+          }),
+          createSession: async (_env, label, key) => {
             expect(key).toBeUndefined();
             const phase = label.endsWith(" happy") ? "happy" : "failure";
             generatedSessionIndex += 1;
             return `agent:qa:native-workspace:${runtimeToolName}:${generatedSessionIndex}:${phase}`;
-          }),
-          readEffectiveTools: vi.fn(async () => new Set<string>()),
-          runAgentPrompt: vi.fn(async (_env, params) => {
-            promptEvidence.push({
-              transcriptToolName: params.transcriptToolName,
-              requireSuccessfulTranscriptToolResult: params.requireSuccessfulTranscriptToolResult,
-            });
-            const phase = params.sessionKey.endsWith(":happy") ? "happy" : "failure";
-            const transcriptArguments = phase === "happy" ? happyArguments : failureArguments;
-            await writeQaSessionTranscript(env, params.sessionKey, [
-              transcriptToolCall(behavior.nativeToolName, phase, transcriptArguments),
-              transcriptToolResult(
-                behavior.nativeToolName,
-                phase,
-                phase === "happy"
-                  ? (behavior.happyOutputMarker ?? "native workspace change completed")
-                  : (behavior.failureOutputMarker ?? "path escapes workspace root"),
-                phase === "failure" ? true : undefined,
-              ),
-            ]);
-            if (behaviorId === "fs-write" && phase === "failure") {
-              const sentinel = behavior.failureSentinel;
-              if (!sentinel) {
-                throw new Error("fs-write failure must use an outside-workspace sentinel");
-              }
-              await expect(
-                fs.readFile(path.resolve(env.gateway.workspaceDir, sentinel.path), "utf8"),
-              ).resolves.toBe(sentinel.contents);
-            }
-            if (phase === "happy" && behavior.happyMutation) {
-              const mutationPath = path.join(env.gateway.workspaceDir, behavior.happyMutation.path);
-              if (behaviorId === "fs-write") {
-                await expect(fs.readFile(mutationPath, "utf8")).rejects.toThrow();
-              }
-              await fs.writeFile(mutationPath, behavior.happyMutation.contents, "utf8");
-            }
-            return {};
-          }),
-          fetchJson: vi.fn(),
-          ensureImageGenerationConfigured: vi.fn(),
+          },
         },
       );
 
       expect(promptEvidence).toEqual([
-        {
-          transcriptToolName: behavior.nativeToolName,
-          requireSuccessfulTranscriptToolResult: true,
-        },
-        {
-          transcriptToolName: behavior.nativeToolName,
-          requireSuccessfulTranscriptToolResult: undefined,
-        },
+        [behavior.nativeToolName, true],
+        [behavior.nativeToolName, undefined],
       ]);
       expect(details).toContain(`codex-native ${behaviorId} behavior passed`);
-      if (behavior.happyMutation) {
-        await expect(
-          fs.readFile(path.join(env.gateway.workspaceDir, behavior.happyMutation.path), "utf8"),
-        ).resolves.toBe(behavior.happyMutation.contents);
-      }
-      if (behavior.failureSentinel) {
-        await expect(
-          fs.readFile(
-            path.resolve(env.gateway.workspaceDir, behavior.failureSentinel.path),
-            "utf8",
-          ),
-        ).rejects.toThrow();
-      }
+      await expect(readWorkspaceFile(mutation.path)).resolves.toBe(mutation.contents);
+      await expect(readWorkspaceFile(sentinel.path)).rejects.toThrow();
     },
   );
-  it("uses fresh sessions for sequential native behaviors and repeated invocations", async () => {
+  it("uses stable behavior labels and fresh session keys for sequential native fixtures", async () => {
     const env = await makeEnv();
     env.gateway.runtimeEnv.OPENCLAW_QA_FORCE_RUNTIME = "codex";
     let sessionIndex = 0;
     const requestedKeys: Array<string | undefined> = [];
+    const requestedLabels: string[] = [];
     const createdKeys: string[] = [];
     const nativeBehaviorIds = ["bash", "exec", "grep"] as const;
-    const createSession = vi.fn(async (_env: unknown, label: string, key?: string) => {
+    env.gateway.call = vi.fn(async (method, params) => {
+      expect(method).toBe("sessions.create");
+      const { label, key } = params as { label: string; key?: string };
       requestedKeys.push(key);
+      requestedLabels.push(label);
       const phase = label.endsWith(" happy") ? "happy" : "failure";
       sessionIndex += 1;
       const sessionKey = `agent:qa:native-workspace:sequence:${sessionIndex}:${phase}`;
       createdKeys.push(sessionKey);
-      return sessionKey;
+      return { key: sessionKey };
     });
-    const runAgentPrompt = vi.fn(
-      async (
-        _env: unknown,
-        params: {
-          sessionKey: string;
-          message: string;
-        },
-      ) => {
-        const behaviorId = nativeBehaviorIds.find((candidate) =>
-          params.message.includes(`native-workspace-behavior=${candidate}.`),
-        );
-        if (!behaviorId) {
-          throw new Error("native workspace behavior missing from prompt");
-        }
-        const behavior = getQaNativeWorkspaceBehavior(behaviorId);
-        const phase = params.sessionKey.endsWith(":happy") ? "happy" : "failure";
-        const args = phase === "happy" ? behavior.happyArgs : behavior.failureArgs;
-        await writeQaSessionTranscript(env, params.sessionKey, [
-          transcriptToolCall(behavior.nativeToolName, phase, {
-            command: `/bin/zsh -lc ${JSON.stringify(args.cmd)}`,
-          }),
-          transcriptToolResult(
-            behavior.nativeToolName,
-            phase,
-            phase === "happy"
-              ? (behavior.happyOutputMarker ?? "native workspace command completed")
-              : (behavior.failureOutputMarker ?? "path escapes workspace root"),
-            phase === "failure" ? true : undefined,
-          ),
-        ]);
-        return {};
-      },
-    );
-    const deps = {
-      createSession,
-      readEffectiveTools: vi.fn(async () => new Set<string>()),
-      runAgentPrompt,
-      fetchJson: vi.fn(),
-      ensureImageGenerationConfigured: vi.fn(),
+    const runAgentPrompt: RuntimeToolFixtureDeps["runAgentPrompt"] = async (_env, params) => {
+      const behaviorId = nativeBehaviorIds.find((candidate) =>
+        params.message.includes(`native-workspace-behavior=${candidate}.`),
+      );
+      if (!behaviorId) {
+        throw new Error("native workspace behavior missing from prompt");
+      }
+      const behavior = getQaNativeWorkspaceBehavior(behaviorId);
+      const phase = params.sessionKey.endsWith(":happy") ? "happy" : "failure";
+      await writeQaSessionTranscript(env, params.sessionKey, nativeReceipt(behavior, phase));
+      return {};
     };
+    const deps = { ...runtimeToolFixtureDeps({ runAgentPrompt }), createSession };
 
     for (const behaviorId of ["bash", "exec", "grep", "bash"] as const) {
+      const scenario = readQaScenarioFile(
+        path.resolve(import.meta.dirname, `../../../qa/scenarios/runtime/tools/${behaviorId}.yaml`),
+      );
       await expect(
-        runRuntimeToolFixture(
-          env,
-          {
-            toolName: OPENCLAW_TOOL_BY_BEHAVIOR[behaviorId],
-            nativeWorkspaceBehavior: behaviorId,
-            toolCoverage: {
-              bucket: "codex-native-workspace",
-              expectedLayer: "codex-native-workspace",
-              required: true,
-            },
-          },
-          deps,
-        ),
+        runRuntimeToolFixtureWithDeps(env, scenario.execution.config!, deps),
       ).resolves.toContain(`codex-native ${behaviorId} behavior passed`);
     }
 
     expect(requestedKeys).toEqual(Array.from({ length: 8 }, () => undefined));
     expect(new Set(createdKeys).size).toBe(8);
+    expect(requestedLabels.slice(0, 6)).toEqual([
+      "Runtime tool fixture: bash happy",
+      "Runtime tool fixture: bash failure",
+      "Runtime tool fixture: exec happy",
+      "Runtime tool fixture: exec failure",
+      "Runtime tool fixture: grep happy",
+      "Runtime tool fixture: grep failure",
+    ]);
+    expect(requestedLabels.slice(6)).toEqual(requestedLabels.slice(0, 2));
   });
 });

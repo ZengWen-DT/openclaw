@@ -1,11 +1,9 @@
 import path from "node:path";
 import type { SessionEvent } from "@github/copilot-sdk";
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-harness-runtime";
+import type { SessionManager } from "openclaw/plugin-sdk/agent-sessions";
 import { upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
-import type {
-  SessionTranscriptTargetParams,
-  TranscriptTurnAdmission,
-} from "openclaw/plugin-sdk/session-transcript-runtime";
+import type { TranscriptTurnAdmission } from "openclaw/plugin-sdk/session-transcript-runtime";
 import { useSessionStoreTempDirs } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterAll, vi, type Mock } from "vitest";
 import { createAttemptTranscriptJournal } from "./attempt-transcript-journal.js";
@@ -25,13 +23,15 @@ type TranscriptRecorder = TranscriptRecorderContract & {
   resolveMessage: Mock<TranscriptRecorderContract["resolveMessage"]>;
 };
 
+type FixtureTranscriptTarget = Parameters<typeof SessionManager.openAsync>[0];
+
 type AttemptTranscriptJournalFixture = {
   attempt: AttemptParamsLike;
   bridge: ReturnType<typeof attachEventBridge>;
   journal: ReturnType<typeof createAttemptTranscriptJournal>;
   recorder: TranscriptRecorder;
   session: FakeSession;
-  target: SessionTranscriptTargetParams;
+  target: FixtureTranscriptTarget;
   tempDir: string;
 };
 
@@ -47,6 +47,12 @@ export function createFakeSession(): FakeSession {
     },
     on: vi.fn((eventType: string, handler: (event: SessionEvent) => void) => {
       listeners.set(eventType, [...(listeners.get(eventType) ?? []), handler]);
+      return () => {
+        listeners.set(
+          eventType,
+          (listeners.get(eventType) ?? []).filter((listener) => listener !== handler),
+        );
+      };
     }) as FakeSession["on"],
     send: vi.fn(async () => "sdk-user"),
     sendAndWait: vi.fn(async () => undefined),
@@ -118,7 +124,7 @@ export async function createFixture(
   resultContentSourceByToolName?: ReadonlyMap<string, "network">,
 ): Promise<AttemptTranscriptJournalFixture> {
   const tempDir = sessionDirs.make();
-  const target: SessionTranscriptTargetParams = {
+  const target: FixtureTranscriptTarget = {
     agentId: "main",
     sessionId: "session-1",
     sessionKey: "agent:main:session-1",

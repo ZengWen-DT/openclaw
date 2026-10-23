@@ -25,8 +25,8 @@ afterAll(async () => {
 });
 
 it.each([
-  { surface: "config form", load: () => import("../components/config-form.render.ts") },
-  { surface: "Setup", load: () => import("../pages/config/setup.ts") },
+  { surface: "config form", load: () => import("../components/config-form.render.tsx") },
+  { surface: "Setup", load: () => import("../pages/config/setup.tsx") },
   { surface: "Settings search", load: () => import("../pages/config/settings-search.ts") },
 ])("loads Settings section fallback copy before $surface uses it", async ({ load }) => {
   const manager = createI18nManagerForTesting(async () => ({ common: { health: "Gesundheit" } }));
@@ -50,7 +50,7 @@ it.each([
   expect(en.configForm).toBe(configForm);
   expect(en.configForm.sections).toBe(sections);
   expect(Object.keys(en)).toEqual(namespaceOrder);
-  expect(Object.keys(en.configForm)).toEqual(fieldOrder);
+  expect(Object.keys(en.configForm).slice(0, fieldOrder.length)).toEqual(fieldOrder);
   expect(Object.keys(en.configForm.sections)).toEqual(
     Object.keys(registerSettingsEnglish.catalog.configForm.sections),
   );

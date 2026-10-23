@@ -7,11 +7,13 @@ import { isDeepStrictEqual } from "node:util";
 import { rawDataToString } from "@openclaw/gateway-client/websocket-data";
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
+import { buildDeviceAuthPayloadV3 } from "../../../packages/gateway-client/src/device-auth.js";
 import {
   PROTOCOL_VERSION,
   type SkillsLibraryReceipt,
   type SkillLibrarySelection,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { waitForGatewayStartup } from "../../../test/helpers/gateway-startup.js";
 import {
   acquireGatewayTestWebSocket,
   closeGatewayTestWebSocket,
@@ -52,7 +54,6 @@ import { setTestEnvValue } from "../../test-utils/env.js";
 import { createOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { acquireTestPortBlock } from "../../test-utils/port-claims.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../../utils/message-channel.js";
-import { buildDeviceAuthPayloadV3 } from "../device-auth.js";
 import { startGatewayServer } from "../server.js";
 import { startClaimedGateway } from "../test-helpers.listener.js";
 import { buildMockOpenAiResponsesProvider } from "../test-openai-responses-model.js";
@@ -359,16 +360,17 @@ describe("Gateway pinned manual library read", () => {
               startGatewayServer(port, { bind: "loopback", controlUiEnabled: false }),
             );
             await gateway.startupSettled;
+            await waitForGatewayStartup(port);
             const alice = await connectProfile(
               port,
               "alice@example.test",
-              state.path("alice-device.sqlite"),
+              state.path("alice-device", "client", "credentials.sqlite"),
             );
             sockets.push(alice);
             const bob = await connectProfile(
               port,
               "bob@example.test",
-              state.path("bob-device.sqlite"),
+              state.path("bob-device", "client", "credentials.sqlite"),
             );
             sockets.push(bob);
             const saved = (await rpc(alice, "skills.library.save", {

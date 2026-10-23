@@ -5,6 +5,7 @@ import { resolveBrewExecutable } from "../infra/brew.js";
 import { isContainerEnvironment } from "../infra/container-environment.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { buildWorkspaceSkillStatus } from "../skills/discovery/status.js";
+import type { SkillStatusEntry } from "../skills/discovery/status.types.js";
 import {
   installSkill,
   MIN_AUTO_GO_VERSION,
@@ -19,14 +20,8 @@ import type { NodeManagerChoice } from "./onboard-types.js";
 
 const SKIPPED_INSTALL_NAME_LIMIT = 8;
 
-type OnboardInstallSkill = {
-  name: string;
-  description?: string;
-  install: Array<{ kind: string; label: string }>;
-};
-
 type SkippedInstall = {
-  skill: OnboardInstallSkill;
+  skill: Pick<SkillStatusEntry, "name">;
   reason: SkillInstallSkipReason;
   detail?: string;
 };
@@ -40,10 +35,7 @@ function summarizeInstallFailure(message: string): string | undefined {
   return cleaned.length > maxLen ? `${truncateUtf16Safe(cleaned, maxLen - 1)}…` : cleaned;
 }
 
-function formatSkillHint(skill: {
-  description?: string;
-  install: Array<{ label: string }>;
-}): string {
+function formatSkillHint(skill: Pick<SkillStatusEntry, "description" | "install">): string {
   const desc = skill.description?.trim();
   const installLabel = skill.install[0]?.label?.trim();
   const combined = desc && installLabel ? `${desc} — ${installLabel}` : desc || installLabel;
@@ -59,40 +51,6 @@ const SKIP_REASON_LABELS = {
   go: `Go toolchain (${MIN_AUTO_GO_VERSION}+)`,
   uv: "uv",
 } satisfies Record<SkillInstallSkipReason, string>;
-
-function formatSkillNames(names: string[]): string {
-  const visible = names.slice(0, SKIPPED_INSTALL_NAME_LIMIT);
-  const suffix = names.length > visible.length ? ` (+${names.length - visible.length} more)` : "";
-  return `${visible.join(", ")}${suffix}`;
-}
-
-function formatSkippedInstallNote(skipped: SkippedInstall[]): string {
-  const byReason = new Map<SkillInstallSkipReason, string[]>();
-  for (const item of skipped) {
-    const names = byReason.get(item.reason) ?? [];
-    names.push(item.skill.name);
-    byReason.set(item.reason, names);
-  }
-  const lines = [t("wizard.skills.manualPrereqsIntro")];
-  for (const reason of ["brew", "go", "uv"] as const) {
-    const names = byReason.get(reason);
-    if (!names || names.length === 0) {
-      continue;
-    }
-    lines.push(`${SKIP_REASON_LABELS[reason]}: ${formatSkillNames(names)}`);
-  }
-  for (const item of skipped.filter((entry) => entry.detail).slice(0, SKIPPED_INSTALL_NAME_LIMIT)) {
-    lines.push(`${item.skill.name}: ${item.detail}`);
-  }
-  lines.push(t("wizard.skills.manualPrereqsDoctorHint"));
-  return lines.join("\n");
-}
-
-function isTrustedAutoInstallableSkill(skill: { bundled: boolean; source: string }): boolean {
-  // Onboarding can offer bundled recipes in its explicit consent prompt. Workspace
-  // skill metadata is mutable project input, so those installs stay excluded.
-  return skill.bundled && skill.source === "openclaw-bundled";
-}
 
 /** Runs the interactive skills setup step and returns the updated config. */
 export async function setupSkills(
@@ -125,19 +83,15 @@ export async function setupSkills(
     t("wizard.skills.statusTitle"),
   );
 
+  // Only bundled recipes belong in onboarding's explicit consent prompt;
+  // workspace skill metadata is mutable project input.
   const baseInstallable = missing.filter(
     (skill) =>
       skill.install.length > 0 &&
       skill.missing.bins.length > 0 &&
-      isTrustedAutoInstallableSkill(skill),
+      skill.bundled &&
+      skill.source === "openclaw-bundled",
   );
-  let brewAvailable: boolean | undefined;
-  const detectBrewOnce = async () => {
-    // Brew detection can shell out; cache it for the whole skills step because
-    // install filtering and prompts both need the same answer.
-    brewAvailable ??= (await detectBinary("brew")) || resolveBrewExecutable() !== undefined;
-    return brewAvailable;
-  };
   const readinessByKind = new Map<string, SkillInstallReadiness>();
   const resolveKindReadinessOnce = async (kind: string) => {
     // The lifecycle preflight can shell out (go version, sudo probe); resolve
@@ -152,7 +106,12 @@ export async function setupSkills(
   };
   const inLinuxContainer = process.platform === "linux" && isContainerEnvironment();
   let installable = baseInstallable;
-  if (inLinuxContainer && baseInstallable.length > 0 && !(await detectBrewOnce())) {
+  if (
+    inLinuxContainer &&
+    baseInstallable.length > 0 &&
+    !(await detectBinary("brew")) &&
+    resolveBrewExecutable() === undefined
+  ) {
     // Linux containers without brew cannot use brew-only recipes reliably; hide
     // them from install selection and leave manual instructions in the note.
     installable = baseInstallable.filter((skill) =>
@@ -166,17 +125,6 @@ export async function setupSkills(
     }
   }
   const candidateInstallable = installable;
-  const readinessBySkillName = new Map<string, SkillInstallReadiness>();
-  for (const skill of candidateInstallable) {
-    // Onboarding intentionally executes only the primary recipe below. Keep
-    // readiness aligned with that recipe instead of silently changing methods.
-    const primaryInstall = skill.install[0];
-    if (!primaryInstall) {
-      continue;
-    }
-    const readiness = await resolveKindReadinessOnce(primaryInstall.kind);
-    readinessBySkillName.set(skill.name, readiness);
-  }
   let next: OpenClawConfig = cfg;
   if (candidateInstallable.length === 0 && missing.length === 0) {
     await prompter.note(
@@ -212,8 +160,12 @@ export async function setupSkills(
     const selectedReadySkills: typeof selectedSkills = [];
     const selectedSkippedInstallable: SkippedInstall[] = [];
     for (const skill of selectedSkills) {
-      const readiness = readinessBySkillName.get(skill.name);
-      if (readiness?.ready !== false) {
+      const primaryInstall = skill.install[0];
+      if (!primaryInstall) {
+        continue;
+      }
+      const readiness = await resolveKindReadinessOnce(primaryInstall.kind);
+      if (readiness.ready) {
         selectedReadySkills.push(skill);
       } else {
         selectedSkippedInstallable.push({ skill, reason: readiness.reason });
@@ -312,10 +264,26 @@ export async function setupSkills(
       );
     }
     if (selectedSkippedInstallable.length > 0) {
-      await prompter.note(
-        formatSkippedInstallNote(selectedSkippedInstallable),
-        t("wizard.skills.manualPrereqsTitle"),
-      );
+      const skipped = selectedSkippedInstallable;
+      const lines = [t("wizard.skills.manualPrereqsIntro")];
+      for (const reason of ["brew", "go", "uv"] as const) {
+        const names = skipped
+          .filter((item) => item.reason === reason)
+          .map((item) => item.skill.name);
+        if (names.length > 0) {
+          const visible = names.slice(0, SKIPPED_INSTALL_NAME_LIMIT);
+          const suffix =
+            names.length > visible.length ? ` (+${names.length - visible.length} more)` : "";
+          lines.push(`${SKIP_REASON_LABELS[reason]}: ${visible.join(", ")}${suffix}`);
+        }
+      }
+      for (const item of skipped
+        .filter((entry) => entry.detail)
+        .slice(0, SKIPPED_INSTALL_NAME_LIMIT)) {
+        lines.push(`${item.skill.name}: ${item.detail}`);
+      }
+      lines.push(t("wizard.skills.manualPrereqsDoctorHint"));
+      await prompter.note(lines.join("\n"), t("wizard.skills.manualPrereqsTitle"));
     }
   }
 

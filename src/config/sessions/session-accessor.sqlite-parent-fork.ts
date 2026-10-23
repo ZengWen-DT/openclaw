@@ -6,6 +6,7 @@ import { derivePromptTokens, normalizeUsage } from "../../agents/usage.js";
 import { projectModelContextMessages } from "../../shared/model-context-message.js";
 import type {
   SessionParentForkDecision,
+  ForkSessionFromParentTranscriptParams,
   TranscriptEvent,
 } from "./session-accessor.sqlite-contract.js";
 import { findSessionTranscriptHeader, isIndexedSessionEntry } from "./session-entry-codec.js";
@@ -242,10 +243,14 @@ export function resolveParentForkSourceTranscript(
     }),
     tree.nodes,
   );
-  const branchEntries =
+  let branchEntries =
     forkFrom === "last-completed"
-      ? visibleBranchEntries.slice(0, findLastCompletedAssistantIndex(visibleBranchEntries) + 1)
+      ? visibleBranchEntries.slice(0, findLastCompletedForkIndex(visibleBranchEntries) + 1)
       : visibleBranchEntries;
+  if (forkFrom === "last-completed" && !hasAssistantHistory(branchEntries)) {
+    // The child writer keeps no history without an assistant; size the same empty prefix.
+    branchEntries = [];
+  }
   const pathEntryIds = new Set(
     branchEntries.flatMap((entry) =>
       isRecord(entry) && typeof entry.id === "string" ? [entry.id] : [],
@@ -263,37 +268,47 @@ export function resolveParentForkSourceTranscript(
     branchEntries,
     cwd: typeof header?.cwd === "string" ? header.cwd : undefined,
     version: header?.version ?? MIN_READABLE_SESSION_VERSION,
-    labelsToWrite: collectBranchLabels({ allEntries: entries, pathEntryIds }),
+    labelsToWrite: entries.flatMap((entry) =>
+      isRecord(entry) &&
+      entry.type === "label" &&
+      typeof entry.label === "string" &&
+      typeof entry.targetId === "string" &&
+      typeof entry.id === "string" &&
+      !pathEntryIds.has(entry.id) &&
+      pathEntryIds.has(entry.targetId) &&
+      typeof entry.timestamp === "string"
+        ? [{ targetId: entry.targetId, label: entry.label, timestamp: entry.timestamp }]
+        : [],
+    ),
     leafId: forkFrom === "last-completed" ? lastBranchEntryId : tree.leafId,
     preserveLeafControl:
       forkFrom !== "last-completed" && isSessionTranscriptLeafControl(lastLeafUpdateNode?.entry),
   };
 }
 
-function findLastCompletedAssistantIndex(entries: readonly TranscriptEvent[]): number {
+function findLastCompletedForkIndex(entries: readonly TranscriptEvent[]): number {
   return entries.findLastIndex((entry) => {
-    const message = isRecord(entry) && isRecord(entry.message) ? entry.message : undefined;
+    if (!isRecord(entry)) {
+      return false;
+    }
+    // A reset is stable even before the next assistant response completes.
+    if (entry.type === "reset") {
+      return true;
+    }
+    const message = isRecord(entry.message) ? entry.message : undefined;
     // Tool-use assistant messages are mid-turn checkpoints. Any other persisted
     // assistant message is a stable boundary, including legacy rows without a reason.
     return message?.role === "assistant" && message.stopReason !== "toolUse";
   });
 }
 
-function collectBranchLabels(params: {
-  allEntries: readonly TranscriptEvent[];
-  pathEntryIds: Set<string>;
-}): Array<{ targetId: string; label: string; timestamp: string }> {
-  return params.allEntries.flatMap((entry) =>
-    isRecord(entry) &&
-    entry.type === "label" &&
-    typeof entry.label === "string" &&
-    typeof entry.targetId === "string" &&
-    typeof entry.id === "string" &&
-    !params.pathEntryIds.has(entry.id) &&
-    params.pathEntryIds.has(entry.targetId) &&
-    typeof entry.timestamp === "string"
-      ? [{ targetId: entry.targetId, label: entry.label, timestamp: entry.timestamp }]
-      : [],
+function hasAssistantHistory(entries: readonly TranscriptEvent[]): boolean {
+  return entries.some(
+    (entry) =>
+      isRecord(entry) &&
+      entry.type === "message" &&
+      isRecord(entry.message) &&
+      entry.message.role === "assistant",
   );
 }
 
@@ -310,43 +325,13 @@ function generateEntryId(existingIds: Set<string>): string {
   return id;
 }
 
-function buildLabelEntries(params: {
-  labelsToWrite: Array<{ targetId: string; label: string; timestamp: string }>;
-  pathEntryIds: Set<string>;
-  lastEntryId: string | null;
-}) {
-  let parentId = params.lastEntryId;
-  return params.labelsToWrite.map(({ targetId, label, timestamp }) => {
-    const entry = {
-      type: "label",
-      id: generateEntryId(params.pathEntryIds),
-      parentId,
-      timestamp,
-      targetId,
-      label,
-    };
-    parentId = entry.id;
-    return entry;
-  });
-}
-
-function hasAssistantEntry(entries: readonly TranscriptEvent[]): boolean {
-  return entries.some(
-    (entry) =>
-      isRecord(entry) &&
-      entry.type === "message" &&
-      isRecord(entry.message) &&
-      entry.message.role === "assistant",
-  );
-}
-
 export function buildForkedChildTranscriptEvents(params: {
   parentSessionFile: string;
   source: ParentForkSourceTranscript;
   targetSessionId: string;
 }): TranscriptEvent[] {
   const keepHistory =
-    params.source.preserveLeafControl || hasAssistantEntry(params.source.branchEntries);
+    params.source.preserveLeafControl || hasAssistantHistory(params.source.branchEntries);
   const header = {
     ...createSessionTranscriptHeader({
       cwd: params.source.cwd,
@@ -367,16 +352,24 @@ export function buildForkedChildTranscriptEvents(params: {
   const lastPathEntry = params.source.branchEntries.at(-1);
   const lastPathEntryId =
     isRecord(lastPathEntry) && typeof lastPathEntry.id === "string" ? lastPathEntry.id : null;
-  const labelEntries = buildLabelEntries({
-    labelsToWrite: params.source.labelsToWrite,
-    pathEntryIds,
-    lastEntryId: lastPathEntryId,
+  let parentId = lastPathEntryId;
+  const labelEntries = params.source.labelsToWrite.map(({ targetId, label, timestamp }) => {
+    const entry = {
+      type: "label",
+      id: generateEntryId(pathEntryIds),
+      parentId,
+      timestamp,
+      targetId,
+      label,
+    };
+    parentId = entry.id;
+    return entry;
   });
   const leafEntry = params.source.preserveLeafControl
     ? {
         type: "leaf",
         id: generateEntryId(pathEntryIds),
-        parentId: labelEntries.at(-1)?.id ?? lastPathEntryId,
+        parentId,
         timestamp: new Date().toISOString(),
         targetId: params.source.leafId,
         appendParentId: params.source.appendParentId,
@@ -389,4 +382,25 @@ export function buildForkedChildTranscriptEvents(params: {
     ...labelEntries,
     ...(leafEntry ? [leafEntry] : []),
   ];
+}
+
+export function resolveParentForkLimitDecision(
+  params: Pick<
+    ForkSessionFromParentTranscriptParams,
+    "enforceTokenLimit" | "forkFrom" | "maxTokens" | "parentEntry"
+  >,
+  source: ParentForkSourceTranscript,
+): Extract<SessionParentForkDecision, { status: "skip" }> | undefined {
+  if (!params.enforceTokenLimit) {
+    return undefined;
+  }
+  const decision = planParentForkDecision(
+    params.parentEntry,
+    estimateParentForkPromptTokens(source),
+    {
+      maxTokens: params.maxTokens,
+      preferTranscriptEstimate: params.forkFrom === "last-completed",
+    },
+  );
+  return decision.status === "skip" ? decision : undefined;
 }

@@ -1,5 +1,9 @@
 // Gateway maintenance-state test helper.
 // Builds minimal timer/health/chat state for maintenance tests.
+import { vi } from "vitest";
+import { WorktreeGcProgress } from "../agents/worktrees/gc-progress.js";
+import { managedWorktrees } from "../agents/worktrees/service.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import type { HealthSummary } from "./health/types.js";
 import { createChatRunState } from "./server-chat-state.js";
@@ -11,8 +15,13 @@ export function createGatewayMaintenanceStateForTest(params?: {
   healthVersion?: number;
   presenceVersion?: number;
 }) {
+  const config: OpenClawConfig = {};
   const chatRunState = createChatRunState();
+  const worktreeGcResult = new WorktreeGcProgress().result;
+  const worktreeGc = vi.spyOn(managedWorktrees, "gc").mockResolvedValue(worktreeGcResult);
   return {
+    worktreeGc,
+    worktreeGcResult,
     scheduler: createTestGatewayScheduler("fake-timers"),
     clients: new Set<GatewayClient>(),
     broadcast: () => {},
@@ -27,14 +36,12 @@ export function createGatewayMaintenanceStateForTest(params?: {
     refreshPresence: () => {},
     resetEventLoopHealth: () => {},
     dedupe: new Map(),
-    chatAbortControllers: new Map(),
-    chatQueuedTurns: new Map(),
     restartRecoveryCandidates: new Map(),
     chatRunState,
     removeChatRun: () => undefined,
     agentRunSeq: new Map(),
     nodeSendToSession: () => {},
-    getRuntimeConfig: () => ({}),
+    getRuntimeConfig: () => config,
     runDeliveryQueueMediaGc: async () => undefined,
   };
 }

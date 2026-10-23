@@ -10,9 +10,10 @@ import {
 import { createRequireRecord } from "../../../test/helpers/record.js";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.ts";
 import type { ModelCatalogResult } from "../api/types.ts";
-import type { ApplicationContext } from "../app/context.ts";
 import type { ChatPageHost } from "../pages/chat/chat-state-host.ts";
+import { evaluateControlUiContext } from "../test-helpers/control-ui-e2e-context.ts";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
+import { enterControlUiSession } from "../test-helpers/control-ui-session-entry.ts";
 import { revealChatModelOption } from "../test-helpers/select-picker-e2e.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 
@@ -182,6 +183,9 @@ suite.define(() => {
           const url = new URL(browserUrl);
           url.pathname = `/${route}`;
           await page.goto(url.href);
+          if (route !== "new") {
+            await enterControlUiSession(page);
+          }
           await waitForControlUiGatewayReady(page);
           const composer = page.locator(".agent-chat__input").first();
           const model = composer.locator("[data-chat-model-select]");
@@ -189,9 +193,7 @@ suite.define(() => {
           await expect.poll(() => model.getAttribute("aria-disabled")).toBe("false");
           await model.click();
           // A failed background refresh must not add chrome above a usable list.
-          await revealChatModelOption(
-            composer.locator('[data-chat-model-option="openai/gpt-5.4"]'),
-          );
+          await revealChatModelOption(composer, "openai/gpt-5.4");
           if (route === "new") {
             // An absent CLI group can mean discovery has not started, or a completed empty result.
             await expect
@@ -200,15 +202,11 @@ suite.define(() => {
                 if (!discovery?.complete || discovery.socket !== currentSocket) {
                   return false;
                 }
-                const settled = await page.evaluate(async () => {
-                  const app = document.querySelector<
-                    HTMLElement & { runtime?: { context: ApplicationContext } }
-                  >("openclaw-app");
-                  const context = app?.runtime?.context;
-                  const agents = context?.agents.state;
+                const settled = await evaluateControlUiContext(page, async (context) => {
+                  const agents = context.agents.state;
                   if (
-                    context?.config.current.cliAgentsEnabled !== true ||
-                    !agents?.connected ||
+                    context.config.current.cliAgentsEnabled !== true ||
+                    !agents.connected ||
                     agents.client !== context.gateway.snapshot.client ||
                     !agents.agentsList?.agents.some((agent) => agent.id === "main")
                   ) {
@@ -263,20 +261,18 @@ suite.define(() => {
                   return false;
                 }
                 const rendered = await page.evaluate(
-                  ({ key: expectedKey, sessionId: expectedSessionId }) => {
+                  async ({ key: expectedKey, sessionId: expectedSessionId }) => {
                     const pane = document.querySelector<
                       HTMLElement & {
                         state?: ChatPageHost;
                         transcriptReady: boolean;
-                        hasUpdated: boolean;
-                        isUpdatePending: boolean;
+                        updateComplete: Promise<unknown>;
                       }
                     >('openclaw-chat-pane[aria-hidden="false"]');
+                    await pane?.updateComplete;
                     const state = pane?.state;
                     return (
-                      pane?.hasUpdated === true &&
-                      !pane.isUpdatePending &&
-                      pane.transcriptReady &&
+                      pane?.transcriptReady &&
                       state?.sessionKey === expectedKey &&
                       state.currentSessionId === expectedSessionId &&
                       !state.chatLoading

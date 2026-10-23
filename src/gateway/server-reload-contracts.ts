@@ -2,7 +2,6 @@ import type { CliDeps } from "../cli/deps.types.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
-import type { HeartbeatRunner } from "../infra/heartbeat-runner.js";
 import type { GatewayRestartEmitter } from "../infra/restart.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import type { PluginRegistry } from "../plugins/registry.js";
@@ -31,7 +30,6 @@ export type CurrentRuntimeSecretsPreparation = {
 type GatewayHotReloadState = {
   hooksConfig: ReturnType<typeof import("./hooks.js").resolveHooksConfig>;
   hookClientIpConfig: HookClientIpConfig;
-  heartbeatRunner: HeartbeatRunner;
   cronState: GatewayCronState;
 };
 
@@ -39,11 +37,6 @@ type GatewayReloadLog = {
   info: (msg: string) => void;
   warn: (msg: string) => void;
   error?: (msg: string) => void;
-};
-
-export type GatewayGmailRestartAbortController = {
-  abort: () => void;
-  signal: AbortSignal;
 };
 
 export type GatewayHotReloadPublication = {
@@ -64,19 +57,7 @@ export type GatewayRestartTransactionResult = {
 };
 
 export type GatewayRestartRequestOptions = {
-  retainDebtAcrossConfigChanges?: boolean;
   prepareRuntimeConfig?: () => Promise<OpenClawConfig>;
-  debtConfig?: OpenClawConfig;
-};
-
-export type AcceptedRestartTarget = {
-  runtimeConfig: OpenClawConfig;
-  sourceConfig: OpenClawConfig;
-  prepareRuntimeConfig: () => Promise<OpenClawConfig>;
-};
-
-export type AcceptedRestartTargetOwnership = {
-  reject: () => void;
 };
 
 class GatewayHotReloadCancelledError extends Error {
@@ -192,8 +173,8 @@ export type GatewayReloadHandlerParams = {
   logCron: { error: (msg: string) => void };
   logReload: GatewayReloadLog;
   cronReconciliation: GatewayCronReconciliation;
-  createGmailRestartAbortController?: () => GatewayGmailRestartAbortController;
-  clearGmailRestartAbortController?: (controller: GatewayGmailRestartAbortController) => void;
+  createGmailRestartAbortController?: () => AbortController;
+  clearGmailRestartAbortController?: (controller: AbortController) => void;
   onCronRestart?: () => void;
   requestRecoveryRestart?: GatewayRestartEmitter;
   restartRecoveryAvailable?: boolean;

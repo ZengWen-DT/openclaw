@@ -1,6 +1,5 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { types } from "node:util";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -10,6 +9,7 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 import { buildPluginApi, createUnavailableRuntime } from "./api-builder.js";
 import { instrumentPluginInstanceApi } from "./api-facades.js";
 import { runPluginRegistration } from "./api-lifecycle.js";
+import { warnOnMissingCliBackendModelProvider } from "./cli-backend-registration.js";
 import { hasPluginConfigMigrationSource } from "./config-contract-matches.js";
 import { findUninspectedPluginDiagnostic } from "./discovery-availability.js";
 import { discoverConfiguredPluginLoadPaths } from "./discovery.js";
@@ -28,15 +28,17 @@ import {
   type PluginCache,
 } from "./plugin-cache.js";
 import { resolvePluginControlPlaneFingerprint } from "./plugin-control-plane-context.js";
-import { getPluginValueInstance, type PluginInstanceHandle } from "./plugin-instance-scope.js";
+import { getPluginValueInstance } from "./plugin-instance-scope.js";
 import { tracePluginLifecyclePhase } from "./plugin-lifecycle-trace.js";
 import { resolvePluginMetadataEnvFingerprint } from "./plugin-metadata-snapshot.js";
+import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
 import { loadPluginRegistrySnapshotWithMetadata } from "./plugin-registry.js";
 import {
   resolvePluginRuntimeExecutionArtifact,
   resolvePreferredBundledRootArtifact,
 } from "./plugin-runtime-artifact-selection.js";
 import { getPluginSetupModuleLoader } from "./plugin-setup-module.js";
+import { matchesProviderPluginRef } from "./provider-registry-shared.js";
 import { resolvePluginRootArtifactPath } from "./root-artifact-path.js";
 import { listSetupCliBackendIds, listSetupProviderIds } from "./setup-descriptors.js";
 import type {
@@ -55,6 +57,13 @@ const CURRENT_MODULE_PATH = fileURLToPath(import.meta.url);
 const RUNNING_FROM_BUILT_ARTIFACT =
   CURRENT_MODULE_PATH.includes(`${path.sep}dist${path.sep}`) ||
   CURRENT_MODULE_PATH.includes(`${path.sep}dist-runtime${path.sep}`);
+const ORDERED_SETUP_API_EXTENSIONS = RUNNING_FROM_BUILT_ARTIFACT
+  ? SETUP_API_EXTENSIONS
+  : [...SETUP_API_EXTENSIONS.slice(3), ...SETUP_API_EXTENSIONS.slice(0, 3)];
+// Shipped implicit setup entries in the root outrank every package-local dist format.
+const SETUP_API_PATHS = ["", "dist"].flatMap((directory) =>
+  ORDERED_SETUP_API_EXTENSIONS.map((extension) => path.join(directory, `setup-api${extension}`)),
+);
 
 type SetupProviderEntry = {
   pluginId: string;
@@ -81,6 +90,7 @@ type PluginSetupRegistryDiagnosticCode =
   | "setup-descriptor-provider-runtime-undeclared"
   | "setup-descriptor-cli-backend-missing-runtime"
   | "setup-descriptor-cli-backend-runtime-undeclared"
+  | "setup-cli-backend-missing-model-provider"
   | "setup-entry-load-failed"
   | "setup-registration-failed";
 
@@ -104,8 +114,6 @@ type SetupAutoEnableReason = {
   pluginId: string;
   reason: string;
 };
-
-type PluginApiBuildParams = Parameters<typeof buildPluginApi>[0];
 
 const NOOP_LOGGER: PluginLogger = {
   info() {},
@@ -139,37 +147,21 @@ function resolveSetupApiPath(
   if (cached !== undefined) {
     return cached?.modulePath ?? null;
   }
-  const modulePath = resolveSetupApiPathUncached(rootDir, options);
+  let modulePath = resolvePluginRootArtifactPath(rootDir, SETUP_API_PATHS);
+  if (!modulePath && options?.includeBundledSourceFallback !== false) {
+    const sourceExtensionRoot = path.resolve(
+      path.dirname(CURRENT_MODULE_PATH),
+      "..",
+      "..",
+      "extensions",
+      path.basename(rootDir),
+    );
+    if (sourceExtensionRoot !== rootDir) {
+      modulePath = resolvePluginRootArtifactPath(sourceExtensionRoot, SETUP_API_PATHS);
+    }
+  }
   artifacts.set(key, modulePath ? { modulePath, boundaryRoot: path.dirname(modulePath) } : null);
   return modulePath;
-}
-
-function resolveSetupApiPathUncached(
-  rootDir: string,
-  options?: { includeBundledSourceFallback?: boolean },
-): string | null {
-  const orderedExtensions = RUNNING_FROM_BUILT_ARTIFACT
-    ? SETUP_API_EXTENSIONS
-    : ([...SETUP_API_EXTENSIONS.slice(3), ...SETUP_API_EXTENSIONS.slice(0, 3)] as const);
-
-  // Shipped implicit setup entries in the root outrank every package-local dist format.
-  const artifactPaths = ["", "dist"].flatMap((directory) =>
-    orderedExtensions.map((extension) => path.join(directory, `setup-api${extension}`)),
-  );
-  const direct = resolvePluginRootArtifactPath(rootDir, artifactPaths);
-  if (direct || options?.includeBundledSourceFallback === false) {
-    return direct;
-  }
-  const sourceExtensionRoot = path.resolve(
-    path.dirname(CURRENT_MODULE_PATH),
-    "..",
-    "..",
-    "extensions",
-    path.basename(rootDir),
-  );
-  return sourceExtensionRoot === rootDir
-    ? null
-    : resolvePluginRootArtifactPath(sourceExtensionRoot, artifactPaths);
 }
 
 function resolveRelevantSetupMigrationPluginIds(params: {
@@ -181,11 +173,7 @@ function resolveRelevantSetupMigrationPluginIds(params: {
   const ids = new Set<string>(
     entries && typeof entries === "object" ? normalizeStringEntries(Object.keys(entries)) : [],
   );
-  const plugins = loadSetupManifestRecords({
-    config: params.config,
-    workspaceDir: params.workspaceDir,
-    env: params.env,
-  });
+  const plugins = loadSetupManifestRecords(params);
   for (const plugin of plugins) {
     if (
       hasPluginConfigMigrationSource({
@@ -218,93 +206,6 @@ function resolveLoadableSetupRuntimeSource(
   );
 }
 
-function resolveDeclaredSetupRuntimeSource(record: PluginManifestRecord): string | null {
-  return (
-    record.setupSource ??
-    resolveSetupApiPath(record.rootDir, {
-      includeBundledSourceFallback: false,
-    })
-  );
-}
-
-function resolveSetupRegistration(
-  record: PluginManifestRecord,
-  diagnostics: PluginSetupRegistryDiagnostic[],
-): {
-  setupSource: string;
-  instance?: PluginInstanceHandle;
-  register: (api: Parameters<typeof runPluginRegistration>[1]) => boolean;
-  initialize: ReturnType<typeof getPluginSetupModuleLoader>["initialize"];
-} | null {
-  const setupArtifact = resolveLoadableSetupRuntimeSource(record);
-  if (!setupArtifact) {
-    return null;
-  }
-  const setupSource = setupArtifact.source;
-
-  let mod: OpenClawPluginModule;
-  let moduleLoader: ReturnType<typeof getPluginSetupModuleLoader>;
-  try {
-    moduleLoader = getPluginSetupModuleLoader(record, setupSource, setupArtifact.rootDir);
-    mod = moduleLoader(setupSource) as OpenClawPluginModule;
-  } catch (error) {
-    // A broken setup entry silently removes the plugin's providers/CLI
-    // backends/migrations from onboarding; record why instead of vanishing.
-    diagnostics.push({
-      pluginId: record.id,
-      code: "setup-entry-load-failed",
-      message: `setup entry failed to load from ${setupSource}: ${formatErrorMessage(error)}`,
-    });
-    return null;
-  }
-
-  return {
-    setupSource,
-    instance: getPluginValueInstance(mod as object),
-    register(api) {
-      const resolved = resolvePluginModuleExport(mod);
-      if (!resolved.register || (resolved.definition?.id && resolved.definition.id !== record.id)) {
-        return false;
-      }
-      // Setup keeps a legacy async entry's synchronous prefix; later registration stays closed.
-      runPluginRegistration(resolved.register.bind(resolved.definition), api, "ignore");
-      return true;
-    },
-    initialize: moduleLoader.initialize,
-  };
-}
-
-function buildSetupPluginApi(params: {
-  record: PluginManifestRecord;
-  setupSource: string;
-  handlers: PluginApiBuildParams["handlers"];
-}): ReturnType<typeof buildPluginApi> {
-  return buildPluginApi({
-    id: params.record.id,
-    name: params.record.name ?? params.record.id,
-    version: params.record.version,
-    description: params.record.description,
-    source: params.setupSource,
-    rootDir: params.record.rootDir,
-    registrationMode: "setup-only",
-    config: {} as OpenClawConfig,
-    runtime: createUnavailableRuntime("setup-only", params.record.id),
-    logger: NOOP_LOGGER,
-    resolvePath: (input) => input,
-    handlers: params.handlers,
-  });
-}
-
-function matchesProvider(provider: ProviderPlugin, providerId: string): boolean {
-  const normalized = normalizeProviderId(providerId);
-  if (normalizeProviderId(provider.id) === normalized) {
-    return true;
-  }
-  return [...(provider.aliases ?? []), ...(provider.hookAliases ?? [])].some(
-    (alias) => normalizeProviderId(alias) === normalized,
-  );
-}
-
 function resolveSetupRegistryCacheKey(params?: {
   config?: OpenClawConfig;
   workspaceDir?: string;
@@ -328,75 +229,19 @@ function resolveSetupRegistryCacheKey(params?: {
   ]);
 }
 
-function cloneSetupRegistryValue<T>(value: T, seen = new WeakMap<object, unknown>()): T {
-  if (!value || typeof value !== "object") {
-    return value;
-  }
-  const cached = seen.get(value);
-  if (cached !== undefined) {
-    return cached as T;
-  }
-  if (types.isDate(value)) {
-    const clone = new Date(value);
-    seen.set(value, clone);
-    return clone as T;
-  }
-  if (types.isRegExp(value)) {
-    const clone = new RegExp(value.source, value.flags);
-    clone.lastIndex = value.lastIndex;
-    seen.set(value, clone);
-    return clone as T;
-  }
-  if (Array.isArray(value)) {
-    const clone: unknown[] = [];
-    seen.set(value, clone);
-    clone.push(...value.map((entry) => cloneSetupRegistryValue(entry, seen)));
-    return clone as T;
-  }
-  if (types.isMap(value)) {
-    const clone = new Map<unknown, unknown>();
-    seen.set(value, clone);
-    for (const [key, entry] of value.entries()) {
-      clone.set(cloneSetupRegistryValue(key, seen), cloneSetupRegistryValue(entry, seen));
-    }
-    return clone as T;
-  }
-  if (types.isSet(value)) {
-    const clone = new Set<unknown>();
-    seen.set(value, clone);
-    for (const entry of value.values()) {
-      clone.add(cloneSetupRegistryValue(entry, seen));
-    }
-    return clone as T;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== null && Object.getPrototypeOf(prototype) !== null) {
-    // Class-prototyped values are shared by reference: setup registrations must
-    // treat them as immutable, or a caller mutation corrupts later cache hits.
-    return value;
-  }
-  const clone = Object.create(prototype) as Record<PropertyKey, unknown>;
-  seen.set(value, clone);
-  for (const key of Reflect.ownKeys(value)) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor) {
-      continue;
-    }
-    if ("value" in descriptor) {
-      descriptor.value = cloneSetupRegistryValue(descriptor.value, seen);
-    }
-    Object.defineProperty(clone, key, descriptor);
-  }
-  return clone as T;
-}
-
 function loadSetupManifestRecords(params: {
   config?: OpenClawConfig;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
   pluginIds?: readonly string[];
+  metadataSnapshot?: PluginMetadataSnapshot;
 }) {
-  const { snapshot: index, manifestRegistry } = loadPluginRegistrySnapshotWithMetadata(params);
+  const { snapshot: index, manifestRegistry } = params.metadataSnapshot
+    ? {
+        snapshot: params.metadataSnapshot.index,
+        manifestRegistry: params.metadataSnapshot.manifestRegistry,
+      }
+    : loadPluginRegistrySnapshotWithMetadata(params);
   if (!manifestRegistry) {
     return loadPluginManifestRegistryForInstalledIndex({ ...params, index, includeDisabled: true })
       .plugins;
@@ -456,68 +301,6 @@ function mapNormalizedIds(ids: readonly string[]): Map<string, string> {
   return mapped;
 }
 
-function pushDescriptorRuntimeDisabledDiagnostic(params: {
-  record: PluginManifestRecord;
-  diagnostics: PluginSetupRegistryDiagnostic[];
-}): void {
-  if (!resolveDeclaredSetupRuntimeSource(params.record)) {
-    return;
-  }
-  params.diagnostics.push({
-    pluginId: params.record.id,
-    code: "setup-descriptor-runtime-disabled",
-    message:
-      "setup.requiresRuntime is false, so OpenClaw ignored the plugin setup runtime entry. Remove setup-api/openclaw.setupEntry or set requiresRuntime true if setup lookup still needs plugin code.",
-  });
-}
-
-function pushSetupDescriptorDriftDiagnostics(params: {
-  record: PluginManifestRecord;
-  providers: readonly ProviderPlugin[];
-  cliBackends: readonly CliBackendPlugin[];
-  diagnostics: PluginSetupRegistryDiagnostic[];
-}): void {
-  const declaredProviderIds = params.record.setup?.providers?.map((entry) => entry.id);
-  if (declaredProviderIds) {
-    for (const provider of params.providers) {
-      if (!declaredProviderIds.some((declaredId) => matchesProvider(provider, declaredId))) {
-        params.diagnostics.push({
-          pluginId: params.record.id,
-          code: "setup-descriptor-provider-runtime-undeclared",
-          runtimeId: provider.id,
-          message: `setup runtime registered provider "${provider.id}" but setup.providers does not declare it.`,
-        });
-      }
-    }
-  }
-
-  const declaredCliBackendIds = params.record.setup?.cliBackends;
-  if (declaredCliBackendIds) {
-    const declaredCliBackends = mapNormalizedIds(declaredCliBackendIds);
-    const runtimeCliBackends = mapNormalizedIds(params.cliBackends.map((backend) => backend.id));
-    for (const [normalized, declaredId] of declaredCliBackends) {
-      if (!runtimeCliBackends.has(normalized)) {
-        params.diagnostics.push({
-          pluginId: params.record.id,
-          code: "setup-descriptor-cli-backend-missing-runtime",
-          declaredId,
-          message: `setup.cliBackends declares "${declaredId}" but setup runtime did not register a matching CLI backend.`,
-        });
-      }
-    }
-    for (const [normalized, runtimeId] of runtimeCliBackends) {
-      if (!declaredCliBackends.has(normalized)) {
-        params.diagnostics.push({
-          pluginId: params.record.id,
-          code: "setup-descriptor-cli-backend-runtime-undeclared",
-          runtimeId,
-          message: `setup runtime registered CLI backend "${runtimeId}" but setup.cliBackends does not declare it.`,
-        });
-      }
-    }
-  }
-}
-
 function withPluginSetupCache<TArgs extends unknown[], TResult>(
   query: (...args: TArgs) => TResult,
 ) {
@@ -558,7 +341,7 @@ export const resolvePluginSetupRegistry = withPluginSetupCache(function (params?
   if (resultCacheKey !== null) {
     const cached = resultCache.get(resultCacheKey);
     if (cached) {
-      return cloneSetupRegistryValue(cached);
+      return cached;
     }
   }
 
@@ -583,24 +366,58 @@ export const resolvePluginSetupRegistry = withPluginSetupCache(function (params?
       continue;
     }
     if (record.setup?.requiresRuntime === false) {
-      pushDescriptorRuntimeDisabledDiagnostic({
-        record,
-        diagnostics,
+      if (
+        record.setupSource ??
+        resolveSetupApiPath(record.rootDir, { includeBundledSourceFallback: false })
+      ) {
+        diagnostics.push({
+          pluginId: record.id,
+          code: "setup-descriptor-runtime-disabled",
+          message:
+            "setup.requiresRuntime is false, so OpenClaw ignored the plugin setup runtime entry. Remove setup-api/openclaw.setupEntry or set requiresRuntime true if setup lookup still needs plugin code.",
+        });
+      }
+      continue;
+    }
+    const setupArtifact = resolveLoadableSetupRuntimeSource(record);
+    if (!setupArtifact) {
+      continue;
+    }
+    const setupSource = setupArtifact.source;
+    let mod: OpenClawPluginModule;
+    let moduleLoader: ReturnType<typeof getPluginSetupModuleLoader>;
+    try {
+      moduleLoader = getPluginSetupModuleLoader(record, setupSource, setupArtifact.rootDir);
+      mod = moduleLoader(setupSource) as OpenClawPluginModule;
+    } catch (error) {
+      // A broken setup entry silently removes the plugin's providers/CLI
+      // backends/migrations from onboarding; record why instead of vanishing.
+      diagnostics.push({
+        pluginId: record.id,
+        code: "setup-entry-load-failed",
+        message: `setup entry failed to load from ${setupSource}: ${formatErrorMessage(error)}`,
       });
       continue;
     }
-    const setupRegistration = resolveSetupRegistration(record, diagnostics);
-    if (!setupRegistration) {
-      continue;
-    }
+    const instance = getPluginValueInstance(mod as object);
 
     const recordProviders = new Map<string, SetupProviderEntry>();
     const recordCliBackends = new Map<string, SetupCliBackendEntry>();
     const recordConfigMigrations: SetupConfigMigrationEntry[] = [];
     const recordAutoEnableProbes: SetupAutoEnableProbeEntry[] = [];
-    const api = buildSetupPluginApi({
-      record,
-      setupSource: setupRegistration.setupSource,
+    const recordDiagnostics: PluginSetupRegistryDiagnostic[] = [];
+    const api = buildPluginApi({
+      id: record.id,
+      name: record.name ?? record.id,
+      version: record.version,
+      description: record.description,
+      source: setupSource,
+      rootDir: record.rootDir,
+      registrationMode: "setup-only",
+      config: {},
+      runtime: createUnavailableRuntime("setup-only", record.id),
+      logger: NOOP_LOGGER,
+      resolvePath: (input) => input,
       handlers: {
         registerProvider(provider) {
           const key = `${record.id}:${normalizeProviderId(provider.id)}`;
@@ -614,6 +431,14 @@ export const resolvePluginSetupRegistry = withPluginSetupCache(function (params?
           if (cliBackends.has(key) || recordCliBackends.has(key)) {
             return;
           }
+          warnOnMissingCliBackendModelProvider(backend, (message) => {
+            recordDiagnostics.push({
+              pluginId: record.id,
+              code: "setup-cli-backend-missing-model-provider",
+              runtimeId: backend.id,
+              message,
+            });
+          });
           recordCliBackends.set(key, { pluginId: record.id, backend });
         },
         registerConfigMigration(migrate) {
@@ -633,9 +458,23 @@ export const resolvePluginSetupRegistry = withPluginSetupCache(function (params?
 
     try {
       if (
-        !setupRegistration.initialize(() =>
-          setupRegistration.register(instrumentPluginInstanceApi(api, setupRegistration.instance)),
-        )
+        !moduleLoader.initialize(() => {
+          const registrationApi = instrumentPluginInstanceApi(api, instance);
+          const resolved = resolvePluginModuleExport(mod);
+          if (
+            !resolved.register ||
+            (resolved.definition?.id && resolved.definition.id !== record.id)
+          ) {
+            return false;
+          }
+          // Setup keeps a legacy async entry's synchronous prefix; later registration stays closed.
+          runPluginRegistration(
+            resolved.register.bind(resolved.definition),
+            registrationApi,
+            "ignore",
+          );
+          return true;
+        })
       ) {
         continue;
       }
@@ -647,6 +486,7 @@ export const resolvePluginSetupRegistry = withPluginSetupCache(function (params?
       });
       continue;
     }
+    diagnostics.push(...recordDiagnostics);
     configMigrations.push(...recordConfigMigrations);
     autoEnableProbes.push(...recordAutoEnableProbes);
     for (const [key, entry] of recordProviders) {
@@ -655,12 +495,49 @@ export const resolvePluginSetupRegistry = withPluginSetupCache(function (params?
     for (const [key, entry] of recordCliBackends) {
       cliBackends.set(key, entry);
     }
-    pushSetupDescriptorDriftDiagnostics({
-      record,
-      providers: [...recordProviders.values()].map((entry) => entry.provider),
-      cliBackends: [...recordCliBackends.values()].map((entry) => entry.backend),
-      diagnostics,
-    });
+    const declaredProviderIds = record.setup?.providers?.map((entry) => entry.id);
+    if (declaredProviderIds) {
+      for (const { provider } of recordProviders.values()) {
+        if (
+          !declaredProviderIds.some((declaredId) => matchesProviderPluginRef(provider, declaredId))
+        ) {
+          diagnostics.push({
+            pluginId: record.id,
+            code: "setup-descriptor-provider-runtime-undeclared",
+            runtimeId: provider.id,
+            message: `setup runtime registered provider "${provider.id}" but setup.providers does not declare it.`,
+          });
+        }
+      }
+    }
+
+    const declaredCliBackendIds = record.setup?.cliBackends;
+    if (declaredCliBackendIds) {
+      const declaredCliBackends = mapNormalizedIds(declaredCliBackendIds);
+      const runtimeCliBackends = mapNormalizedIds(
+        [...recordCliBackends.values()].map((entry) => entry.backend.id),
+      );
+      for (const [normalized, declaredId] of declaredCliBackends) {
+        if (!runtimeCliBackends.has(normalized)) {
+          diagnostics.push({
+            pluginId: record.id,
+            code: "setup-descriptor-cli-backend-missing-runtime",
+            declaredId,
+            message: `setup.cliBackends declares "${declaredId}" but setup runtime did not register a matching CLI backend.`,
+          });
+        }
+      }
+      for (const [normalized, runtimeId] of runtimeCliBackends) {
+        if (!declaredCliBackends.has(normalized)) {
+          diagnostics.push({
+            pluginId: record.id,
+            code: "setup-descriptor-cli-backend-runtime-undeclared",
+            runtimeId,
+            message: `setup runtime registered CLI backend "${runtimeId}" but setup.cliBackends does not declare it.`,
+          });
+        }
+      }
+    }
   }
 
   const registry = {
@@ -679,7 +556,7 @@ export const resolvePluginSetupRegistry = withPluginSetupCache(function (params?
   if (resultCacheKey === null) {
     return registry;
   }
-  resultCache.set(resultCacheKey, cloneSetupRegistryValue(registry));
+  resultCache.set(resultCacheKey, registry);
   return registry;
 });
 
@@ -704,7 +581,7 @@ export const resolvePluginSetupProviderCore = withPluginSetupCache(function (par
     return undefined;
   }
   return resolveSetupRegistryForManifestOwner(record).providers.findLast((entry) =>
-    matchesProvider(entry.provider, normalizedProvider),
+    matchesProviderPluginRef(entry.provider, normalizedProvider),
   )?.provider;
 });
 
@@ -713,6 +590,7 @@ export const resolvePluginSetupCliBackend = withPluginSetupCache(function (param
   config?: OpenClawConfig;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
+  metadataSnapshot?: PluginMetadataSnapshot;
 }): SetupCliBackendEntry | undefined {
   const normalized = normalizeProviderId(params.backend);
 
@@ -724,6 +602,7 @@ export const resolvePluginSetupCliBackend = withPluginSetupCache(function (param
     config: params.config,
     workspaceDir: params.workspaceDir,
     env,
+    metadataSnapshot: params.metadataSnapshot,
     normalizedId: normalized,
     listIds: listSetupCliBackendIds,
   });
@@ -773,13 +652,7 @@ export const resolvePluginSetupAutoEnableReasons = withPluginSetupCache(function
   const reasons: SetupAutoEnableReason[] = [];
   const seen = new Set<string>();
 
-  for (const entry of resolvePluginSetupRegistry({
-    config: params.config,
-    workspaceDir: params.workspaceDir,
-    env,
-    pluginIds: params.pluginIds,
-    manifestRegistry: params.manifestRegistry,
-  }).autoEnableProbes) {
+  for (const entry of resolvePluginSetupRegistry(params).autoEnableProbes) {
     const raw = entry.probe({
       config: params.config,
       env,
@@ -804,4 +677,3 @@ export const resolvePluginSetupAutoEnableReasons = withPluginSetupCache(function
 
   return reasons;
 });
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

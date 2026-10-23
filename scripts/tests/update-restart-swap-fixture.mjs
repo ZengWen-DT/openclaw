@@ -18,7 +18,7 @@ export async function createDiskSwap(sourceRoot, base) {
   assert.equal(installed, expected, "filesystem dependency must match the candidate manifest");
   const atomic = await import(pathToFileURL(require.resolve("@openclaw/fs-safe/atomic")).href);
   const fsSafe = new Map();
-  for (const subpath of ["errors", "root"]) {
+  for (const subpath of ["errors", "path", "root"]) {
     const specifier = `@openclaw/fs-safe/${subpath}`;
     fsSafe.set(specifier, await import(pathToFileURL(require.resolve(specifier)).href));
   }
@@ -62,6 +62,7 @@ export async function createDiskSwap(sourceRoot, base) {
     "infra/package-update-swap-retirement",
     "infra/package-update-filesystem",
     "infra/package-update-integrity",
+    "infra/package-update-integrity-hasher",
     "infra/package-update-npm-root",
     "infra/package-update-local-overrides",
     "infra/package-update-swap-contract",

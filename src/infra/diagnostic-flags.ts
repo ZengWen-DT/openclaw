@@ -10,42 +10,12 @@ function resolveDiagnosticFlags(
   cfg?: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
-  const configFlags = Array.isArray(cfg?.diagnostics?.flags) ? cfg?.diagnostics?.flags : [];
+  const configFlags = cfg?.diagnostics?.flags ?? [];
   const envFlags = parseDiagnosticEnvFlags(env[DIAGNOSTICS_ENV]);
   if (envFlags.disablesAll) {
     return [];
   }
   return normalizeUniqueStringEntriesLower([...configFlags, ...envFlags.flags]);
-}
-
-/** Matches one diagnostic flag against exact, wildcard, and namespace-enabled flags. */
-function matchesDiagnosticFlag(flag: string, enabledFlags: string[]): boolean {
-  const target = normalizeLowercaseStringOrEmpty(flag);
-  if (!target) {
-    return false;
-  }
-  for (const raw of enabledFlags) {
-    const enabled = normalizeLowercaseStringOrEmpty(raw);
-    if (enabled === "*" || enabled === "all") {
-      return true;
-    }
-    if (enabled.endsWith(".*")) {
-      const prefix = enabled.slice(0, -2);
-      if (target === prefix || target.startsWith(`${prefix}.`)) {
-        return true;
-      }
-    }
-    if (enabled.endsWith("*")) {
-      const prefix = enabled.slice(0, -1);
-      if (target.startsWith(prefix)) {
-        return true;
-      }
-    }
-    if (enabled === target) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /** Returns whether a diagnostic flag is enabled after config/env resolution. */
@@ -54,5 +24,21 @@ export function isDiagnosticFlagEnabled(
   cfg?: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return matchesDiagnosticFlag(flag, resolveDiagnosticFlags(cfg, env));
+  const enabledFlags = resolveDiagnosticFlags(cfg, env);
+  const target = normalizeLowercaseStringOrEmpty(flag);
+  if (!target) {
+    return false;
+  }
+  for (const enabled of enabledFlags) {
+    if (enabled === "*" || enabled === "all" || enabled === target) {
+      return true;
+    }
+    if (enabled.endsWith(".*") && target === enabled.slice(0, -2)) {
+      return true;
+    }
+    if (enabled.endsWith("*") && target.startsWith(enabled.slice(0, -1))) {
+      return true;
+    }
+  }
+  return false;
 }

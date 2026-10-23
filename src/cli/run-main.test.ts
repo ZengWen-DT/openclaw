@@ -7,18 +7,13 @@ import {
   type PluginManifestCommandAliasRegistry,
 } from "../plugins/manifest-command-aliases.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import {
-  resolveGatewayCatalogCommandPath,
-  resolveGatewayRunPreBootstrapOptions,
-} from "./gateway-run-argv.js";
+import { captureEnv } from "../test-utils/env.js";
+import { rewriteUpdateFlagArgv } from "./argv.js";
+import { resolveGatewayCommandPath } from "./gateway-run-argv.js";
 import {
   isGatewayRunFastPathArgv,
-  rewriteUpdateFlagArgv,
   resolveMissingPluginCommandMessage,
-  shouldHandleBareRoot,
-  shouldStartProxyForCli,
   shouldUseRootHelpFastPath,
-  shouldUseSetupOnboardConfigureHelpFastPath,
 } from "./run-main-policy.js";
 import { runCli } from "./run-main.js";
 
@@ -35,9 +30,9 @@ const sqliteAdmission = vi.hoisted(() => ({
   initialize: vi.fn<() => Promise<void>>().mockResolvedValue(),
   selectGatewayEnvironment: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
 }));
-vi.mock("../infra/bun-sqlite-library.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../infra/bun-sqlite-library.js")>()),
-  initializeSqliteRuntimeCapabilities: sqliteAdmission.initialize,
+vi.mock("../infra/sqlite-runtime-initialize.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../infra/sqlite-runtime-initialize.js")>()),
+  initializeSqliteRuntime: sqliteAdmission.initialize,
 }));
 vi.mock("./gateway-cli/run.js", () => ({ runGatewayCommand }));
 // Keep Commander parsing independent of native startup; run-main.exit and
@@ -67,6 +62,7 @@ vi.mock("../logging/console.js", async (importOriginal) => ({
 
 describe("CLI host admission and Gateway fast-path parsing", () => {
   const previousExitCode = process.exitCode;
+  const pathEnv = captureEnv(["PATH", "OPENCLAW_PATH_BOOTSTRAPPED"]);
   beforeEach(() => {
     process.exitCode = undefined;
     runGatewayCommand.mockClear();
@@ -75,6 +71,7 @@ describe("CLI host admission and Gateway fast-path parsing", () => {
     vi.spyOn(process.stderr, "write").mockImplementation(() => true);
   });
   afterEach(() => {
+    pathEnv.restore();
     process.exitCode = previousExitCode;
     vi.restoreAllMocks();
   });
@@ -155,30 +152,6 @@ describe("Gateway argv boundaries", () => {
     expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--unknown"))).toBe(false);
     expect(isGatewayRunFastPathArgv(cliArgs("gateway", "--update-canary=true"))).toBe(false);
   });
-
-  it("resolves destructive flags after root options without consuming option values", () => {
-    expect(
-      resolveGatewayRunPreBootstrapOptions(
-        cliArgs("--log-level", "debug", "gateway", "run", "--force", "--reset"),
-      ),
-    ).toEqual({ force: true, reset: true });
-    expect(resolveGatewayRunPreBootstrapOptions(cliArgs("gateway", "--token", "--force"))).toEqual({
-      force: false,
-      reset: false,
-    });
-  });
-
-  it.each([
-    { args: ["--", "gateway", "--force"], commandPath: ["gateway", "--force"] },
-    { args: ["gateway", "--", "run", "--force"], commandPath: ["gateway", "run"] },
-    { args: ["gateway", "run", "--", "--reset"], commandPath: ["gateway", "run"] },
-  ])("preserves literal commands without destructive flags: $args", ({ args, commandPath }) => {
-    const argv = cliArgs(...args);
-    expect(resolveGatewayCatalogCommandPath(argv)).toEqual(commandPath);
-    const options = resolveGatewayRunPreBootstrapOptions(argv);
-    expect(options?.force).not.toBe(true);
-    expect(options?.reset).not.toBe(true);
-  });
 });
 
 describe("root startup policy", () => {
@@ -193,25 +166,6 @@ describe("root startup policy", () => {
     expect(rewriteUpdateFlagArgv(cliArgs(...args))).toEqual(cliArgs(...expected));
   });
 
-  it.each([["--profile", "work", "--", "config", "get", "gateway.mode"]])(
-    "does not launch bare-root flows for literal commands: %j",
-    (...args) => {
-      const argv = cliArgs(...args);
-      expect(shouldHandleBareRoot(argv)).toBe(false);
-      expect(shouldUseRootHelpFastPath(argv)).toBe(false);
-    },
-  );
-
-  it("skips proxy startup before SQLite maintenance", () => {
-    expect(shouldStartProxyForCli(cliArgs("doctor", "--state-sqlite", "compact", "--json"))).toBe(
-      false,
-    );
-    expect(shouldStartProxyForCli(cliArgs("doctor", "--state-sqlite=compact", "--json"))).toBe(
-      false,
-    );
-    expect(shouldStartProxyForCli(cliArgs("doctor", "--lint"))).toBe(true);
-  });
-
   it("uses root help only for root invocations and aliases", () => {
     expect(shouldUseRootHelpFastPath(cliArgs("--help"))).toBe(true);
     expect(shouldUseRootHelpFastPath(cliArgs("help", "--help"))).toBe(true);
@@ -219,16 +173,6 @@ describe("root startup policy", () => {
     expect(shouldUseRootHelpFastPath(cliArgs("status", "--help"))).toBe(false);
     expect(shouldUseRootHelpFastPath(cliArgs("--help", "status"))).toBe(false);
     expect(shouldUseRootHelpFastPath(cliArgs("help", "gateway"))).toBe(false);
-  });
-
-  it("keeps setup help behind unambiguous argument parsing", () => {
-    expect(shouldUseSetupOnboardConfigureHelpFastPath(cliArgs("setup", "--help"))).toBe(true);
-    expect(shouldUseSetupOnboardConfigureHelpFastPath(cliArgs("onboard", "status", "--help"))).toBe(
-      false,
-    );
-    expect(
-      shouldUseSetupOnboardConfigureHelpFastPath(cliArgs("onboard", "--gateway-port", "--help")),
-    ).toBe(false);
   });
 });
 
@@ -269,11 +213,12 @@ describe("plugin command policy", () => {
 });
 
 it("keeps post-root log levels out of the gateway command path", () => {
+  expect(resolveGatewayCommandPath(cliArgs("gateway", "--log-level", "debug", "run"))).toEqual([
+    "gateway",
+    "run",
+  ]);
   expect(
-    resolveGatewayCatalogCommandPath(cliArgs("gateway", "--log-level", "debug", "run")),
-  ).toEqual(["gateway", "run"]);
-  expect(
-    resolveGatewayCatalogCommandPath(
+    resolveGatewayCommandPath(
       cliArgs("gateway", "--log-level=debug", "restart-handoff", "capabilities"),
     ),
   ).toEqual(["gateway", "restart-handoff"]);

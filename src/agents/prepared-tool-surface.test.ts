@@ -9,54 +9,45 @@ import { createCoreCodingTools } from "./core-coding-tools.js";
 import { prepareCoreToolPolicy, projectAgentToolDefinition } from "./prepared-tool-surface.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-
 describe("prepared core tool policy", () => {
   it.each([
-    { mode: undefined, required: false, memory: false, workspaceOnly: true, readOnly: false },
-    { mode: "full", required: false, memory: false, workspaceOnly: false, readOnly: false },
-    { mode: "full", required: true, memory: false, workspaceOnly: true, readOnly: false },
-    { mode: "full", required: false, memory: true, workspaceOnly: true, readOnly: false },
-    { mode: "read-only", required: false, memory: false, workspaceOnly: true, readOnly: true },
-  ] as const)(
-    "preserves session precedence for $mode, required=$required, memory=$memory",
-    (testCase) => {
-      const policy = prepareCoreToolPolicy({
+    [undefined, false, false, true, false],
+    ["full", false, false, false, false],
+    ["full", true, false, true, false],
+    ["full", false, true, true, false],
+    ["read-only", false, false, true, true],
+  ] as const)("resolves session policy (%#)", (mode, required, memory, workspaceOnly, readOnly) => {
+    expect(
+      prepareCoreToolPolicy({
         config: { tools: { fs: { workspaceOnly: true } } },
-        sessionPermissionPolicy: testCase.mode
-          ? { root: "/workspace", mode: testCase.mode }
-          : undefined,
-        requireWorkspaceOnly: testCase.required || undefined,
-        trigger: testCase.memory ? "memory" : "user",
-      });
-      expect(policy.workspaceOnly).toBe(testCase.workspaceOnly);
-      expect(policy.readOnly).toBe(testCase.readOnly);
-      expect(policy.applyPatchEnabled).toBe(!testCase.readOnly);
-      expect(policy.applyPatchContainmentSource).toBe(
-        testCase.required ? "required-root" : testCase.mode ? "session" : "config",
-      );
-    },
-  );
+        sessionPermissionPolicy: mode ? { root: "/workspace", mode } : undefined,
+        requireWorkspaceOnly: required || undefined,
+        trigger: memory ? "memory" : "user",
+      }),
+    ).toMatchObject({
+      workspaceOnly,
+      readOnly,
+      applyPatchEnabled: !readOnly,
+      applyPatchContainmentSource: required ? "required-root" : mode ? "session" : "config",
+    });
+  });
 
   it.each([
-    { allowModels: [" OPENAI/model-a "], modelId: "model-a", expected: true },
-    { allowModels: ["model-a"], modelId: "model-a", expected: true },
-    { allowModels: ["openai/model-a"], modelId: "openai/model-a", expected: true },
-    { allowModels: ["model-b"], modelId: "model-a", expected: false },
-    { allowModels: ["model-a"], modelId: undefined, expected: false },
-  ])(
-    "resolves patch model eligibility for $allowModels and $modelId",
-    ({ allowModels, modelId, expected }) => {
-      expect(
-        prepareCoreToolPolicy({
-          config: { tools: { exec: { applyPatch: { allowModels } } } },
-          modelProvider: "openai",
-          modelId,
-        }).applyPatchEnabled,
-      ).toBe(expected);
-    },
-  );
+    [" OPENAI/model-a ", "model-a", true],
+    ["openai/model-a", "openai/model-a", true],
+    ["model-b", "model-a", false],
+    ["model-a", undefined, false],
+  ] as const)("checks patch model allowlist (%#)", (allowed, modelId, applyPatchEnabled) => {
+    expect(
+      prepareCoreToolPolicy({
+        config: { tools: { exec: { applyPatch: { allowModels: [allowed] } } } },
+        modelProvider: "openai",
+        modelId,
+      }),
+    ).toMatchObject({ applyPatchEnabled });
+  });
 
-  it("projects the selected model budget, vision support, and image limits without credentials", () => {
+  it("preserves image and transport policy", () => {
     expect(
       prepareCoreToolPolicy({
         config: { agents: { defaults: { imageMaxDimensionPx: 800 } } },
@@ -80,15 +71,14 @@ describe("prepared core tool policy", () => {
     {
       tools: { fs: { workspaceOnly: false } },
       agents: {
-        list: [
-          {
-            id: "restricted",
+        entries: {
+          restricted: {
             tools: {
               fs: { workspaceOnly: true },
               exec: { applyPatch: { allowModels: ["other-model"] } },
             },
           },
-        ],
+        },
       },
     },
   ] satisfies OpenClawConfig[])(
@@ -150,7 +140,6 @@ it("issues byte-identical definitions to the local session adapter", () => {
   const local = toToolDefinitions(tools);
   const placed = tools.map(projectAgentToolDefinition);
   expect(JSON.stringify(placed)).toBe(JSON.stringify(local));
-  expect(placed[0]?.executionMode).toBe("sequential");
-  expect(placed[0]?.hideFromChannelProgress).toBe(true);
+  expect(placed[0]).toMatchObject({ executionMode: "sequential", hideFromChannelProgress: true });
   expect(Object.keys(placed[0]!)).not.toContain("execute");
 });

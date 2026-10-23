@@ -1,11 +1,8 @@
-import fs, { type BigIntStats } from "node:fs";
+import fs from "node:fs";
 import { sameFileIdentity, type FileIdentityStat } from "@openclaw/fs-safe/advanced";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import {
-  hashFileDescriptorSync,
-  sameFileMutationFingerprint,
-  type FileMutationFingerprint,
-} from "./file-descriptor.js";
+import type { FileMutationFingerprint } from "./file-descriptor.js";
+import { hashPublishedFileSync, sameFileStatFingerprint } from "./sqlite-snapshot-file.js";
 
 export function readSqliteIntegrityFileIdentity(
   pathname: string,
@@ -28,33 +25,20 @@ export type SqliteFileGeneration = {
   wal?: SqliteFileFingerprint;
 };
 
-function assertRegularFile(stat: BigIntStats): void {
-  if (!stat.isFile()) {
-    throw new Error("SQLite generation target must be a regular file");
-  }
-}
-
-function sameFileState(left: BigIntStats, right: BigIntStats): boolean {
-  return (
-    sameFileIdentity(left, right) &&
-    left.birthtimeNs === right.birthtimeNs &&
-    left.ctimeNs === right.ctimeNs &&
-    left.mtimeNs === right.mtimeNs &&
-    left.size === right.size
-  );
-}
-
 function fingerprintFile(pathname: string): SqliteFileFingerprint {
   const fd = fs.openSync(pathname, "r");
   try {
     const before = fs.fstatSync(fd, { bigint: true });
-    assertRegularFile(before);
-    const { sha256 } = hashFileDescriptorSync(fd);
+    if (!before.isFile()) {
+      throw new Error("SQLite generation target must be a regular file");
+    }
+    const { sha256 } = hashPublishedFileSync(fs.realpathSync.native(pathname), before);
     const after = fs.fstatSync(fd, { bigint: true });
     const current = fs.statSync(pathname, { bigint: true });
-    if (!sameFileState(before, after) || !sameFileState(after, current)) {
+    if (!sameFileStatFingerprint(before, after) || !sameFileStatFingerprint(after, current)) {
       throw new Error(`SQLite generation target changed while hashing: ${pathname}`);
     }
+    // Retain native descriptor IDs when Windows pathname stats report unknown IDs.
     return {
       birthtimeNs: after.birthtimeNs,
       ctimeNs: after.ctimeNs,
@@ -80,7 +64,8 @@ function readOptionalFile(pathname: string): SqliteFileFingerprint | undefined {
   }
 }
 
-function readGeneration(pathname: string): SqliteFileGeneration {
+/** Provisional family observation; callers must verify it against a later stable read. */
+export function readSqliteFileGeneration(pathname: string): SqliteFileGeneration {
   const database = fingerprintFile(pathname);
   const journal = readOptionalFile(`${pathname}-journal`);
   const wal = readOptionalFile(`${pathname}-wal`);
@@ -91,9 +76,10 @@ function readGeneration(pathname: string): SqliteFileGeneration {
   };
 }
 
+/** Raw source reads require an isolated process or a drained database owner. */
 export function readStableSqliteFileGeneration(pathname: string): SqliteFileGeneration {
-  const first = readGeneration(pathname);
-  const second = readGeneration(pathname);
+  const first = readSqliteFileGeneration(pathname);
+  const second = readSqliteFileGeneration(pathname);
   if (!sameSqliteFileGeneration(first, second)) {
     throw new Error(`SQLite file generation changed while reading: ${pathname}`);
   }
@@ -101,7 +87,12 @@ export function readStableSqliteFileGeneration(pathname: string): SqliteFileGene
 }
 
 function sameFileFingerprint(left: SqliteFileFingerprint, right: SqliteFileFingerprint): boolean {
-  return sameFileMutationFingerprint(left, right) && left.sha256 === right.sha256;
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    sameFileStatFingerprint(left, right) &&
+    left.sha256 === right.sha256
+  );
 }
 
 function sameOptionalFileFingerprint(
@@ -120,7 +111,11 @@ export function sameSqliteFileGeneration(
   return (
     sameFileFingerprint(left.database, right.database) &&
     sameOptionalFileFingerprint(left.journal, right.journal) &&
-    sameOptionalFileFingerprint(left.wal, right.wal)
+    // SQLite can create/delete an empty WAL while opening a closed reader; it contains no frames.
+    sameOptionalFileFingerprint(
+      left.wal?.size === 0n ? undefined : left.wal,
+      right.wal?.size === 0n ? undefined : right.wal,
+    )
   );
 }
 

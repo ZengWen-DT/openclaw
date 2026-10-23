@@ -1,6 +1,5 @@
 import { collectNestedErrorCandidates } from "@openclaw/normalization-core/error-coercion";
 import { registerSignalExitGate } from "../cli/signal-exit-barrier.js";
-import { needsCandidateManagedServiceStop } from "../cli/update-cli/update-command-legacy-service-stop.js";
 import { UpdateCommandRecoveryPendingError } from "../cli/update-cli/update-command-recovery-error.js";
 import type { PreManagedServiceStop } from "../cli/update-cli/update-command-service-context-types.js";
 import { maybeStopManagedServiceBeforeMutableUpdate } from "../cli/update-cli/update-command-service-maintenance.js";
@@ -107,7 +106,6 @@ export async function stopSupervisedPredecessorGateway(
   input: { runId: string; repair: boolean },
   params: {
     root: string;
-    timeoutMs?: number;
     assertCurrent: () => void;
     warn: (message: string) => void;
   },
@@ -154,7 +152,7 @@ export async function stopSupervisedPredecessorGateway(
       },
     ).then((result) => {
       if (
-        result.runId !== runId ||
+        result?.runId !== runId ||
         result.status !== "running" ||
         !result.steps.some((stored) => stored.step === step && stored.status === "completed")
       ) {
@@ -180,7 +178,7 @@ export async function stopSupervisedPredecessorGateway(
       // The delegated Doctor input carries no step budget; bound the drain and
       // stop by the service stop budget so a stuck predecessor cannot outlive
       // the parent's Doctor allowance.
-      timeoutMs: params.timeoutMs ?? GATEWAY_SERVICE_STOP_TIMEOUT_MS,
+      timeoutMs: GATEWAY_SERVICE_STOP_TIMEOUT_MS,
       onStopped: record,
       assertCurrent: params.assertCurrent,
       warn: params.warn,
@@ -325,7 +323,12 @@ export async function adoptCandidateManagedServiceStop(params: {
   }
   if (
     params.status !== "ok" ||
-    !needsCandidateManagedServiceStop({ ...params, preManagedServiceStop: params.transferred })
+    !params.shouldRestart ||
+    params.mode === "unknown" ||
+    params.transferred?.serviceUpdateVerdict?.kind !== "unavailable" ||
+    params.transferred.stopped ||
+    params.transferred.inspected ||
+    params.windowsTaskAutoStartSuspended === true
   ) {
     return unchanged;
   }

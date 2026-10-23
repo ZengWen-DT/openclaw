@@ -1,14 +1,14 @@
 import type {
   GeneratedImageAsset,
   ImageGenerationProvider,
-  ImageGenerationSourceImage,
+  ImageGenerationRequest,
 } from "openclaw/plugin-sdk/image-generation";
 import {
   imageFileExtensionForMimeType,
   toImageDataUrl,
 } from "openclaw/plugin-sdk/image-generation";
-import { resolveGeneratedMediaMaxBytes } from "openclaw/plugin-sdk/media-generation-runtime";
-import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
+import { resolveGeneratedImageDownloadMaxBytes } from "openclaw/plugin-sdk/media-generation-runtime";
+import { isProviderApiKeyConfiguredAsync } from "openclaw/plugin-sdk/provider-auth";
 import {
   assertOkOrThrowHttpError,
   assertOkOrThrowProviderError,
@@ -140,10 +140,7 @@ type FalImageModelSchema = {
   supportsCount: boolean;
   supportsOutputFormat: boolean;
 };
-function parseFalImageGenerationResponse(payload: unknown): {
-  images: Record<string, unknown>[];
-  prompt?: string;
-} {
+function parseFalImageGenerationResponse(payload: unknown) {
   if (!isRecord(payload)) {
     throw new Error(FAL_IMAGE_MALFORMED_RESPONSE);
   }
@@ -284,13 +281,6 @@ function parseSize(raw: string | undefined): { width: number; height: number } |
   return { width, height };
 }
 
-function mapResolutionToEdge(resolution: "1K" | "2K" | "4K" | undefined): number | undefined {
-  if (!resolution) {
-    return undefined;
-  }
-  return resolution === "4K" ? 4096 : resolution === "2K" ? 2048 : 1024;
-}
-
 const FAL_ASPECT_RATIO_SIZES = new Map([
   ["1:1", "square_hd"],
   ["4:3", "landscape_4_3"],
@@ -334,21 +324,25 @@ function aspectRatioToDimensions(
   };
 }
 
-function resolveFalImageSize(params: {
-  size?: string;
-  resolution?: "1K" | "2K" | "4K";
-  aspectRatio?: string;
-  hasInputImages: boolean;
-}): FalImageSize | undefined {
-  const parsed = parseSize(params.size);
+function resolveFalImageSize(
+  req: ImageGenerationRequest,
+  hasInputImages: boolean,
+): FalImageSize | undefined {
+  const parsed = parseSize(req.size);
   if (parsed) {
     return parsed;
   }
 
-  const normalizedAspectRatio = params.aspectRatio?.trim();
-  const edge = mapResolutionToEdge(params.resolution);
+  const normalizedAspectRatio = req.aspectRatio?.trim();
+  const edge = req.resolution
+    ? req.resolution === "4K"
+      ? 4096
+      : req.resolution === "2K"
+        ? 2048
+        : 1024
+    : undefined;
   if (normalizedAspectRatio) {
-    if (edge && !params.hasInputImages) {
+    if (edge && !hasInputImages) {
       return aspectRatioToDimensions(normalizedAspectRatio, edge);
     }
     return (
@@ -357,16 +351,6 @@ function resolveFalImageSize(params: {
     );
   }
   return edge ? { width: edge, height: edge } : undefined;
-}
-
-function resolveFalGptImage25AspectRatioSize(aspectRatio: string): FalImageSize {
-  // A 1536px long edge keeps every supported ratio through 3:1 above the
-  // minimum pixel count. Round the short edge to the API's 16px grid.
-  const { width, height } = aspectRatioToDimensions(aspectRatio, 1536);
-  return {
-    width: Math.round(width / 16) * 16,
-    height: Math.round(height / 16) * 16,
-  };
 }
 
 function validateFalGptImage25Size(size: FalImageSize | undefined): void {
@@ -395,131 +379,6 @@ function validateFalGptImage25Size(size: FalImageSize | undefined): void {
 function aspectRatioScore(aspectRatio: string, targetRatio: number): number {
   const { widthRatio, heightRatio } = parseAspectRatioParts(aspectRatio);
   return Math.abs(Math.log(widthRatio / heightRatio) - Math.log(targetRatio));
-}
-
-function resolveClosestFalAspectRatioForSize(
-  imageSize: FalImageSize | undefined,
-  aspectRatios: readonly string[],
-): string | undefined {
-  if (!imageSize || typeof imageSize === "string") {
-    return undefined;
-  }
-  const targetRatio = imageSize.width / imageSize.height;
-  return aspectRatios.reduce<string | undefined>((best, candidate) => {
-    if (!best) {
-      return candidate;
-    }
-    return aspectRatioScore(candidate, targetRatio) < aspectRatioScore(best, targetRatio)
-      ? candidate
-      : best;
-  }, undefined);
-}
-
-function resolveFalCreativityOption(providerOptions: Record<string, unknown> | undefined): string {
-  const falOptions = isRecord(providerOptions?.fal) ? providerOptions.fal : undefined;
-  const normalized = normalizeLowercaseStringOrEmpty(falOptions?.creativity);
-  return KREA_CREATIVITY_LEVELS.some((level) => level === normalized) ? normalized : "medium";
-}
-
-function resolveNativeFalAspectRatio(params: {
-  schema: FalImageModelSchema;
-  aspectRatio?: string;
-  imageSize?: FalImageSize;
-}): string | undefined {
-  const requestedAspectRatio = params.aspectRatio?.trim();
-  const allowedAspectRatios = params.schema.aspectRatios;
-  if (requestedAspectRatio) {
-    if (allowedAspectRatios && !allowedAspectRatios.includes(requestedAspectRatio)) {
-      throw new Error(
-        `${params.schema.referenceLimitLabel} supports aspectRatio values: ${allowedAspectRatios.join(", ")}`,
-      );
-    }
-    return requestedAspectRatio;
-  }
-  if (allowedAspectRatios) {
-    return resolveClosestFalAspectRatioForSize(params.imageSize, allowedAspectRatios);
-  }
-  return undefined;
-}
-
-function applyFalImageGeometry(params: {
-  requestBody: Record<string, unknown>;
-  schema: FalImageModelSchema;
-  imageSize?: FalImageSize;
-  size?: string;
-  aspectRatio?: string;
-  resolution?: "1K" | "2K" | "4K";
-}) {
-  if (params.schema.geometry === "native_aspect_ratio") {
-    if (params.resolution && params.schema.referenceImages === "image_style_references") {
-      throw new Error("fal Krea 2 supports aspectRatio but not resolution overrides");
-    }
-    const nativeAspectRatio = resolveNativeFalAspectRatio({
-      schema: params.schema,
-      aspectRatio: params.aspectRatio,
-      imageSize: params.size ? params.imageSize : undefined,
-    });
-    if (nativeAspectRatio) {
-      params.requestBody.aspect_ratio = nativeAspectRatio;
-    }
-    if (params.resolution && params.schema.referenceImages === "image_urls") {
-      // An absent allowlist forwards resolutions; an empty one rejects all overrides.
-      const allowedResolutions = params.schema.resolutions;
-      if (allowedResolutions === undefined) {
-        params.requestBody.resolution = params.resolution;
-      } else if (allowedResolutions.length === 0) {
-        throw new Error(
-          `${params.schema.referenceLimitLabel} does not support resolution overrides`,
-        );
-      } else if (!allowedResolutions.includes(params.resolution)) {
-        throw new Error(
-          `${params.schema.referenceLimitLabel} supports resolution values: ${allowedResolutions.join(", ")}`,
-        );
-      } else {
-        params.requestBody.resolution =
-          params.schema.resolutionCase === "lower"
-            ? params.resolution.toLowerCase()
-            : params.resolution;
-      }
-    }
-    return;
-  }
-  if (params.imageSize !== undefined) {
-    params.requestBody.image_size = params.imageSize;
-  }
-}
-
-function applyFalReferenceImages(params: {
-  requestBody: Record<string, unknown>;
-  schema: FalImageModelSchema;
-  inputImages: ImageGenerationSourceImage[];
-}) {
-  const encoded = params.inputImages.map(toImageDataUrl);
-  if (params.schema.referenceImages === "image_urls") {
-    params.requestBody.image_urls = encoded;
-    return;
-  }
-  if (params.schema.referenceImages === "image_style_references") {
-    params.requestBody.image_style_references = encoded.map((imageUrl) => ({
-      image_url: imageUrl,
-    }));
-    return;
-  }
-  const [input] = encoded;
-  if (!input) {
-    throw new Error("fal image edit request missing reference image");
-  }
-  params.requestBody.image_url = input;
-}
-
-function formatFalReferenceLimitError(
-  schema: FalImageModelSchema,
-  inputImageCount: number,
-): string {
-  const limit = schema.maxInputImages === 1 ? "one" : String(schema.maxInputImages);
-  const noun =
-    schema.maxInputImages === 1 ? schema.referenceLimitNoun : `${schema.referenceLimitNoun}s`;
-  return `${schema.referenceLimitLabel} supports at most ${limit} ${noun} (requested ${inputImageCount})`;
 }
 
 async function fetchImageBuffer(
@@ -562,7 +421,7 @@ export function buildFalImageGenerationProvider(): ImageGenerationProvider {
       FAL_KREA_2_LARGE_MODEL,
       ...FAL_GPT_IMAGE_25_MODELS,
     ],
-    isConfigured: (ctx) => isProviderApiKeyConfigured({ provider: "fal", ...ctx }),
+    isConfiguredAsync: (ctx) => isProviderApiKeyConfiguredAsync({ provider: "fal", ...ctx }),
     capabilities: {
       generate: {
         maxCount: 4,
@@ -665,24 +524,28 @@ export function buildFalImageGenerationProvider(): ImageGenerationProvider {
       if (isGptImage25 && req.size && req.size !== "auto" && !parseSize(req.size)) {
         throw new Error("fal GPT Image 2.5 size must be WIDTHxHEIGHT or auto");
       }
-      const imageSize =
-        isGptImage25 && req.size === "auto"
-          ? "auto"
-          : isGptImage25 && req.aspectRatio && !req.size
-            ? resolveFalGptImage25AspectRatioSize(req.aspectRatio)
-            : resolveFalImageSize({
-                size: req.size,
-                resolution: req.resolution,
-                aspectRatio: req.aspectRatio,
-                hasInputImages,
-              });
+      let imageSize: FalImageSize | undefined;
+      if (isGptImage25 && req.size === "auto") {
+        imageSize = "auto";
+      } else if (isGptImage25 && req.aspectRatio && !req.size) {
+        // Keep ratios through 3:1 above the pixel minimum and on the API's 16px grid.
+        const { width, height } = aspectRatioToDimensions(req.aspectRatio, 1536);
+        imageSize = { width: Math.round(width / 16) * 16, height: Math.round(height / 16) * 16 };
+      } else {
+        imageSize = resolveFalImageSize(req, hasInputImages);
+      }
       if (isGptImage25) {
         validateFalGptImage25Size(imageSize);
       }
       const model = ensureFalModelPath(requestedModel, hasInputImages, schema);
 
       if (hasInputImages && inputImageCount > schema.maxInputImages) {
-        throw new Error(formatFalReferenceLimitError(schema, inputImageCount));
+        const limit = schema.maxInputImages === 1 ? "one" : String(schema.maxInputImages);
+        const noun =
+          schema.maxInputImages === 1 ? schema.referenceLimitNoun : `${schema.referenceLimitNoun}s`;
+        throw new Error(
+          `${schema.referenceLimitLabel} supports at most ${limit} ${noun} (requested ${inputImageCount})`,
+        );
       }
 
       // Flux/custom edit endpoints use the singular image_url contract.
@@ -699,7 +562,7 @@ export function buildFalImageGenerationProvider(): ImageGenerationProvider {
         req,
         capability: "image",
       });
-      const maxImageBytes = resolveGeneratedMediaMaxBytes(req.cfg, "image");
+      const maxImageBytes = resolveGeneratedImageDownloadMaxBytes(req.cfg);
       const requestBody: Record<string, unknown> = {
         prompt: req.prompt,
         ...(schema.supportsCount ? { num_images: req.count ?? 1 } : {}),
@@ -710,23 +573,74 @@ export function buildFalImageGenerationProvider(): ImageGenerationProvider {
         ...(isGptImage25 && req.background ? { background: req.background } : {}),
       };
       if (schema.referenceImages === "image_style_references") {
-        requestBody.creativity = resolveFalCreativityOption(req.providerOptions);
+        const falOptions = isRecord(req.providerOptions?.fal) ? req.providerOptions.fal : undefined;
+        const normalized = normalizeLowercaseStringOrEmpty(falOptions?.creativity);
+        requestBody.creativity = KREA_CREATIVITY_LEVELS.some((level) => level === normalized)
+          ? normalized
+          : "medium";
       }
-      applyFalImageGeometry({
-        requestBody,
-        schema,
-        imageSize,
-        size: req.size,
-        aspectRatio: req.aspectRatio,
-        resolution: req.resolution,
-      });
+      if (schema.geometry === "native_aspect_ratio") {
+        if (req.resolution && schema.referenceImages === "image_style_references") {
+          throw new Error("fal Krea 2 supports aspectRatio but not resolution overrides");
+        }
+        let nativeAspectRatio = req.aspectRatio?.trim();
+        const allowedAspectRatios = schema.aspectRatios;
+        const sizeForAspectRatio = req.size ? imageSize : undefined;
+        if (nativeAspectRatio) {
+          if (allowedAspectRatios && !allowedAspectRatios.includes(nativeAspectRatio)) {
+            throw new Error(
+              `${schema.referenceLimitLabel} supports aspectRatio values: ${allowedAspectRatios.join(", ")}`,
+            );
+          }
+        } else if (
+          allowedAspectRatios &&
+          sizeForAspectRatio &&
+          typeof sizeForAspectRatio !== "string"
+        ) {
+          const targetRatio = sizeForAspectRatio.width / sizeForAspectRatio.height;
+          nativeAspectRatio = allowedAspectRatios.reduce<string | undefined>((best, candidate) => {
+            if (!best) {
+              return candidate;
+            }
+            return aspectRatioScore(candidate, targetRatio) < aspectRatioScore(best, targetRatio)
+              ? candidate
+              : best;
+          }, undefined);
+        }
+        if (nativeAspectRatio) {
+          requestBody.aspect_ratio = nativeAspectRatio;
+        }
+        if (req.resolution && schema.referenceImages === "image_urls") {
+          // An absent allowlist forwards resolutions; an empty one rejects all overrides.
+          const allowedResolutions = schema.resolutions;
+          if (allowedResolutions === undefined) {
+            requestBody.resolution = req.resolution;
+          } else if (allowedResolutions.length === 0) {
+            throw new Error(`${schema.referenceLimitLabel} does not support resolution overrides`);
+          } else if (!allowedResolutions.includes(req.resolution)) {
+            throw new Error(
+              `${schema.referenceLimitLabel} supports resolution values: ${allowedResolutions.join(", ")}`,
+            );
+          } else {
+            requestBody.resolution =
+              schema.resolutionCase === "lower" ? req.resolution.toLowerCase() : req.resolution;
+          }
+        }
+      } else if (imageSize !== undefined) {
+        requestBody.image_size = imageSize;
+      }
 
       if (hasInputImages) {
-        applyFalReferenceImages({
-          requestBody,
-          schema,
-          inputImages: req.inputImages ?? [],
-        });
+        const encoded = (req.inputImages ?? []).map(toImageDataUrl);
+        if (schema.referenceImages === "image_urls") {
+          requestBody.image_urls = encoded;
+        } else if (schema.referenceImages === "image_style_references") {
+          requestBody.image_style_references = encoded.map((imageUrl) => ({
+            image_url: imageUrl,
+          }));
+        } else {
+          requestBody.image_url = encoded[0];
+        }
       }
       const { response, release } = await fetchWithSsrFGuard({
         url: `${baseUrl}/${model}`,
@@ -782,4 +696,3 @@ export function buildFalImageGenerationProvider(): ImageGenerationProvider {
     },
   };
 }
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
