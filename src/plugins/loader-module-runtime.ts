@@ -1,4 +1,5 @@
 import { isMainThread } from "node:worker_threads";
+import { assertRuntimeSupportsPluginModule } from "../infra/runtime-profile.js";
 import { toSafeImportPath } from "../shared/import-specifier.js";
 import { VERSION } from "../version.js";
 import { runPluginRegistration } from "./api-lifecycle.js";
@@ -120,7 +121,6 @@ export function createPluginModuleLoader(options: {
   loaderFilename?: string;
   installNativeSdkResolver?: boolean;
   expectedSourceDigests?: Readonly<Record<string, string>>;
-  replacePluginIds?: readonly string[];
 }) {
   const cache = getPluginCache();
   const captured = {
@@ -174,7 +174,6 @@ export function createPluginModuleLoader(options: {
     source: modulePath,
     rootDir: owner.rootDir,
     standalone: owner.standalone,
-    reloadBundledCode: captured.replacePluginIds?.includes(owner.record.id),
     expectedSourceDigest: captured.expectedSourceDigests?.[owner.record.id],
     ...inspection(owner),
     devSourceRoot: captured.devSourceRoot,
@@ -199,6 +198,7 @@ export function createPluginModuleLoader(options: {
     });
   return Object.assign(load, {
     async prepare(modulePath: string, owner: Owner): Promise<void> {
+      assertRuntimeSupportsPluginModule(modulePath);
       // Compute workers already own retained native-ESM source captures. Keep their
       // inline acquisition path so a prepared artifact cannot compete with that owner.
       // An inspection that joins a retained native ESM artifact binds it synchronously;
@@ -214,8 +214,7 @@ export function createPluginModuleLoader(options: {
         });
       if (
         !isMainThread ||
-        (owner.record.origin === "bundled" &&
-          !captured.replacePluginIds?.includes(owner.record.id)) ||
+        owner.record.origin === "bundled" ||
         getPluginInstance(owner.record) ||
         retained()
       ) {
@@ -227,7 +226,6 @@ export function createPluginModuleLoader(options: {
           rootDir: owner.rootDir,
           source: modulePath,
           standalone: owner.standalone,
-          bundledReload: owner.record.origin === "bundled",
         });
         if (cache.retirement || isPluginRegistryRetired(owner.registry)) {
           await preparedArtifact.artifact.disposeAsync();
