@@ -8,6 +8,13 @@ import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.opencla
 import type { RuntimeEnv } from "../runtime.js";
 import type { MockFn } from "../test-utils/vitest-mock-fn.js";
 
+export const MACOS_APP_INSTALL_OWNER_MARKER = JSON.stringify({
+  schemaVersion: 1,
+  owner: "macos-app",
+  displayName: "OpenClaw.app",
+  updateHint: "Update OpenClaw.app to update this Gateway.",
+});
+
 export const baseConfigSnapshot = {
   path: "/tmp/openclaw.json",
   exists: true,
@@ -18,6 +25,22 @@ export const baseConfigSnapshot = {
   issues: [],
   legacyIssues: [],
 };
+
+export function createPluginPackagingConfigIssues(): Pick<
+  ConfigFileSnapshot,
+  "issues" | "warnings"
+> {
+  return {
+    issues: [{ path: "plugins.slots.memory", message: "plugin not found: source-only-pack" }],
+    warnings: [
+      {
+        path: "plugins",
+        message:
+          "plugin source-only-pack: installed plugin package requires compiled runtime output for TypeScript entry index.ts: expected ./dist/index.js. This is a plugin packaging issue, not a local config problem.",
+      },
+    ],
+  };
+}
 
 export function createTestModelDefinition(
   id: string,
@@ -138,5 +161,20 @@ export function createThrowingTestRuntime(): RuntimeEnv {
     exit: vi.fn(() => {
       throw new Error("exit");
     }),
+  };
+}
+
+export function createTestConfigReadMocks<TKey extends string, TArgs extends unknown[], TResult>(
+  owner: Record<TKey, (...args: TArgs) => TResult>,
+  key: TKey,
+) {
+  const loadConfig = owner[key];
+  return {
+    getRuntimeConfig: loadConfig,
+    loadConfig,
+    captureRuntimeConfigAsyncReader:
+      (...args: TArgs) =>
+      async () =>
+        owner[key](...args),
   };
 }
