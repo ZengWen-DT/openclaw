@@ -86,14 +86,23 @@ jobs:
           trap 'git restore -- src/agents/tools/web-fetch-utils.ts' EXIT
           git show 7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b:src/agents/tools/web-fetch-utils.ts > src/agents/tools/web-fetch-utils.ts
           set +e
-          pnpm test src/agents/tools/web-fetch-utils.test.ts --maxWorkers=1 -t 'preserves inline-code literals' > regression-negative.log 2>&1
+          pnpm test src/agents/tools/web-fetch-utils.test.ts --maxWorkers=1 -t 'preserves inline-code literals' --reporter=json --outputFile=regression-negative.json > regression-negative.log 2>&1
           result=$?
           set -e
           cat regression-negative.log
           test "$result" != 0
-          rg '8 tests' regression-negative.log
-          rg 'preserves inline-code literals' regression-negative.log
-          rg 'AssertionError|expected .* to be' regression-negative.log
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          const report = JSON.parse(fs.readFileSync('regression-negative.json', 'utf8'));
+          const selected = report.testResults.flatMap((file) => file.assertionResults)
+            .filter((test) => test.fullName.includes('preserves inline-code literals') && !['pending', 'skipped'].includes(test.status));
+          assert.equal(selected.length, 8, 'all eight new cases must execute');
+          const failed = selected.filter((test) => test.status === 'failed');
+          assert(failed.length > 0, 'original production owner must fail new cases');
+          assert(failed.some((test) => test.failureMessages.some((message) => /AssertionError|expected .* to be/s.test(message))), 'failure must be a behavior assertion');
+          console.log(`${selected.length} regression cases selected; ${failed.length} fail on original production owner`);
+          NODE
           git restore -- src/agents/tools/web-fetch-utils.ts
           test -z "$(git diff --name-only -- src/agents/tools/web-fetch-utils.ts)"
       - name: Repository build
@@ -117,3 +126,4 @@ jobs:
             source/web-fetch-proof.json
             source/focused-checks.log
             source/regression-negative.log
+            source/regression-negative.json
