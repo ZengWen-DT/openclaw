@@ -1,0 +1,76 @@
+name: Web fetch inline code proof
+on:
+  push:
+    branches: [proof/web-fetch-inline-code-184362]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact source commit
+        required: true
+        default: 7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b
+      expected:
+        description: Expected behavioral result
+        required: true
+        type: choice
+        options: [baseline, fixed]
+      focused_checks:
+        description: Run focused regression tests after proof
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha || '7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b' }}
+          path: source
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.15.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+      - name: Install pinned dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+      - name: Fetch real HTTP Markdown through production tool
+        working-directory: source
+        env:
+          EXPECTED_RESULT: ${{ inputs.expected || 'baseline' }}
+          TARGET_SHA: ${{ inputs.target_sha || '7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b' }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          cp ../harness/proof/web-fetch-inline-code.mts .web-fetch-inline-code-proof.mts
+          set +e
+          timeout 240 node --import ./scripts/tsx.mjs .web-fetch-inline-code-proof.mts > web-fetch-proof.log 2>&1
+          result=$?
+          set -e
+          cat web-fetch-proof.log
+          if [ "$EXPECTED_RESULT" = baseline ]; then
+            test "$result" = 2
+          else
+            test "$result" = 0
+          fi
+      - name: Focused regression checks
+        if: inputs.focused_checks
+        working-directory: source
+        run: pnpm test src/agents/tools/web-fetch-utils.test.ts src/agents/tools/web-fetch-visibility.tool-extraction.test.ts --maxWorkers=1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-fetch-inline-code-${{ inputs.expected || 'baseline' }}
+          path: |
+            source/web-fetch-proof.log
+            source/web-fetch-proof.json
