@@ -35,6 +35,21 @@ const fixtures = [
     expected: "Read guide.\n\n# literal\n![alt](image.png)\n[label](url)\n    indented",
   },
   {
+    name: "outer-inline-with-literal-triple-backticks",
+    body: "Before `literal ```x``` tail` after.",
+    expected: "Before literal ```x``` tail after.",
+  },
+  {
+    name: "inline-tilde-fence-syntax",
+    body: "Use `~~~text` then `![alt](image.png)` outside.",
+    expected: "Use ~~~text then ![alt](image.png) outside.",
+  },
+  {
+    name: "tilde-fenced-sibling",
+    body: "Before.\n\n~~~text\n![alt](image.png)\n[label](url)\n~~~\n\nAfter.",
+    expected: "Before.\n\n![alt](image.png)\n[label](url)\n\nAfter.",
+  },
+  {
     name: "literal-marker-prefix",
     body: "Prefix \0" + "0\0 then `![alt](image.png)` and [guide](url).",
     expected: "then ![alt](image.png) and guide.",
@@ -93,6 +108,7 @@ try {
   assert.equal(requests, fixtures.length * 2, "each mode reaches the real HTTP server without cache");
   const report = {
     sourceSha: process.env.TARGET_SHA,
+    sourceRepository: process.env.TARGET_REPOSITORY,
     scope: "Real node:http loopback server and production createWebFetchTool.execute; no mocked network, provider, or extraction. Marker utility control also calls markdownToText directly. No external service, browser, model, or live Gateway.",
     requests,
     observations,

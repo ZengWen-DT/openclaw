@@ -6,6 +6,10 @@ on:
         description: Exact source commit
         required: true
         default: 7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b
+      target_repository:
+        description: Public source repository
+        required: true
+        default: ZengWen-DT/openclaw
       expected:
         description: Expected behavioral result
         required: true
@@ -29,6 +33,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.target_sha || '7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b' }}
+          repository: ${{ inputs.target_repository || 'ZengWen-DT/openclaw' }}
           path: source
           persist-credentials: false
       - uses: pnpm/action-setup@v4
@@ -49,6 +54,7 @@ jobs:
         env:
           EXPECTED_RESULT: ${{ inputs.expected || 'baseline' }}
           TARGET_SHA: ${{ inputs.target_sha || '7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b' }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository || 'ZengWen-DT/openclaw' }}
         run: |
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           cp ../harness/proof/web-fetch-inline-code.mts .web-fetch-inline-code-proof.mts
