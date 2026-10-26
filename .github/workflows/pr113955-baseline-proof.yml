@@ -72,6 +72,29 @@ jobs:
           else
             test "$result" = 0
           fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-fetch-inline-http-${{ inputs.expected || 'baseline' }}
+          path: |
+            source/web-fetch-proof.log
+            source/web-fetch-proof.json
+      - name: Changed-file formatting
+        if: inputs.focused_checks
+        working-directory: source
+        run: |
+          files=(src/agents/tools/web-fetch-utils.ts src/agents/tools/web-fetch-utils.test.ts src/agents/tools/web-fetch-visibility.tool-extraction.test.ts docs/tools/web-fetch.md)
+          set +e
+          pnpm exec oxfmt --check "${files[@]}" > formatting.log 2>&1
+          result=$?
+          set -e
+          cat formatting.log
+          if [ "$result" != 0 ]; then
+            pnpm exec oxfmt --write "${files[@]}"
+            mkdir -p formatting-output
+            cp --parents "${files[@]}" formatting-output/
+            git restore -- "${files[@]}"
+            exit "$result"
+          fi
       - name: Focused regression checks
         if: inputs.focused_checks
         working-directory: source
@@ -127,3 +150,5 @@ jobs:
             source/focused-checks.log
             source/regression-negative.log
             source/regression-negative.json
+            source/formatting.log
+            source/formatting-output/
