@@ -1,0 +1,68 @@
+name: ACP message boundary proof
+on:
+  push:
+    branches: [proof/acp-message-boundaries-184242]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact source commit to exercise
+        required: true
+        default: e512f2ad391e4594d68691e0632bac0198fb3782
+      expected:
+        description: Expected behavioral result
+        required: true
+        type: choice
+        options: [baseline, fixed]
+permissions:
+  contents: read
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha || 'e512f2ad391e4594d68691e0632bac0198fb3782' }}
+          path: source
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.15.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+      - name: Install pinned dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+      - name: Exercise real ACP SDK wire and SQLite replay
+        working-directory: source
+        env:
+          EXPECTED_RESULT: ${{ inputs.expected || 'baseline' }}
+          TARGET_SHA: ${{ inputs.target_sha || 'e512f2ad391e4594d68691e0632bac0198fb3782' }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          cp ../harness/proof/acp-message-proof.mts .acp-message-proof.mts
+          set +e
+          timeout 180 node --import ./scripts/tsx.mjs .acp-message-proof.mts > acp-proof.log 2>&1
+          result=$?
+          set -e
+          cat acp-proof.log
+          if [ "$EXPECTED_RESULT" = baseline ]; then
+            test "$result" = 2
+          else
+            test "$result" = 0
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acp-message-proof-${{ inputs.expected }}
+          path: |
+            source/acp-proof.log
+            source/acp-proof.json
