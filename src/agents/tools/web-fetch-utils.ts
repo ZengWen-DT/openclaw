@@ -9,6 +9,7 @@ import {
   readRawTextBounds,
   skipRawTextElement,
 } from "../../../packages/markdown-core/src/html-scanner.js";
+import { findMarkdownCodeRegions } from "../../../packages/markdown-core/src/markdown-code-regions.js";
 import { stripInvisibleUnicode } from "../../infra/unicode-visibility.js";
 import { decodeHtmlEntities } from "../../shared/html-entities.js";
 import { readHtmlAttribute } from "./web-fetch-attributes.js";
@@ -372,13 +373,40 @@ function readBacktickRunEnd(value: string, start: number): number {
 }
 
 export function markdownToText(markdown: string): string {
-  const codeBlocks: string[] = [];
+  const codeLiterals: string[] = [];
+  const inlineCode = findMarkdownCodeRegions(markdown).filter((region) => !region.block);
+  let inlineIndex = 0;
   let text = "";
   const opener = /`{3,}|(?:^|\n) {0,3}(~{3,})/g;
+  let opening = opener.exec(markdown);
   let pos = 0;
   while (pos < markdown.length) {
-    opener.lastIndex = pos;
-    const opening = opener.exec(markdown);
+    const inline = inlineCode[inlineIndex];
+    if (inline && inline.start < pos) {
+      inlineIndex += 1;
+      continue;
+    }
+    if (opening && opening.index < pos) {
+      opener.lastIndex = pos;
+      opening = opener.exec(markdown);
+    }
+    if (inline && (!opening || inline.start <= opening.index)) {
+      text += markdown.slice(pos, inline.start).replaceAll("\0", "\0\0");
+      const delimiterLength = readBacktickRunEnd(markdown, inline.start) - inline.start;
+      let literal = markdown
+        .slice(inline.start + delimiterLength, inline.end - delimiterLength)
+        .replace(/\r\n?|\n/g, " ");
+      if (literal.startsWith(" ") && literal.endsWith(" ") && /[^ ]/.test(literal)) {
+        literal = literal.slice(1, -1);
+      }
+      // Original ownership keeps inner fence markers out of the fence scanner.
+      // Share its literal store so fetched NULs and code never become nested placeholders.
+      text += `\0${codeLiterals.length}\0`;
+      codeLiterals.push(literal);
+      pos = inline.end;
+      inlineIndex += 1;
+      continue;
+    }
     if (!opening) {
       text += markdown.slice(pos).replaceAll("\0", "\0\0");
       break;
@@ -439,14 +467,13 @@ export function markdownToText(markdown: string): string {
     const lineEnd = /[\r\n\u2028\u2029]$/.test(code) ? code.slice(-1) : "";
     const literal = code.slice(0, code.length - lineEnd.length);
     if (literal) {
-      text += `\0${codeBlocks.length}\0`;
-      codeBlocks.push(literal);
+      text += `\0${codeLiterals.length}\0`;
+      codeLiterals.push(literal);
     }
     text += lineEnd;
     pos = close?.end ?? markdown.length;
   }
   text = stripInlineLinks(text, { images: "omit" });
-  text = text.replace(/`([^`]+)`/g, "$1");
   text = text.replace(/^#{1,6}\s+/gm, "");
   text = text.replace(/^[^\S\n]*[-*+]\s+/gm, "");
   text = text.replace(/^[^\S\n]*\d+\.\s+/gm, "");
@@ -455,7 +482,7 @@ export function markdownToText(markdown: string): string {
   return normalizeWhitespace(text).replace(
     /\0(?:\0|(\d+)\0)/g,
     (_match, index: string | undefined) =>
-      index === undefined ? "\0" : codeBlocks[Number(index)]!,
+      index === undefined ? "\0" : codeLiterals[Number(index)]!,
   );
 }
 

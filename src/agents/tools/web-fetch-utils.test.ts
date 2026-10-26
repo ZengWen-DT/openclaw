@@ -44,6 +44,22 @@ describe("web-fetch-utils", () => {
     );
   });
 
+  it.each([
+    [
+      "Use `![alt](image.png)` and ``[label](https://example.com)``; read [guide](https://example.com).",
+      "Use ![alt](image.png) and [label](https://example.com); read guide.",
+    ],
+    ["Use `before ```x``` after`.", "Use before ```x``` after."],
+    ["Use `[label](url)\n![alt](image)`.", "Use [label](url) ![alt](image)."],
+    ["Use ``a`b [label](url)``.", "Use a`b [label](url)."],
+    ["Use ` # heading  with  spaces `.", "Use # heading  with  spaces."],
+    ["Use `  `.", "Use   ."],
+    ["Use `x\0[link](url)` and \u00000\0.", "Use x\0[link](url) and \u00000\0."],
+    ["Read [`[literal](url)`](guide); omit ![`alt`](image).", "Read [literal](url); omit ."],
+  ])("preserves inline-code literals while formatting prose (case %#)", (markdown, expected) => {
+    expect(markdownToText(markdown)).toBe(expected);
+  });
+
   it.each<[string, string, ("text" | "markdown")?]>([
     ["<p hidden>Before<bloc\u212aquote>Secret</bloc\u212aquote></p><p>Visible</p>", "Visible"],
     ["<p hidden>Before<div.foo>Secret</div.foo></p><p>Visible</p>", "Visible"],

@@ -34,6 +34,8 @@ const MARKDOWN_CODE =
 const UNCLOSED_CODE =
   '# literal\n- literal\n    if enabled:\n        print("two  spaces")\n\n\n\treturn True';
 const INLINE_FENCE = "Use ``` to start a code block.\nNext paragraph.";
+const INLINE_CODE =
+  "Use `![alt](image.png)` and ``[label](https://example.com)``; read [guide](https://example.com). Omit ![`alt`](image.png).";
 const ZERO_SCALE =
   '<p>Visible article.</p><div style="transform:scale(0, 0)">Hidden flat content</div><div style="transform:scale3d(0, 0, 0)">Hidden 3D content</div><p style="transform:scale(0.5, 0.5)">Visible scaled content.</p>';
 const RESPONSES = [
@@ -63,6 +65,17 @@ const RESPONSES = [
   ),
   markdown("/markdown-unclosed", `\`\`\`text\n${UNCLOSED_CODE}`, UNCLOSED_CODE),
   markdown("/markdown-inline-fence-prose", INLINE_FENCE),
+  markdown(
+    "/markdown-inline-code-text",
+    INLINE_CODE,
+    "Use ![alt](image.png) and [label](https://example.com); read guide. Omit .",
+  ),
+  markdown("/markdown-inline-code", INLINE_CODE, INLINE_CODE, "markdown"),
+  markdown(
+    "/markdown-inline-owned-fences",
+    "Use `before ```x``` after` and `[label](url)\n![alt](image)`.",
+    "Use before ```x``` after and [label](url) ![alt](image).",
+  ),
   ...(["markdown", "text"] as const).map((mode) =>
     response(
       `/zero-scale-${mode}`,
