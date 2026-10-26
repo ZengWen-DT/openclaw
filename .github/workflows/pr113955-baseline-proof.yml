@@ -19,12 +19,16 @@ on:
         description: Run focused regression tests after proof
         type: boolean
         default: false
+      full_checks:
+        description: Run repository build, check, and test
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
   proof:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,7 +75,39 @@ jobs:
       - name: Focused regression checks
         if: inputs.focused_checks
         working-directory: source
-        run: pnpm test src/agents/tools/web-fetch-utils.test.ts src/agents/tools/web-fetch-visibility.tool-extraction.test.ts --maxWorkers=1
+        run: |
+          set -o pipefail
+          pnpm test src/agents/tools/web-fetch-utils.test.ts src/agents/tools/web-fetch-visibility.tool-extraction.test.ts --maxWorkers=1 2>&1 | tee focused-checks.log
+      - name: Regression negative control against original production owner
+        if: inputs.focused_checks
+        working-directory: source
+        run: |
+          git fetch --no-tags --depth=1 https://github.com/openclaw/openclaw.git 7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b
+          trap 'git restore -- src/agents/tools/web-fetch-utils.ts' EXIT
+          git show 7aee7016f08cfc43ffe5f69a70d02f5a4d84a99b:src/agents/tools/web-fetch-utils.ts > src/agents/tools/web-fetch-utils.ts
+          set +e
+          pnpm test src/agents/tools/web-fetch-utils.test.ts --maxWorkers=1 -t 'preserves inline-code literals' > regression-negative.log 2>&1
+          result=$?
+          set -e
+          cat regression-negative.log
+          test "$result" != 0
+          rg '8 tests' regression-negative.log
+          rg 'preserves inline-code literals' regression-negative.log
+          rg 'AssertionError|expected .* to be' regression-negative.log
+          git restore -- src/agents/tools/web-fetch-utils.ts
+          test -z "$(git diff --name-only -- src/agents/tools/web-fetch-utils.ts)"
+      - name: Repository build
+        if: inputs.full_checks
+        working-directory: source
+        run: pnpm build
+      - name: Repository checks
+        if: inputs.full_checks
+        working-directory: source
+        run: pnpm check
+      - name: Repository tests
+        if: inputs.full_checks
+        working-directory: source
+        run: pnpm test
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -79,3 +115,5 @@ jobs:
           path: |
             source/web-fetch-proof.log
             source/web-fetch-proof.json
+            source/focused-checks.log
+            source/regression-negative.log
