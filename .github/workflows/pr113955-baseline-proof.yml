@@ -97,12 +97,14 @@ jobs:
             exit "$result"
           fi
       - name: Focused regression checks
+        id: focused
         if: inputs.focused_checks
         working-directory: source
         run: |
           set -o pipefail
           pnpm test src/agents/tools/web-fetch-utils.test.ts src/agents/tools/web-fetch-visibility.tool-extraction.test.ts --maxWorkers=1 2>&1 | tee focused-checks.log
       - name: Regression negative control against original production owner
+        id: negative
         if: inputs.focused_checks
         working-directory: source
         run: |
@@ -130,6 +132,7 @@ jobs:
           git restore -- src/agents/tools/web-fetch-utils.ts
           test -z "$(git diff --name-only -- src/agents/tools/web-fetch-utils.ts)"
       - name: Keep validation artifacts outside source checkout
+        id: clean
         if: always()
         working-directory: source
         run: |
@@ -141,15 +144,15 @@ jobs:
           git diff --exit-code
           git diff --cached --exit-code
       - name: Repository build
-        if: inputs.full_checks
+        if: ${{ !cancelled() && inputs.full_checks && steps.focused.outcome == 'success' && steps.negative.outcome == 'success' && steps.clean.outcome == 'success' }}
         working-directory: source
         run: pnpm build
       - name: Repository checks
-        if: inputs.full_checks
+        if: ${{ !cancelled() && inputs.full_checks && steps.focused.outcome == 'success' && steps.negative.outcome == 'success' && steps.clean.outcome == 'success' }}
         working-directory: source
         run: pnpm check
       - name: Repository tests
-        if: inputs.full_checks
+        if: ${{ !cancelled() && inputs.full_checks && steps.focused.outcome == 'success' && steps.negative.outcome == 'success' && steps.clean.outcome == 'success' }}
         working-directory: source
         run: pnpm test
       - uses: actions/upload-artifact@v4
