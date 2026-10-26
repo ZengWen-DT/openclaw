@@ -76,7 +76,7 @@ try {
       assert.equal(envelope.extractor, "cf-markdown", "Markdown response extraction path");
       assert.equal(typeof envelope.text, "string");
       if (typeof envelope.spill?.path === "string") spillPaths.add(envelope.spill.path);
-      const expected = extractMode === "markdown" ? fixture.body.replaceAll("\0", "") : fixture.expected;
+      const expected = extractMode === "markdown" ? fixture.body : fixture.expected;
       const passed = envelope.text.includes(expected);
       const observation = { fixture: fixture.name, extractMode, passed, expected, result: envelope };
       observations.push(observation);

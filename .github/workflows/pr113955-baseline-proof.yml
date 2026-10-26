@@ -1,7 +1,5 @@
 name: Web fetch inline code proof
 on:
-  push:
-    branches: [proof/web-fetch-inline-code-184362]
   workflow_dispatch:
     inputs:
       target_sha:
