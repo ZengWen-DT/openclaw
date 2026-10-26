@@ -37,7 +37,8 @@ jobs:
           run_install: false
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.22.1
+          check-latest: true
           cache: pnpm
           cache-dependency-path: source/pnpm-lock.yaml
       - name: Install pinned dependencies
