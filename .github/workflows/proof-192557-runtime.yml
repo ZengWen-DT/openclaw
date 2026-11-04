@@ -1,0 +1,42 @@
+name: Temporary 192557 runtime proof build
+on:
+  push:
+    branches: [proof/192557-runtime-build]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: before
+            sha: 52da7f61d3aaefbdbee2f637efa1c5a924f0b920
+          - label: after
+            sha: e0c832649cdbb58b40c761955c2f740754dd4dbc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+      - run: corepack enable
+      - run: corepack pnpm install --frozen-lockfile
+      - run: corepack pnpm build:runtime
+      - name: Package compiled runtime
+        run: |
+          printf '%s\n' "$(git rev-parse HEAD)" > /tmp/build-sha.txt
+          find packages extensions -type d -name dist -prune -print > /tmp/runtime-paths.txt
+          printf '%s\n' dist >> /tmp/runtime-paths.txt
+          tar -czf /tmp/openclaw-runtime.tgz -T /tmp/runtime-paths.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.label }}
+          path: |
+            /tmp/openclaw-runtime.tgz
+            /tmp/build-sha.txt
+          retention-days: 1
