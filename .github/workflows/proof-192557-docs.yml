@@ -1,0 +1,21 @@
+name: Temporary 192557 documentation checks
+on:
+  push:
+    branches: [proof/192557-docs]
+permissions:
+  contents: read
+jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e0c832649cdbb58b40c761955c2f740754dd4dbc
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+      - run: corepack enable
+      - run: corepack pnpm install --frozen-lockfile
+      - run: corepack pnpm check:docs
